@@ -3,10 +3,71 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>MemScope</title>
+<link rel="stylesheet" href="style.css">
 </head>
 <body>
-<h1>MemScope</h1>
-<p>The UI is not installed yet. The API is running: <a href="/api/devices">/api/devices</a></p>
+<div class="app">
+  <div id="banner" class="banner" role="alert" hidden></div>
+
+  <header class="topbar">
+    <span class="brand">MemScope</span>
+    <label class="field">Device
+      <select id="device-select" disabled><option>Looking for devices…</option></select>
+    </label>
+    <button id="device-refresh" class="btn icon" type="button" title="Refresh the device list" aria-label="Refresh devices">&#8635;</button>
+    <label class="field">App
+      <select id="app-select" disabled><option>–</option></select>
+    </label>
+    <button id="app-refresh" class="btn icon" type="button" title="Refresh the app list" aria-label="Refresh apps">&#8635;</button>
+    <button id="dump-btn" class="btn primary" type="button" disabled>Dump now</button>
+    <span class="soon" title="Coming in a later step"><button class="btn" type="button" disabled>Record startup</button></span>
+  </header>
+
+  <div id="job-panel" class="job-panel" hidden aria-live="polite"></div>
+
+  <div class="strip soon" title="Timeline: coming in a later step">
+    <span class="muted">Timeline</span>
+    <span class="placeholder">memory over time and snapshot markers appear here (coming in a later step)</span>
+  </div>
+
+  <div class="snaprow">
+    <label class="field">Snapshot
+      <select id="snapshot-select" disabled><option>No snapshots yet</option></select>
+    </label>
+    <span class="soon" title="Coming in a later step">
+      <label class="field">compare with
+        <select id="compare-select" disabled><option>–</option></select>
+      </label>
+    </span>
+  </div>
+
+  <div class="tabsrow">
+    <div class="tabs" role="tablist">
+      <button class="tab active" role="tab" aria-selected="true" id="tab-tree" type="button">Tree</button>
+      <span class="soon" title="Coming in a later step"><button class="tab" role="tab" aria-disabled="true" disabled type="button">Classes</button></span>
+      <span class="soon" title="Coming in a later step"><button class="tab" role="tab" aria-disabled="true" disabled type="button">Findings</button></span>
+    </div>
+    <div class="controls">
+      <div class="search">
+        <input id="search" type="search" placeholder="Find class (e.g. LeakyActivity)" autocomplete="off" aria-label="Search class name" disabled>
+        <ul id="search-list" class="search-list" role="listbox" hidden></ul>
+      </div>
+      <label class="check" title="Hide the ~35 MB of zygote / boot-image objects that every Android process shares. Sizes then count only your app's heap."><input id="hide-system" type="checkbox" checked> Hide system heap</label>
+      <label class="check" title="Dim rows whose class is not in your app's packages"><input id="my-code" type="checkbox"> My code</label>
+    </div>
+  </div>
+
+  <main class="main">
+    <section class="treepane" aria-label="Heap tree">
+      <div id="summary" class="summary"></div>
+      <div id="search-banner" class="search-banner" hidden></div>
+      <div id="tree" class="tree"></div>
+    </section>
+    <aside id="details" class="details" aria-label="Details"></aside>
+  </main>
+</div>
+<script type="module" src="app.js"></script>
 </body>
 </html>

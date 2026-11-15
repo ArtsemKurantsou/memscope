@@ -1,0 +1,41 @@
+<!doctype html>
+<meta charset="utf-8"><title>MemScope selftest</title>
+<body style="font:14px monospace"><pre id="out"></pre>
+<script type="module">
+import { formatBytes, formatPercent, splitClassName, refKind, hasObjectDetails, rowSize, rowPercent, rowVisible, sortRows } from './util.js';
+const out = document.getElementById('out');
+let fails = 0;
+function eq(name, got, want) {
+  const ok = JSON.stringify(got) === JSON.stringify(want);
+  if (!ok) fails++;
+  out.textContent += (ok ? 'PASS ' : 'FAIL ') + name + (ok ? '' : ' got ' + JSON.stringify(got) + ' want ' + JSON.stringify(want)) + '\n';
+}
+eq('0 B', formatBytes(0), '0 B');
+eq('512 B', formatBytes(512), '512 B');
+eq('1 KB', formatBytes(1024), '1.0 KB');
+eq('1.5 KB', formatBytes(1536), '1.5 KB');
+eq('promote 1023.99 KB', formatBytes(1024 * 1023.99), '1.0 MB');
+eq('20 MB', formatBytes(20 * 1024 * 1024), '20.0 MB');
+eq('2.5 GB', formatBytes(2.5 * 1024 ** 3), '2.5 GB');
+eq('null', formatBytes(null), '–');
+eq('pct', formatPercent(61.234), '61.2%');
+eq('pct tiny', formatPercent(0.01), '<0.1%');
+eq('pct zero', formatPercent(0), '0.0%');
+eq('split', splitClassName('java.util.HashMap$Node'), { simple: 'HashMap$Node', pkg: 'java.util' });
+eq('split array', splitClassName('byte[]'), { simple: 'byte[]', pkg: '' });
+eq('split app array', splitClassName('dev.x.Foo[]'), { simple: 'Foo[]', pkg: 'dev.x' });
+eq('kind root', refKind('root'), 'root');
+eq('kind grp', refKind('grp:obj:3|7'), 'grp');
+eq('details obj', hasObjectDetails('obj:3'), true);
+eq('details cat', hasObjectDetails('cat:static'), false);
+eq('details grp', hasObjectDetails('grp:cat:other|2'), false);
+const r = (retained, app) => ({ retainedBytes: retained, appHeapBytes: app, percentOfHeap: retained / 10 });
+eq('size hide', rowSize(r(100, 40), true), 40);
+eq('size show', rowSize(r(100, 40), false), 100);
+eq('percent hide', rowPercent(r(100, 40), true, { appHeapBytes: 80 }), 50);
+eq('percent show', rowPercent(r(100, 40), false, { appHeapBytes: 80 }), 10);
+eq('visible', [rowVisible(r(5, 0), true), rowVisible(r(5, 0), false)], [false, true]);
+eq('sort', sortRows([r(9, 1), r(5, 5), r(7, 5)], true).map((x) => x.retainedBytes), [5, 7, 9]);
+out.textContent += fails ? '\n' + fails + ' FAILED' : '\nALL PASSED';
+document.title = fails ? 'selftest FAIL' : 'selftest OK';
+</script>
