@@ -19,6 +19,7 @@ class FakeDevice(val serial: String = "emulator-5554") : ProcessRunner {
     var processes = listOf("100 dev.app", "101 dev.app:remote")
     var pull = Pull.GOOD
     var hprofSize = 4096
+    var pullDelayMs = 0L
     var statOverride: Long? = null
     var onCancelPull: () -> Unit = {}
     @Volatile var disconnected = false
@@ -45,6 +46,7 @@ class FakeDevice(val serial: String = "emulator-5554") : ProcessRunner {
     }
 
     private fun doPull(dest: Path, cancel: CancelToken): ProcessResult {
+        if (pullDelayMs > 0) Thread.sleep(pullDelayMs)
         val header = "JAVA PROFILE 1.0.3\u0000".toByteArray()
         fun write(n: Int, head: ByteArray = header) = Files.write(dest, head + ByteArray(maxOf(0, n - head.size)))
         return when (pull) {

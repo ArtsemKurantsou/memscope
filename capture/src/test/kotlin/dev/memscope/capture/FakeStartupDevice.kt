@@ -28,6 +28,8 @@ class FakeStartupDevice(val serial: String = "emulator-5554", val pkg: String = 
     var otherNewPids = mapOf(4300 to "$pkg:other")
     var pull = Pull.GOOD
     var hprofSize = 4096
+    /** Time a pull takes (a slow transfer). */
+    var pullDelayMs = 0L
     var amStartOutput = "Starting: Intent { cmp=$pkg/.Main }"
     /** Command (joined `shell` args prefix) that fails with exit 1, to inject errors. */
     var failShell: String? = null
@@ -115,6 +117,7 @@ class FakeStartupDevice(val serial: String = "emulator-5554", val pkg: String = 
     }
 
     private fun doPull(dest: Path): ProcessResult {
+        if (pullDelayMs > 0) Thread.sleep(pullDelayMs)
         val raw = "JAVA PROFILE 1.0.3\u0000".toByteArray().let { it + ByteArray(hprofSize - it.size) }
         val gz = ByteArrayOutputStream().also { b -> GZIPOutputStream(b).use { it.write(raw) } }.toByteArray()
         return when (pull) {

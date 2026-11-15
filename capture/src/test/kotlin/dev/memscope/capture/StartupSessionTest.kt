@@ -65,6 +65,17 @@ class StartupSessionTest {
     }
 
     @Test
+    fun `milestone snapshots are stamped when the dump starts, not when the pull ends`() {
+        device.pullDelayMs = 250
+        vm.defaultScript()
+        val before = System.currentTimeMillis()
+        runOk(StartupConfig(milestones = Milestones.defaults.take(1)))
+        val after = System.currentTimeMillis()
+        val taken = stored().snapshots.single().takenAtMs
+        assertTrue(taken >= before && after - taken >= 200, "taken=$taken before=$before after=$after")
+    }
+
+    @Test
     fun `the listener hears the pid, then held while stopped and running while resumed, and ends running`() {
         vm.defaultScript()
         val heard = java.util.concurrent.CopyOnWriteArrayList<String>()

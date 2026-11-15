@@ -314,6 +314,7 @@ class StartupSession(
             var ok = false
             try {
                 val t0 = nowMs()
+                val takenAtMs = System.currentTimeMillis() // the dump is taken now, not when the pull ends (timeline marker position)
                 guard.update(serial) { it.copy(pendingDump = remote) } // recoverStale removes it if this run dies
                 val error = try {
                     bounded("The heap dump", timeouts.dumpMs, onAbort = { debugger?.dispose() }) { debugger!!.invokeDump(thread, remote) }
@@ -341,7 +342,7 @@ class StartupSession(
                 facts += "%.1f MB".format(size / MB)
                 store.addSnapshot(
                     session.id,
-                    SnapshotMeta(snapshotId, m.label, m.id, processName, System.currentTimeMillis(), local.fileName.toString(), size, SnapshotMeta.Status.OK),
+                    SnapshotMeta(snapshotId, m.label, m.id, processName, takenAtMs, local.fileName.toString(), size, SnapshotMeta.Status.OK),
                 )
                 ok = true
                 d(facts.joinToString(" · "))
@@ -492,7 +493,10 @@ class StartupSession(
         }
 
         private inline fun observe(f: () -> Unit) {
-            try { f() } catch (_: Exception) { /* an observer must never break a recording */ }
+            try { f() } catch (e: Throwable) {
+                if (e is VirtualMachineError || e is LinkageError) throw e
+                /* an observer must never break a recording */
+            }
         }
 
         private fun checkCancel() {

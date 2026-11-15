@@ -32,6 +32,15 @@ class OnDemandDumperTest {
     private fun localHprofs() = Files.list(store.dir(session.id)).use { s -> s.map { it.fileName.toString() }.filter { it != "session.json" }.toList() }
 
     @Test
+    fun `the snapshot is stamped when the dump starts, not when the pull ends`() {
+        device.pullDelayMs = 300
+        val before = System.currentTimeMillis()
+        val meta = dumper.dump(session.id, "dev.app", "x", newJob())
+        val after = System.currentTimeMillis()
+        assertTrue(meta.takenAtMs >= before && after - meta.takenAtMs >= 250, "takenAtMs=${meta.takenAtMs} before=$before after=$after")
+    }
+
+    @Test
     fun `success records an OK snapshot, pulls a valid file and removes the remote file`() {
         val job = newJob()
         val meta = dumper.dump(session.id, "dev.app", "after login", job)

@@ -37,10 +37,11 @@ class OnDemandDumper(private val adb: Adb, private val store: SessionStore) {
         try {
             job.step(CHECK) { checkApp(serial, session.packageName, processName) }
             remoteTouched = true
+            val takenAtMs = System.currentTimeMillis() // the dump is taken now, not when the pull ends (timeline marker position)
             job.step(DUMP) { dumpOnDevice(serial, processName, remote, job) }
             val size = job.step(PULL) { detail -> pullAndValidate(serial, remote, localPart, localFinal, job, detail) }
             meta = SnapshotMeta(
-                snapshotId, label, null, processName, System.currentTimeMillis(), localFinal.fileName.toString(),
+                snapshotId, label, null, processName, takenAtMs, localFinal.fileName.toString(),
                 size, SnapshotMeta.Status.OK,
             )
         } catch (t: Throwable) {
