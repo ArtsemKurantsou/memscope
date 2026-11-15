@@ -64,6 +64,35 @@ class StartupSessionTest {
     }
 
     @Test
+    fun `the listener hears the pid, then held while stopped and running while resumed, and ends running`() {
+        vm.defaultScript()
+        val heard = java.util.concurrent.CopyOnWriteArrayList<String>()
+        val listener = object : StartupListener {
+            override fun onPid(pid: Int) { heard += "pid $pid" }
+            override fun onHeld(held: Boolean) { heard += if (held) "held" else "running" }
+        }
+        val config = StartupConfig()
+        StartupSession(device.adb, store, guard, { vm }, fast, listener).run(session.id, config, newJob(config))
+        assertEquals("pid ${device.targetPid}", heard.first())
+        assertEquals("running", heard.last())
+        assertTrue(heard.count { it == "held" } >= 5, heard.toString()) // attach, then every milestone stop
+        assertTrue(heard.zipWithNext().none { (a, b) -> a == b && a != "held" }, heard.toString())
+    }
+
+    @Test
+    fun `a failing listener never breaks the recording`() {
+        vm.defaultScript()
+        val boom = object : StartupListener {
+            override fun onPid(pid: Int) = throw IllegalStateException("boom")
+            override fun onHeld(held: Boolean) = throw IllegalStateException("boom")
+        }
+        val config = StartupConfig()
+        val job = newJob(config)
+        StartupSession(device.adb, store, guard, { vm }, fast, boom).run(session.id, config, job)
+        assertEquals(Job.State.DONE, job.snapshot().state)
+    }
+
+    @Test
     fun `default run records five OK snapshots in milestone order and leaves the device clean`() {
         vm.defaultScript()
         val job = runOk()

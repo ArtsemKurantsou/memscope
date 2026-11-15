@@ -36,6 +36,18 @@ data class StartupTimeouts(
 )
 
 /**
+ * What a [StartupSession] tells an observer (the memory timeline poller) without depending on it: [onPid] when the
+ * profiled process exists, [onHeld] with true while the app is stopped by the debugger (a milestone, or before the
+ * first resume) and false while it runs. Callbacks run on the session thread; failures in them are ignored.
+ */
+interface StartupListener {
+    fun onPid(pid: Int) {}
+    fun onHeld(held: Boolean) {}
+
+    companion object { val NONE = object : StartupListener {} }
+}
+
+/**
  * Records a startup: launches the app under a debugger that stops it at each enabled milestone, dumps the heap there
  * with `Debug.dumpHprofData` and pulls the dump into the session. Follows the "Recommended sequence" of
  * spike/FINDINGS.md. One thread drives everything (including the JDI event queue); only an attach or dump that must be
@@ -48,6 +60,7 @@ class StartupSession(
     private val guard: DebugAppGuard,
     private val debuggerFactory: () -> DebuggerPort = { JdiDebuggerPort() },
     private val timeouts: StartupTimeouts = StartupTimeouts(),
+    private val listener: StartupListener = StartupListener.NONE,
     private val onMilestoneDone: (Milestone) -> Unit = {},
 ) {
     /**
@@ -167,6 +180,7 @@ class StartupSession(
             val found = t.awaitProcess(processName, timeouts.pidMs.milliseconds, job.cancel)
             pid = found
             guard.update(serial) { it.copy(pid = found) }
+            observe { listener.onPid(found) }
             t.close()
             tracker = null
         }
@@ -188,6 +202,7 @@ class StartupSession(
                 )
             }
             dbg.suspendAll()
+            observe { listener.onHeld(true) }
             val waitError = dbg.armWaitReturn()
             for (m in pending.values.toList()) {
                 if (m.id == Milestones.PROCESS_START) {
@@ -198,6 +213,7 @@ class StartupSession(
                 if (status is HookStatus.Failed) failMilestone(m, hookProblem(m, status.reason))
             }
             resumedAtMs = nowMs()
+            observe { listener.onHeld(false) }
             dbg.resume() // from here on the VM must see no JDWP traffic until it reports an event (settle delay, FINDINGS A.2)
         }
 
@@ -212,6 +228,7 @@ class StartupSession(
                     if (nowMs() - lastProgress >= timeoutMs) return timedOut()
                     continue
                 }
+                observe { listener.onHeld(true) }
                 for (e in events.sortedBy(::order)) {
                     when (e) {
                         is DebugEvent.Disconnected -> return appExit()
@@ -238,6 +255,7 @@ class StartupSession(
                 if (events.any { it !is DebugEvent.HookResolved }) lastProgress = nowMs() // also excludes time spent dumping
                 if (pending.isEmpty()) break // detach resumes the VM
                 resumedAtMs = nowMs()
+                observe { listener.onHeld(false) }
                 dbg.resume()
             }
             return Outcome.ALL_REACHED
@@ -315,6 +333,7 @@ class StartupSession(
         /** Never throws: cleanup must not mask the error being reported. */
         private fun detach(d: (String) -> Unit) {
             val notes = ArrayList<String>()
+            observe { listener.onHeld(false) }
             debugger?.dispose()
             debugger = null
             tracker?.close()
@@ -404,6 +423,10 @@ class StartupSession(
             } catch (e: java.util.zip.ZipException) {
                 incomplete("the compressed stream is corrupt (${e.message})")
             }
+        }
+
+        private inline fun observe(f: () -> Unit) {
+            try { f() } catch (_: Exception) { /* an observer must never break a recording */ }
         }
 
         private fun checkCancel() {
