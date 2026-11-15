@@ -1,0 +1,497 @@
+package dev.memscope.server
+
+import dev.memscope.analysis.HprofUnreadableException
+import dev.memscope.capture.SessionMeta
+import dev.memscope.capture.SessionStore
+import dev.memscope.capture.SnapshotMeta
+import io.ktor.client.HttpClient
+import io.ktor.client.plugins.DefaultRequest
+import io.ktor.client.request.get
+import io.ktor.client.request.header
+import io.ktor.client.request.post
+import io.ktor.client.request.setBody
+import io.ktor.client.statement.HttpResponse
+import io.ktor.client.statement.bodyAsText
+import io.ktor.http.ContentType
+import io.ktor.http.HttpHeaders
+import io.ktor.http.HttpStatusCode
+import io.ktor.http.contentType
+import io.ktor.server.testing.ApplicationTestBuilder
+import io.ktor.server.testing.testApplication
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.int
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotEquals
+import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.io.TempDir
+import java.io.File
+import java.nio.file.Path
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+
+class RoutesTest {
+    @TempDir lateinit var home: Path
+
+    private val runner = FakeAdbRunner()
+    private val opener = FakeOpener()
+    private lateinit var store: SessionStore
+    private lateinit var deps: ServerDeps
+    private var now = 1_000_000L
+    private lateinit var http: HttpClient
+
+    private fun server(block: suspend ApplicationTestBuilder.() -> Unit) {
+        store = SessionStore(home)
+        deps = ServerDeps(store, { runner.adb }, opener, clock = { now })
+        try {
+            testApplication {
+                application { memscopeModule(deps, setOf("localhost")) }
+                http = client
+                block()
+            }
+        } finally {
+            deps.close()
+        }
+    }
+
+    private fun parse(text: String): JsonElement = Json.parseToJsonElement(text)
+    private suspend fun HttpResponse.json(): JsonElement = parse(bodyAsText())
+    private suspend fun HttpResponse.obj(): JsonObject = json().jsonObject
+    private suspend fun HttpResponse.array(): JsonArray = json().jsonArray
+
+    private suspend fun HttpClient.postJson(url: String, body: String = "{}") =
+        post(url) { contentType(ContentType.Application.Json); setBody(body) }
+
+    private suspend fun HttpClient.waitJob(jobId: String, timeoutMs: Long = 10_000): JsonObject {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (true) {
+            val job = get("/api/jobs/$jobId").obj()
+            if (job["state"]!!.jsonPrimitive.content != "RUNNING" || System.currentTimeMillis() > deadline) return job
+            Thread.sleep(20)
+        }
+    }
+
+    private suspend fun HttpClient.openSnapshot(sid: String, snap: String): JsonObject {
+        val r = postJson("/api/snapshots/$sid/$snap/open")
+        assertEquals(HttpStatusCode.OK, r.status, r.bodyAsText())
+        return waitJob(r.obj()["jobId"]!!.jsonPrimitive.content)
+    }
+
+    private fun str(o: JsonObject, k: String) = o[k]!!.jsonPrimitive.content
+
+    // ---------------------------------------------------------------- devices and apps
+
+    @Test fun devicesListsAttachedDevices() = server {
+        val r = client.get("/api/devices")
+        assertEquals(HttpStatusCode.OK, r.status, r.bodyAsText())
+        val d = r.array().single().jsonObject
+        assertEquals("emulator-5554", str(d, "serial"))
+        assertEquals("device", str(d, "state"))
+        assertEquals("sdk_gphone64", str(d, "model"))
+        assertEquals(35, d["apiLevel"]!!.jsonPrimitive.int)
+    }
+
+    @Test fun deviceFailureIs502WithHintAndKind() = server {
+        runner.noDevices = true
+        val r = client.get("/api/devices")
+        assertEquals(HttpStatusCode.BadGateway, r.status)
+        val e = r.obj()
+        assertEquals("NO_DEVICE", str(e, "kind"))
+        assertTrue(str(e, "hint").isNotBlank())
+        assertTrue(str(e, "error").isNotBlank())
+    }
+
+    @Test fun appsListsOnlyDebuggablePackagesWithProcesses() = server {
+        val apps = client.get("/api/devices/emulator-5554/apps").array()
+        val app = apps.single().jsonObject
+        assertEquals("dev.app", str(app, "packageName"))
+        assertEquals(true, app["running"]!!.jsonPrimitive.content.toBoolean())
+        assertEquals(listOf("dev.app", "dev.app:remote"), app["processes"]!!.jsonArray.map { str(it.jsonObject, "name") })
+        assertEquals(100, app["processes"]!!.jsonArray[0].jsonObject["pid"]!!.jsonPrimitive.int)
+    }
+
+    @Test fun appsAreCachedPerSerialUntilRefresh() = server {
+        client.get("/api/devices/emulator-5554/apps")
+        val after1 = runner.count("shell", "pm")
+        client.get("/api/devices/emulator-5554/apps")
+        assertEquals(after1, runner.count("shell", "pm"), "second call within 30 s is served from the cache")
+        client.get("/api/devices/emulator-5554/apps?refresh=1")
+        assertEquals(after1 + 1, runner.count("shell", "pm"))
+        now += 31_000
+        client.get("/api/devices/emulator-5554/apps")
+        assertEquals(after1 + 2, runner.count("shell", "pm"), "cache expires after ~30 s")
+    }
+
+    // ---------------------------------------------------------------- sessions
+
+    @Test fun createAttachSessionDefaultsPrefixesToPackage() = server {
+        val r = client.postJson("/api/sessions", """{"serial":"emulator-5554","packageName":"dev.app","mode":"ATTACH"}""")
+        assertEquals(HttpStatusCode.OK, r.status)
+        val s = r.obj()
+        assertEquals("ACTIVE", str(s, "state"))
+        assertEquals("ATTACH", str(s, "mode"))
+        assertEquals(listOf("dev.app"), s["appPackagePrefixes"]!!.jsonArray.map { it.jsonPrimitive.content })
+        assertEquals(s, client.get("/api/sessions/${str(s, "id")}").obj())
+        assertEquals(1, client.get("/api/sessions").array().size)
+    }
+
+    @Test fun createSessionHonoursCustomPrefixes() = server {
+        val r = client.postJson(
+            "/api/sessions",
+            """{"serial":"emulator-5554","packageName":"dev.app","mode":"ATTACH","appPackagePrefixes":["dev.app","com.lib"]}""",
+        )
+        assertEquals(listOf("dev.app", "com.lib"), r.obj()["appPackagePrefixes"]!!.jsonArray.map { it.jsonPrimitive.content })
+        assertEquals(listOf("dev.app", "com.lib"), store.list().single().appPackagePrefixes)
+    }
+
+    @Test fun nonDebuggablePackageIsRefusedWithoutCreatingASession() = server {
+        val r = client.postJson("/api/sessions", """{"serial":"emulator-5554","packageName":"dev.other","mode":"ATTACH"}""")
+        assertEquals(HttpStatusCode.BadGateway, r.status)
+        assertEquals("NOT_DEBUGGABLE", str(r.obj(), "kind"))
+        assertTrue(store.list().isEmpty())
+    }
+
+    @Test fun startupModeIsNotAvailableYet() = server {
+        val r = client.postJson("/api/sessions", """{"serial":"emulator-5554","packageName":"dev.app","mode":"STARTUP"}""")
+        assertEquals(HttpStatusCode.NotImplemented, r.status)
+        assertEquals("startup recording not available yet", str(r.obj(), "error"))
+        assertTrue(store.list().isEmpty())
+        assertEquals(0, runner.count("shell", "run-as"), "nothing is checked or changed on the device")
+    }
+
+    @Test fun malformedSessionRequestIs400() = server {
+        assertEquals(HttpStatusCode.BadRequest, client.postJson("/api/sessions", """{"serial":"x"}""").status)
+        assertEquals(HttpStatusCode.BadRequest, client.postJson("/api/sessions", "not json").status)
+    }
+
+    @Test fun creatingASessionEndsTheOtherActiveOne() = server {
+        val first = store.newAttachSession()
+        val second = client.postJson("/api/sessions", """{"serial":"emulator-5554","packageName":"dev.app","mode":"ATTACH"}""").obj()
+        assertNotEquals(first.id, str(second, "id"))
+        assertEquals(SessionMeta.State.ENDED, store.get(first.id)!!.state)
+        assertEquals(1, store.list().count { it.state == SessionMeta.State.ACTIVE })
+    }
+
+    @Test fun endSessionAndUnknownSession() = server {
+        val s = store.newAttachSession()
+        val r = client.postJson("/api/sessions/${s.id}/end")
+        assertEquals("ENDED", str(r.obj(), "state"))
+        assertEquals(HttpStatusCode.NotFound, client.get("/api/sessions/nope").status)
+        assertEquals(HttpStatusCode.NotFound, client.postJson("/api/sessions/nope/end").status)
+        assertEquals(HttpStatusCode.NotFound, client.postJson("/api/sessions/nope/dump").status)
+    }
+
+    @Test fun traversalLookingSessionIdIs400Or404() = server {
+        val status = client.get("/api/sessions/..%2F..").status
+        assertTrue(status == HttpStatusCode.BadRequest || status == HttpStatusCode.NotFound, "was $status")
+    }
+
+    // ---------------------------------------------------------------- dump and jobs
+
+    @Test fun dumpRunsAsAJobAndRecordsTheSnapshot() = server {
+        val s = store.newAttachSession()
+        val r = client.postJson("/api/sessions/${s.id}/dump", """{"label":"before login"}""")
+        assertEquals(HttpStatusCode.OK, r.status)
+        val job = client.waitJob(str(r.obj(), "jobId"))
+        assertEquals("DONE", str(job, "state"), job.toString())
+        assertEquals("s1", str(job, "resultRef"))
+        val snap = store.get(s.id)!!.snapshots.single()
+        assertEquals("before login", snap.label)
+        assertEquals("dev.app", snap.processName, "process defaults to the session's package")
+        assertEquals(SnapshotMeta.Status.OK, snap.status)
+        assertEquals(listOf("Check app", "Dump heap on device", "Pull dump", "Clean up"), job["steps"]!!.jsonArray.map { str(it.jsonObject, "name") })
+    }
+
+    @Test fun dumpAcceptsAnExplicitProcessAndAnEmptyBody() = server {
+        val s = store.newAttachSession()
+        val withProcess = client.postJson("/api/sessions/${s.id}/dump", """{"processName":"dev.app:remote"}""")
+        assertEquals("DONE", str(client.waitJob(str(withProcess.obj(), "jobId")), "state"))
+        assertEquals("dev.app:remote", store.get(s.id)!!.snapshots.single().processName)
+        val empty = client.post("/api/sessions/${s.id}/dump")
+        assertEquals(HttpStatusCode.OK, empty.status)
+        assertEquals("DONE", str(client.waitJob(str(empty.obj(), "jobId")), "state"))
+    }
+
+    @Test fun deviceFailureDuringDumpFailsTheJobWithAHint() = server {
+        val s = store.newAttachSession()
+        runner.disconnected = true
+        val job = client.waitJob(str(client.postJson("/api/sessions/${s.id}/dump").obj(), "jobId"))
+        assertEquals("FAILED", str(job, "state"))
+        assertTrue(str(job, "errorHint").contains("disconnected", ignoreCase = true), job.toString())
+        assertTrue(store.get(s.id)!!.snapshots.isEmpty())
+    }
+
+    @Test fun dumpOnAnEndedSessionIsRefused() = server {
+        val s = store.newAttachSession()
+        store.update(s.id) { it.copy(state = SessionMeta.State.ENDED) }
+        assertEquals(HttpStatusCode.Conflict, client.postJson("/api/sessions/${s.id}/dump").status)
+    }
+
+    @Test fun unknownJobIs404AndCancelFlagsTheJob() = server {
+        assertEquals(HttpStatusCode.NotFound, client.get("/api/jobs/nope").status)
+        assertEquals(HttpStatusCode.NotFound, client.postJson("/api/jobs/nope/cancel").status)
+        val job = deps.jobs.create("x", listOf("a"))
+        val r = client.postJson("/api/jobs/${job.id}/cancel")
+        assertEquals(HttpStatusCode.OK, r.status)
+        assertEquals(job.id, str(r.obj(), "id"))
+        assertTrue(job.cancel.isCancelled)
+    }
+
+    @Test fun jobRegistryKeepsOnlyTheLastFinishedJobs() {
+        val reg = JobRegistry(workers = 1, keepFinished = 3)
+        try {
+            val ids = (1..6).map { reg.create("j$it", emptyList()).also { j -> j.complete(null) }.id }
+            assertNull(reg.get(ids[0]))
+            assertNull(reg.get(ids[1]))
+            assertTrue(ids.drop(2).all { reg.get(it) != null })
+            val running = reg.create("running", emptyList())
+            repeat(10) { reg.create("f$it", emptyList()).complete(null) }
+            assertEquals(running, reg.get(running.id), "unfinished jobs are never dropped")
+        } finally {
+            reg.close()
+        }
+    }
+
+    // ---------------------------------------------------------------- snapshots
+
+    @Test fun queriesBeforeOpenAre409NotAnalysed() = server {
+        val s = store.newAttachSession()
+        val snap = store.addFakeSnapshot(s.id)
+        for (path in listOf("summary", "tree?ref=root", "object?ref=obj:1", "reveal?ref=obj:1", "classes", "instances?class=a.B", "indexInParent?parent=root&child=obj:1")) {
+            val r = client.get("/api/snapshots/${s.id}/$snap/$path")
+            assertEquals(HttpStatusCode.Conflict, r.status, path)
+            assertEquals("not analysed", str(r.obj(), "error"), path)
+        }
+    }
+
+    @Test fun unknownSnapshotIs404() = server {
+        val s = store.newAttachSession()
+        assertEquals(HttpStatusCode.NotFound, client.get("/api/snapshots/${s.id}/s9/summary").status)
+        assertEquals(HttpStatusCode.NotFound, client.postJson("/api/snapshots/${s.id}/s9/open").status)
+        assertEquals(HttpStatusCode.NotFound, client.get("/api/snapshots/nope/s1/summary").status)
+    }
+
+    @Test fun openRunsAnalysisJobWithThreeStepsAndUnlocksQueries() = server {
+        val s = store.newAttachSession().let { store.update(it.id) { m -> m.copy(appPackagePrefixes = listOf("dev.app", "com.lib")) } }
+        val snap = store.addFakeSnapshot(s.id)
+        val job = client.openSnapshot(s.id, snap)
+        assertEquals("DONE", str(job, "state"), job.toString())
+        val steps = job["steps"]!!.jsonArray.map { it.jsonObject }
+        assertEquals(listOf("Parse", "Index", "Dominators"), steps.map { str(it, "name") })
+        assertTrue(steps.all { str(it, "state") == "DONE" }, steps.toString())
+        assertEquals(listOf("dev.app", "com.lib"), opener.seenPrefixes, "prefixes come from the session")
+
+        val summary = client.get("/api/snapshots/${s.id}/$snap/summary").obj()
+        assertEquals(1000, summary["reachableBytes"]!!.jsonPrimitive.int)
+        assertEquals(42, summary["objectCount"]!!.jsonPrimitive.int)
+
+        val tree = client.get("/api/snapshots/${s.id}/$snap/tree?ref=root&offset=5&limit=10").obj()
+        assertEquals("obj:1", str(tree["rows"]!!.jsonArray[0].jsonObject, "ref"))
+        assertTrue(Triple("root", 5, 10) in opener.opened.single().childrenCalls)
+
+        client.get("/api/snapshots/${s.id}/$snap/tree?ref=root")
+        assertTrue(Triple("root", 0, 25) in opener.opened.single().childrenCalls, "default offset 0, limit 25")
+
+        val obj = client.get("/api/snapshots/${s.id}/$snap/object?ref=obj:7").obj()
+        assertEquals("obj:7", str(obj, "ref"))
+        assertEquals("java.lang.String", client.get("/api/snapshots/${s.id}/$snap/classes").array()[0].jsonObject["className"]!!.jsonPrimitive.content)
+        val inst = client.get("/api/snapshots/${s.id}/$snap/instances?class=java.lang.String&offset=0&limit=5").obj()
+        assertEquals(1, inst["total"]!!.jsonPrimitive.int)
+        assertEquals(listOf("root", "cat:static", "obj:3"), client.get("/api/snapshots/${s.id}/$snap/reveal?ref=obj:3").array().map { it.jsonPrimitive.content })
+        assertEquals(4, client.get("/api/snapshots/${s.id}/$snap/indexInParent?parent=root&child=obj:3").obj()["index"]!!.jsonPrimitive.int)
+    }
+
+    @Test fun openingAnAlreadyOpenSnapshotCompletesImmediatelyWithoutReopening() = server {
+        val s = store.newAttachSession()
+        val snap = store.addFakeSnapshot(s.id)
+        client.openSnapshot(s.id, snap)
+        val again = client.openSnapshot(s.id, snap)
+        assertEquals("DONE", str(again, "state"))
+        assertTrue(again["steps"]!!.jsonArray.all { str(it.jsonObject, "state") == "DONE" })
+        assertEquals(1, opener.calls.get())
+    }
+
+    @Test fun concurrentOpensOfTheSameSnapshotIndexOnce() = server {
+        val s = store.newAttachSession()
+        val snap = store.addFakeSnapshot(s.id)
+        val gate = CountDownLatch(1)
+        opener.gate = gate
+        val a = str(client.postJson("/api/snapshots/${s.id}/$snap/open").obj(), "jobId")
+        val b = str(client.postJson("/api/snapshots/${s.id}/$snap/open").obj(), "jobId")
+        assertEquals(a, b, "the second request joins the running analysis job")
+        gate.countDown()
+        assertEquals("DONE", str(client.waitJob(a), "state"))
+        assertEquals(1, opener.calls.get())
+    }
+
+    @Test fun lruKeepsTwoSnapshotsAndClosesTheEvictedOne() = server {
+        val s = store.newAttachSession()
+        val ids = (1..3).map { store.addFakeSnapshot(s.id) }
+        ids.forEach { assertEquals("DONE", str(client.openSnapshot(s.id, it), "state")) }
+        assertTrue(opener.opened[0].closed)
+        assertFalse(opener.opened[1].closed)
+        assertFalse(opener.opened[2].closed)
+        val evicted = client.get("/api/snapshots/${s.id}/${ids[0]}/summary")
+        assertEquals(HttpStatusCode.Conflict, evicted.status)
+        assertEquals("not analysed", str(evicted.obj(), "error"))
+        assertEquals(HttpStatusCode.OK, client.get("/api/snapshots/${s.id}/${ids[1]}/summary").status)
+        // using [1] made [2] the least recently used: re-opening [0] evicts it
+        assertEquals("DONE", str(client.openSnapshot(s.id, ids[0]), "state"))
+        assertTrue(opener.opened[2].closed)
+        assertEquals(HttpStatusCode.Conflict, client.get("/api/snapshots/${s.id}/${ids[2]}/summary").status)
+    }
+
+    @Test fun unreadableHprofFailsTheJobPersistsStatusAndGives422() = server {
+        val s = store.newAttachSession()
+        val snap = store.addFakeSnapshot(s.id)
+        val file = store.snapshotFile(s.id, snap).toFile()
+        opener.failWith = HprofUnreadableException(file, "Heap dump ${file.path} is truncated or corrupt", null)
+        val job = client.openSnapshot(s.id, snap)
+        assertEquals("FAILED", str(job, "state"))
+        assertTrue(str(job, "errorMessage").contains(file.name))
+        assertTrue(str(job, "errorHint").contains("capture", ignoreCase = true))
+        assertEquals(SnapshotMeta.Status.UNREADABLE, store.get(s.id)!!.snapshots.single().status)
+        val summary = client.get("/api/snapshots/${s.id}/$snap/summary")
+        assertEquals(HttpStatusCode.UnprocessableEntity, summary.status)
+        assertEquals("UNREADABLE", str(summary.obj(), "kind"))
+        assertTrue(str(summary.obj(), "hint").contains("capture", ignoreCase = true))
+        assertEquals(HttpStatusCode.UnprocessableEntity, client.postJson("/api/snapshots/${s.id}/$snap/open").status)
+    }
+
+    @Test fun emptyHprofIsRejectedAt422AndMarkedUnreadable() = server {
+        val s = store.newAttachSession()
+        val snap = store.addFakeSnapshot(s.id, bytes = 0)
+        val r = client.postJson("/api/snapshots/${s.id}/$snap/open")
+        assertEquals(HttpStatusCode.UnprocessableEntity, r.status)
+        assertEquals("UNREADABLE", str(r.obj(), "kind"))
+        assertEquals(0, opener.calls.get())
+        assertEquals(SnapshotMeta.Status.UNREADABLE, store.get(s.id)!!.snapshots.single().status)
+    }
+
+    @Test fun unreadableErrorSurfacingFromAQueryMarksTheSnapshot() = server {
+        val s = store.newAttachSession()
+        val snap = store.addFakeSnapshot(s.id)
+        client.openSnapshot(s.id, snap)
+        opener.opened.single().onChildren = { throw HprofUnreadableException(File("x.hprof"), "x.hprof is corrupt", null) }
+        val r = client.get("/api/snapshots/${s.id}/$snap/tree?ref=root")
+        assertEquals(HttpStatusCode.UnprocessableEntity, r.status)
+        assertEquals(SnapshotMeta.Status.UNREADABLE, store.get(s.id)!!.snapshots.single().status)
+    }
+
+    @Test fun badRefIs400WithHint() = server {
+        val s = store.newAttachSession()
+        val snap = store.addFakeSnapshot(s.id)
+        client.openSnapshot(s.id, snap)
+        val r = client.get("/api/snapshots/${s.id}/$snap/object?ref=cat:static")
+        assertEquals(HttpStatusCode.BadRequest, r.status)
+        val e = r.obj()
+        assertEquals("BAD_REQUEST", str(e, "kind"))
+        assertTrue(str(e, "error").contains("does not name a single object"))
+        assertTrue(str(e, "hint").isNotBlank())
+        assertEquals(HttpStatusCode.BadRequest, client.get("/api/snapshots/${s.id}/$snap/tree").status, "ref is required")
+        assertEquals(HttpStatusCode.BadRequest, client.get("/api/snapshots/${s.id}/$snap/tree?ref=root&offset=abc").status)
+    }
+
+    @Test fun revealDeeperThan2000Is422() = server {
+        val s = store.newAttachSession()
+        val snap = store.addFakeSnapshot(s.id)
+        client.openSnapshot(s.id, snap)
+        val view = opener.opened.single()
+        view.revealPath = List(2000) { "obj:$it" }
+        assertEquals(HttpStatusCode.OK, client.get("/api/snapshots/${s.id}/$snap/reveal?ref=obj:1").status)
+        view.revealPath = List(2001) { "obj:$it" }
+        val r = client.get("/api/snapshots/${s.id}/$snap/reveal?ref=obj:1")
+        assertEquals(HttpStatusCode.UnprocessableEntity, r.status)
+        assertEquals("too deep to reveal", str(r.obj(), "error"))
+        assertEquals("use the path shown in the details panel", str(r.obj(), "hint"))
+    }
+
+    @Test fun viewReportingTooDeepIs422() = server {
+        val s = store.newAttachSession()
+        val snap = store.addFakeSnapshot(s.id)
+        http.openSnapshot(s.id, snap)
+        opener.opened.single().revealFails = TooDeepToReveal()
+        val r = http.get("/api/snapshots/${s.id}/$snap/reveal?ref=obj:1")
+        assertEquals(HttpStatusCode.UnprocessableEntity, r.status)
+        assertEquals("too deep to reveal", str(r.obj(), "error"))
+    }
+
+    @Test fun queryRacingWithEvictionGets409NotA500() = server {
+        val s = store.newAttachSession()
+        val snap = store.addFakeSnapshot(s.id)
+        http.openSnapshot(s.id, snap)
+        opener.opened.single().onChildren = { throw IllegalStateException("snapshot closed") }
+        val r = http.get("/api/snapshots/${s.id}/$snap/tree?ref=root")
+        assertEquals(HttpStatusCode.Conflict, r.status)
+        assertEquals("not analysed", str(r.obj(), "error"))
+    }
+
+    @Test fun finishedOpenWarmsTheSnapshotInTheBackground() = server {
+        val s = store.newAttachSession()
+        val snap = store.addFakeSnapshot(s.id)
+        http.openSnapshot(s.id, snap)
+        val view = opener.opened.single()
+        val deadline = System.currentTimeMillis() + 5000
+        while (view.detailsCalls.isEmpty() && System.currentTimeMillis() < deadline) Thread.sleep(10)
+        assertEquals(listOf("obj:1"), view.detailsCalls, "details of the first root row")
+        assertTrue(Triple("root", 0, 1) in view.childrenCalls)
+    }
+
+    // ---------------------------------------------------------------- web surface
+
+    @Test fun servesPlaceholderUiWithNoStore() = server {
+        val r = client.get("/")
+        assertEquals(HttpStatusCode.OK, r.status)
+        assertEquals("no-store", r.headers[HttpHeaders.CacheControl])
+        val body = r.bodyAsText()
+        assertTrue(body.contains("MemScope"))
+        assertTrue(body.contains("/api/devices"))
+    }
+
+    @Test fun foreignHostHeaderIsRejected() = server {
+        val r = client.get("/api/devices") { header(HttpHeaders.Host, "evil.example.com") }
+        assertEquals(HttpStatusCode.Forbidden, r.status)
+        assertEquals(0, runner.calls.size, "rejected before any handler ran")
+        assertEquals(HttpStatusCode.Forbidden, client.get("/") { header(HttpHeaders.Host, "attacker.test:7070") }.status)
+    }
+
+    @Test fun noCorsHeadersEvenForCrossOriginRequests() = server {
+        val r = client.get("/api/devices") { header(HttpHeaders.Origin, "http://evil.example.com") }
+        assertNull(r.headers[HttpHeaders.AccessControlAllowOrigin])
+        val preflight = client.post("/api/sessions") { header(HttpHeaders.Origin, "http://evil.example.com") }
+        assertNull(preflight.headers[HttpHeaders.AccessControlAllowOrigin])
+    }
+
+    @Test fun serverBindsLoopbackOnly() {
+        val port = java.net.ServerSocket(0).use { it.localPort }
+        store = SessionStore(home)
+        deps = ServerDeps(store, { runner.adb }, opener)
+        val engine = startServer(deps, port, wait = false)
+        try {
+            val http = java.net.http.HttpClient.newHttpClient()
+            val ok = http.send(
+                java.net.http.HttpRequest.newBuilder(java.net.URI("http://127.0.0.1:$port/")).build(),
+                java.net.http.HttpResponse.BodyHandlers.ofString(),
+            )
+            assertEquals(200, ok.statusCode(), "reachable on 127.0.0.1 with Host 127.0.0.1:$port")
+            val other = java.net.NetworkInterface.getNetworkInterfaces().toList()
+                .flatMap { it.inetAddresses.toList() }
+                .firstOrNull { it is java.net.Inet4Address && !it.isLoopbackAddress }
+            if (other != null) {
+                val refused = runCatching { java.net.Socket().use { it.connect(java.net.InetSocketAddress(other, port), 2000) } }
+                assertTrue(refused.isFailure, "must not accept connections on ${other.hostAddress}")
+            }
+        } finally {
+            engine.stop(0, 1000)
+            deps.close()
+        }
+    }
+}
