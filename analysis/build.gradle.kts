@@ -49,3 +49,15 @@ tasks.register<JavaExec>("demoHome") {
     val home = providers.gradleProperty("demoHome")
     doFirst { args(home.orNull ?: throw GradleException("pass -PdemoHome=<dir>")) }
 }
+
+// Times the findings of a dump: ./gradlew :analysis:perfFindings -Phprof=/path/to/dump.hprof
+tasks.register<JavaExec>("perfFindings") {
+    group = "verification"
+    description = "Computes the findings of -Phprof=<file> with -Xmx6g, timing each rule and printing the peak heap."
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("dev.memscope.analysis.findings.FindingsPerfMainKt")
+    maxHeapSize = providers.gradleProperty("perfXmx").getOrElse("6g")
+    javaLauncher.set(javaToolchains.launcherFor { languageVersion.set(JavaLanguageVersion.of(17)) })
+    val hprof = providers.gradleProperty("hprof")
+    doFirst { args(hprof.orNull ?: throw GradleException("pass -Phprof=<heap dump>")) }
+}
