@@ -2,16 +2,19 @@ package dev.memscope.analysis
 
 import kotlinx.serialization.Serializable
 
+/** Fields equal to their default (0 / false) are left out of the JSON ([DiffJson]); readers treat a missing number as 0. */
 @Serializable
 data class ClassDelta(
-    val className: String, val isAppCode: Boolean, val countBefore: Int, val countAfter: Int,
-    val shallowBefore: Long, val shallowAfter: Long, val retainedBefore: Long, val retainedAfter: Long,
-    val appCountBefore: Int, val appCountAfter: Int, val appShallowBefore: Long, val appShallowAfter: Long,
-    val appRetainedBefore: Long, val appRetainedAfter: Long,
+    val className: String, val isAppCode: Boolean = false, val countBefore: Int = 0, val countAfter: Int = 0,
+    val shallowBefore: Long = 0, val shallowAfter: Long = 0, val retainedBefore: Long = 0, val retainedAfter: Long = 0,
+    val appCountBefore: Int = 0, val appCountAfter: Int = 0, val appShallowBefore: Long = 0, val appShallowAfter: Long = 0,
+    val appRetainedBefore: Long = 0, val appRetainedAfter: Long = 0,
 )
 
 @Serializable
-data class RootDelta(val label: String, val retainedBefore: Long, val retainedAfter: Long, val appRetainedBefore: Long, val appRetainedAfter: Long)
+data class RootDelta(
+    val label: String, val retainedBefore: Long = 0, val retainedAfter: Long = 0, val appRetainedBefore: Long = 0, val appRetainedAfter: Long = 0,
+)
 
 @Serializable
 data class DiffResult(
@@ -21,11 +24,17 @@ data class DiffResult(
 
 /**
  * What grew between two heap dumps. Classes are matched by name; the tree's root categories and its
- * `Static fields` class rows are matched by label ([RootDelta.label]). Object identity is not tracked.
+ * `Static fields` class rows are matched by label ([RootDelta.label]). Only roots whose retained size changed are listed. Object identity is not tracked.
  *
  * "App" numbers count only app-heap objects: every dump holds the same ~35 MB of zygote and boot-image
  * objects, which would otherwise drown the change.
  */
+/** The wire form of a [DiffResult]: defaults omitted, which is most of a large app's numbers. */
+object DiffJson {
+    private val json = kotlinx.serialization.json.Json { encodeDefaults = false }
+    fun encode(d: DiffResult): String = json.encodeToString(DiffResult.serializer(), d)
+}
+
 object SnapshotDiff {
     const val STATICS_PREFIX = "Static fields / "
 
@@ -82,5 +91,5 @@ object SnapshotDiff {
             val (rb, ab) = before[label] ?: (0L to 0L)
             val (ra, aa) = after[label] ?: (0L to 0L)
             RootDelta(label, rb, ra, ab, aa)
-        }
+        }.filter { it.retainedBefore != it.retainedAfter || it.appRetainedBefore != it.appRetainedAfter }
 }

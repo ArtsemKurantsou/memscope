@@ -107,14 +107,28 @@ class SnapshotDiffTest {
     fun diffOfASnapshotWithItselfIsAllZero() {
         val self = SnapshotDiff.diff(after, after)
         assertTrue(self.classes.isEmpty(), "unchanged classes are not listed: ${self.classes.map { it.className }}")
-        assertTrue(self.roots.isNotEmpty())
-        for (r in self.roots) {
-            assertEquals(r.retainedBefore, r.retainedAfter, r.label)
-            assertEquals(r.appRetainedBefore, r.appRetainedAfter, r.label)
-        }
+        assertTrue(self.roots.isEmpty(), "unchanged roots are not listed: ${self.roots.map { it.label }}")
         assertEquals(self.reachableBefore, self.reachableAfter)
         assertEquals(self.appHeapBefore, self.appHeapAfter)
-        assertNotNull(self.roots.firstOrNull { it.label == "Static fields / test.Cache" })
+    }
+
+    @Test
+    fun onlyChangedRootsAreListed() {
+        assertTrue(diff.roots.isNotEmpty())
+        for (r in diff.roots) assertTrue(r.retainedBefore != r.retainedAfter || r.appRetainedBefore != r.appRetainedAfter, r.label)
+        assertTrue(diff.roots.none { it.label == "Static fields / java.lang.Class" })
+    }
+
+    @Test
+    fun twoClassObjectsWithOneNameAreOneClassDelta() {
+        val b = File(dir, "dup-before.hprof").also { DiffHprof.write(it, itemCount = 1, dupACount = 1, dupBCount = 1) }
+        val a = File(dir, "dup-after.hprof").also { DiffHprof.write(it, itemCount = 1, dupACount = 2, dupBCount = 3) }
+        Snapshot.open(b, prefixes).use { sb -> Snapshot.open(a, prefixes).use { sa ->
+            val d = SnapshotDiff.diff(sb, sa).classes.single { it.className == "test.Dup" }
+            assertEquals(2, d.countBefore); assertEquals(5, d.countAfter)
+            assertEquals(2L * DiffHprof.DUP_SIZE, d.shallowBefore); assertEquals(5L * DiffHprof.DUP_SIZE, d.shallowAfter)
+            assertEquals(1, SnapshotDiff.diff(sb, sa).classes.count { it.className == "test.Dup" })
+        } }
     }
 
     @Test
@@ -123,6 +137,40 @@ class SnapshotDiffTest {
             val same = c.countBefore == c.countAfter && c.shallowBefore == c.shallowAfter && c.retainedBefore == c.retainedAfter &&
                 c.appCountBefore == c.appCountAfter && c.appShallowBefore == c.appShallowAfter && c.appRetainedBefore == c.appRetainedAfter
             assertTrue(!same, "${c.className} did not change")
+        }
+    }
+}
+
+/** Size and speed of the diff of a large app: 30,000 classes, each with one more instance after. */
+class SnapshotDiffLargeTest {
+    @Test
+    fun diffOfThirtyThousandClassesIsFastAndItsPayloadIsMeasured() {
+        val dir = Files.createTempDirectory("snapshot-diff-large").toFile()
+        try {
+            val classes = 30_000
+            val b = File(dir, "b.hprof").also { ManyClassesHprof.write(it, classes, 1) }
+            val a = File(dir, "a.hprof").also { ManyClassesHprof.write(it, classes, 2) }
+            Snapshot.open(b, listOf("gen.")).use { sb -> Snapshot.open(a, listOf("gen.")).use { sa ->
+                sb.classes(); sa.classes() // warm like the server does
+                fun measure(): List<Long> {
+                    val start = System.nanoTime()
+                    val d = SnapshotDiff.diff(sb, sa)
+                    val ms = (System.nanoTime() - start) / 1_000_000
+                    val json = DiffJson.encode(d)
+                    val gz = java.io.ByteArrayOutputStream().also { o -> java.util.zip.GZIPOutputStream(o).use { it.write(json.toByteArray()) } }.size()
+                    return listOf(ms, json.length.toLong(), gz.toLong())
+                }
+                val (ms, jsonBytes, gzBytes) = measure()
+                val rt = Runtime.getRuntime()
+                System.gc(); System.gc(); val h0 = rt.totalMemory() - rt.freeMemory()
+                val d = SnapshotDiff.diff(sb, sa)
+                System.gc(); System.gc(); val retained = (rt.totalMemory() - rt.freeMemory()) - h0
+                println("DIFF-MEASURE classes=${d.classes.size} diffMs=$ms jsonBytes=$jsonBytes gzipBytes=$gzBytes retainedHeapBytes=$retained")
+                assertEquals(classes, d.classes.count { it.className.startsWith("gen.") })
+                assertTrue(ms < 10_000, "diff took $ms ms")
+            } }
+        } finally {
+            dir.deleteRecursively()
         }
     }
 }

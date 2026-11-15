@@ -30,17 +30,20 @@ object DiffHprof {
     const val ITEM_SIZE = 16
     const val LATE_SIZE = 24
     const val GONE_SIZE = 40
+    const val DUP_SIZE = 32
 
     private const val OBJ = 2
     private const val C_OBJECT = 1L; private const val C_CLASS = 2L; private const val C_OBJARR = 3L; private const val C_BYTES = 4L
-    private const val C_APP = 5L; private const val C_CACHE = 6L; private const val C_ITEM = 7L; private const val C_LATE = 8L; private const val C_GONE = 9L
+    private const val C_APP = 5L; private const val C_CACHE = 6L; private const val C_ITEM = 7L; private const val C_LATE = 8L; private const val C_GONE = 9L; private const val C_DUP_A = 10L; private const val C_DUP_B = 11L
     private const val ITEMS = 100L; private const val CACHE_DATA = 101L
     private fun item(i: Int) = 1_000L + i
     private fun payload(i: Int) = 2_000L + i
     private fun late(i: Int) = 3_000L + i
     private fun gone(i: Int) = 4_000L + i
+    private fun dupA(i: Int) = 5_000L + i
+    private fun dupB(i: Int) = 6_000L + i
 
-    fun write(file: File, itemCount: Int, payloadBytes: Int = 100, cacheBytes: Int = 16, lateCount: Int = 0, goneCount: Int = 0) {
+    fun write(file: File, itemCount: Int, payloadBytes: Int = 100, cacheBytes: Int = 16, lateCount: Int = 0, goneCount: Int = 0, dupACount: Int = 0, dupBCount: Int = 0) {
         var nextString = 1L
         val strings = LinkedHashMap<String, Long>()
         fun s(value: String) = strings.getOrPut(value) { nextString++ }
@@ -56,6 +59,9 @@ object DiffHprof {
             K(C_ITEM, "test.Item", ITEM_SIZE, listOf("payload")),
             K(C_LATE, "test.Late", LATE_SIZE, emptyList()),
             K(C_GONE, "test.Gone", GONE_SIZE, emptyList()),
+            // Two class objects with one name (e.g. two class loaders): the class table merges them.
+            K(C_DUP_A, "test.Dup", DUP_SIZE, emptyList()),
+            K(C_DUP_B, "test.Dup", DUP_SIZE, emptyList()),
         )
         for (c in classes) { s(c.name); c.fields.forEach { s(it) }; c.statics.forEach { s(it.first) } }
         s("app"); s("image")
@@ -80,7 +86,7 @@ object DiffHprof {
                 for (v in values) buf.putInt(v)
                 w.write(InstanceDumpRecord(id, 0, classId, buf.array()))
             }
-            val elements = (0 until itemCount).map { item(it) } + (0 until lateCount).map { late(it) } + (0 until goneCount).map { gone(it) }
+            val elements = (0 until itemCount).map { item(it) } + (0 until lateCount).map { late(it) } + (0 until goneCount).map { gone(it) } + (0 until dupACount).map { dupA(it) } + (0 until dupBCount).map { dupB(it) }
             w.write(ObjectArrayDumpRecord(ITEMS, 0, C_OBJARR, elements.toLongArray()))
             for (i in 0 until itemCount) {
                 inst(item(i), C_ITEM, payload(i).toInt())
@@ -88,7 +94,47 @@ object DiffHprof {
             }
             for (i in 0 until lateCount) inst(late(i), C_LATE)
             for (i in 0 until goneCount) inst(gone(i), C_GONE)
+            for (i in 0 until dupACount) inst(dupA(i), C_DUP_A)
+            for (i in 0 until dupBCount) inst(dupB(i), C_DUP_B)
             w.write(ByteArrayDump(CACHE_DATA, 0, ByteArray(cacheBytes)))
+        }
+    }
+}
+
+/**
+ * A dump with [classCount] app classes `gen.C<i>` of [instancesPer] instances each, every instance held by
+ * one Object[] that is a static of `gen.Holder`. Used to size the diff of a large app (25-30k classes).
+ */
+object ManyClassesHprof {
+    private const val OBJ = 2
+    private const val C_OBJECT = 1L; private const val C_CLASS = 2L; private const val C_OBJARR = 3L; private const val C_HOLDER = 4L
+    private const val FIRST_CLASS = 100L
+    private const val ARRAY = 50L
+    private const val FIRST_INSTANCE = 1_000_000L
+
+    fun write(file: File, classCount: Int, instancesPer: Int) {
+        var nextString = 1L
+        val strings = LinkedHashMap<String, Long>()
+        fun s(value: String) = strings.getOrPut(value) { nextString++ }
+        val names = listOf("java.lang.Object", "java.lang.Class", "java.lang.Object[]", "gen.Holder") + List(classCount) { "gen.pkg${it % 50}.C$it" }
+        for (n in names) s(n)
+        s("items"); s("app"); s("image")
+        fun classId(i: Int) = if (i < 4) (i + 1).toLong() else FIRST_CLASS + i
+        val header = HprofHeader(System.currentTimeMillis(), HprofVersion.ANDROID, 4)
+        HprofWriter.openWriterFor(file, header).use { w ->
+            for ((value, id) in strings) w.write(HprofRecord.StringRecord(id, value))
+            names.forEachIndexed { i, n -> w.write(HprofRecord.LoadClassRecord(i + 1, classId(i), 0, s(n))) }
+            w.write(HeapDumpInfoRecord('I'.code, s("image")))
+            names.forEachIndexed { i, _ ->
+                val statics = if (classId(i) == C_HOLDER) listOf(StaticFieldRecord(s("items"), OBJ, ValueHolder.ReferenceHolder(ARRAY))) else emptyList()
+                w.write(ClassDumpRecord(classId(i), 0, if (i == 0) 0 else C_OBJECT, 0, 0, 0, if (i == 1) SyntheticHprof.CLASS_INSTANCE_SIZE else 16, statics, emptyList()))
+            }
+            w.write(HeapDumpInfoRecord('A'.code, s("app")))
+            val ids = LongArray(classCount * instancesPer) { FIRST_INSTANCE + it }
+            w.write(ObjectArrayDumpRecord(ARRAY, 0, C_OBJARR, ids))
+            for (c in 0 until classCount) for (k in 0 until instancesPer) {
+                w.write(InstanceDumpRecord(FIRST_INSTANCE + c.toLong() * instancesPer + k, 0, classId(4 + c), ByteArray(0)))
+            }
         }
     }
 }

@@ -54,7 +54,7 @@ fun Snapshot.asView(): SnapshotView = object : SnapshotView, SnapshotBacked {
     }
     override fun indexInParent(parentRef: String, childRef: String) = this@asView.indexInParent(parentRef, childRef)
     override fun diff(base: SnapshotView): DiffResult {
-        val before = (base as? SnapshotBacked)?.snapshot ?: throw IllegalArgumentException("base is not an analysed snapshot")
+        val before = (base as? SnapshotBacked)?.snapshot ?: throw IllegalArgumentException("the base snapshot cannot be compared: it is not backed by a real analysis")
         return SnapshotDiff.diff(before, this@asView)
     }
     override fun close() = this@asView.close()

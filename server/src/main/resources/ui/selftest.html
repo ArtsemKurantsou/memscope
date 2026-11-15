@@ -97,6 +97,7 @@ eq('nearestIndex', [nearestIndex([smp(0, 1), smp(1000, 1), smp(2000, 1)], 1400),
   eq("root label of a category", rootLabelOf({ kind: "CATEGORY", label: "Static fields" }), "Static fields");
   eq("root label of class statics", rootLabelOf({ kind: "CLASS_STATICS", label: "x.Y", className: "x.Y" }), "Static fields / x.Y");
   eq("deeper rows have no root label", rootLabelOf({ kind: "OBJECT", label: "x.Y" }), null);
+  eq("indexDiff fills omitted zeros", indexDiff({ classes: [{ className: "a.B", countAfter: 2 }], roots: [{ label: "x", retainedAfter: 5 }] }).classByName.get("a.B"), { isAppCode: false, countBefore: 0, countAfter: 2, shallowBefore: 0, shallowAfter: 0, retainedBefore: 0, retainedAfter: 0, appCountBefore: 0, appCountAfter: 0, appShallowBefore: 0, appShallowAfter: 0, appRetainedBefore: 0, appRetainedAfter: 0, className: "a.B" });
   eq("root delta app / all", [rootDelta(diff, "Static fields", true), rootDelta(diff, "Static fields", false), rootDelta(diff, "nope", true)], [5, 40, null]);
 }
 out.textContent += fails ? '\n' + fails + ' FAILED' : '\nALL PASSED';

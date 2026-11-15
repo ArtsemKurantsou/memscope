@@ -107,13 +107,14 @@ async function defaultReopen(sid, snap) {
 /**
  * What grew between snapshot `baseId` (before) and `snap` (after). Both must be open on the server: a 409
  * "not analysed: <id>" re-opens the named one and retries (the other is touched first so it stays the more
- * recently used of the two).
+ * recently used of the two). `isCurrent` says whether the caller still wants the result; once it is false no snapshot is re-opened.
  */
-async function diff(sid, snap, baseId) {
+async function diff(sid, snap, baseId, isCurrent = () => true) {
   const url = `/api/snapshots/${sid}/${snap}/diff` + q({ base: baseId });
   for (let attempt = 0; ; attempt++) {
     try { return await get(url); } catch (e) {
       if (!e.notAnalysed || attempt >= 2) throw e;
+      if (!isCurrent()) throw new ApiError(0, { error: "Superseded", hint: "", kind: "SUPERSEDED" }); // the user moved on: do not evict what they now browse
       const missing = /^not analysed: (\S+)/.exec(e.message)?.[1] || snap;
       const open = missing === snap ? baseId : snap;
       await get(`/api/snapshots/${sid}/${open}/summary`).catch(() => {});
@@ -141,6 +142,6 @@ export function snapshotApi(sid, snap) {
     indexInParent: (parent, child) => call('/indexInParent' + q({ parent, child })),
     classes: () => call('/classes'),
     instances: (cls, offset = 0, limit = 25) => call('/instances' + q({ class: cls, offset, limit })),
-    diff: (baseId) => diff(sid, snap, baseId),
+    diff: (baseId, isCurrent) => diff(sid, snap, baseId, isCurrent),
   };
 }

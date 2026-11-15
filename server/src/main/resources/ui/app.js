@@ -191,7 +191,8 @@ $('tab-classes').addEventListener('click', () => setTab('classes'));
 
 /** Fills the Classes tab with the open snapshot's classes (once per snapshot). */
 async function loadClassesView() {
-  if (!state.snap || state.classesLoaded) return;
+  if (!state.snap) { classesView.setMessage(el('div', { class: 'empty' }, 'No snapshot open.')); return; }
+  if (state.classesLoaded) return;
   const snap = state.snap;
   classesView.setMessage(el('div', { class: 'empty' }, el('span', { class: 'spinner' }), ' Loading classes…'));
   try {
@@ -240,7 +241,7 @@ async function fetchDiff(force = false) {
   renderCompareLine();
   let result = null;
   let error = null;
-  try { result = indexDiff(await state.snap.diff(state.base.id)); } catch (e) { error = e; }
+  try { result = indexDiff(await state.snap.diff(state.base.id, () => my === state.diffToken)); } catch (e) { error = e; }
   if (my !== state.diffToken) return;
   state.diffLoading = false;
   state.diff = result;

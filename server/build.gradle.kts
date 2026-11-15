@@ -17,8 +17,17 @@ dependencies {
     implementation(libs.ktor.server.core)
     implementation(libs.ktor.server.netty)
     implementation(libs.ktor.server.content.negotiation)
+    implementation(libs.ktor.server.compression)
     implementation(libs.ktor.serialization.json)
     // Ktor logs through SLF4J; without a binding it prints a warning on every start.
     runtimeOnly("org.slf4j:slf4j-nop:2.0.13")
     testImplementation(libs.ktor.server.tests)
+}
+
+// Route tests build small real heap dumps with the analysis tests' synthetic writers (DiffHprof).
+evaluationDependsOn(":analysis")
+val analysisTestOutput = rootProject.project(":analysis").extensions.getByType<SourceSetContainer>()["test"].output
+dependencies {
+    testImplementation(analysisTestOutput)
+    testImplementation(libs.shark.graph)
 }

@@ -66,13 +66,15 @@ export function buildRows(classes, diff, hideSystem) {
   return rows;
 }
 
+const COLLATOR = new Intl.Collator();
+
 /** Substring filter (case-insensitive) and sort; ties keep the class name order so the result is stable. */
 export function sortAndFilter(rows, { filter, key, dir }) {
   const needle = filter.trim().toLowerCase();
   const out = needle ? rows.filter((r) => r.className.toLowerCase().includes(needle)) : rows.slice();
   const sign = dir === 'asc' ? 1 : -1;
   if (key === 'name') {
-    out.sort((a, b) => sign * a.className.localeCompare(b.className));
+    out.sort((a, b) => sign * COLLATOR.compare(a.className, b.className));
   } else {
     out.sort((a, b) => sign * (a[key] - b[key]) || (a.className < b.className ? -1 : a.className > b.className ? 1 : 0));
   }
@@ -117,17 +119,17 @@ export function createClasses({ container, getOptions, onPickClass }) {
 
   function setSort(key) {
     sort = sort.key === key ? { key, dir: sort.dir === 'desc' ? 'asc' : 'desc' } : { key, dir: key === 'name' ? 'asc' : 'desc' };
-    recompute();
+    recompute(true);
   }
 
-  function recompute() {
+  function recompute(resetScroll = false) {
     shown = sortAndFilter(rows, { filter, ...sort });
     maxDelta = 1;
     if (diff) for (const r of shown) maxDelta = Math.max(maxDelta, Math.abs(r.dRetained));
     countEl.textContent = `${formatInt(shown.length)} of ${formatInt(rows.length)} classes`;
     renderHead();
     spacer.style.height = shown.length * ROW + 'px';
-    scroller.scrollTop = 0;
+    if (resetScroll) scroller.scrollTop = 0; // a new diff or a hide-system toggle keeps the reader's place
     paint(true);
   }
 
@@ -182,12 +184,12 @@ export function createClasses({ container, getOptions, onPickClass }) {
     if (next && next.classList.contains('cls-row')) { next.focus(); ev.preventDefault(); }
   });
   new ResizeObserver(() => paint()).observe(scroller);
-  filterInput.addEventListener('input', debounce(() => { filter = filterInput.value; recompute(); }, 120));
+  filterInput.addEventListener('input', debounce(() => { filter = filterInput.value; recompute(true); }, 120));
 
-  function rebuild() {
+  function rebuild(resetScroll = false) {
     if (!source) { rows = []; shown = []; renderHead(); paint(true); return; }
     rows = buildRows(source.classes, diff, getOptions().hideSystem);
-    recompute();
+    recompute(resetScroll);
   }
 
   /** Shows `node` (spinner / error) instead of the table, or the table again for null. */
@@ -200,7 +202,7 @@ export function createClasses({ container, getOptions, onPickClass }) {
 
   return {
     /** The class table of the open snapshot (ClassStat[]), or null while it loads. */
-    setClasses(classes) { source = classes ? { classes } : null; setMessage(null); rebuild(); },
+    setClasses(classes) { source = classes ? { classes } : null; setMessage(null); rebuild(true); },
     /** The indexed diff against the base snapshot, or null for no comparison. */
     setDiff(d) {
       diff = d;

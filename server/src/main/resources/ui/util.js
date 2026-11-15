@@ -130,11 +130,22 @@ export function formatDeltaInt(n) {
  * Index of a DiffResult for lookups: classes by name, roots by label. `hideSystem` picks the numbers a
  * view shows: app-heap bytes (default) or all reachable bytes.
  */
+/** The server leaves out numbers that are 0 and `isAppCode: false`: fill them in. */
+const CLASS_DEFAULTS = {
+  isAppCode: false, countBefore: 0, countAfter: 0, shallowBefore: 0, shallowAfter: 0, retainedBefore: 0, retainedAfter: 0,
+  appCountBefore: 0, appCountAfter: 0, appShallowBefore: 0, appShallowAfter: 0, appRetainedBefore: 0, appRetainedAfter: 0,
+};
+const ROOT_DEFAULTS = { retainedBefore: 0, retainedAfter: 0, appRetainedBefore: 0, appRetainedAfter: 0 };
+
 export function indexDiff(diff) {
+  const classes = diff.classes.map((c) => ({ ...CLASS_DEFAULTS, ...c }));
+  const roots = diff.roots.map((r) => ({ ...ROOT_DEFAULTS, ...r }));
   return {
     ...diff,
-    classByName: new Map(diff.classes.map((c) => [c.className, c])),
-    rootByLabel: new Map(diff.roots.map((r) => [r.label, r])),
+    classes,
+    roots,
+    classByName: new Map(classes.map((c) => [c.className, c])),
+    rootByLabel: new Map(roots.map((r) => [r.label, r])),
   };
 }
 

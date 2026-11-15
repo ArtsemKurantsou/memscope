@@ -1,5 +1,6 @@
 package dev.memscope.server
 
+import dev.memscope.analysis.DiffJson
 import dev.memscope.analysis.DiffResult
 import dev.memscope.analysis.HprofUnreadableException
 import dev.memscope.capture.DeviceArgs
@@ -33,6 +34,10 @@ import io.ktor.server.request.receive
 import io.ktor.server.request.receiveText
 import io.ktor.server.response.header
 import io.ktor.server.response.respond
+import io.ktor.server.response.respondText
+import io.ktor.server.plugins.compression.Compression
+import io.ktor.server.plugins.compression.gzip
+import io.ktor.server.plugins.compression.minimumSize
 import io.ktor.server.routing.Route
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
@@ -61,6 +66,10 @@ private fun unreadable(message: String) = ApiException(
  */
 fun Application.memscopeModule(deps: ServerDeps, allowedHosts: Set<String>) {
     install(ContentNegotiation) { json(apiJson) }
+    // A diff of a large app is megabytes of repetitive JSON (about 1% gzipped).
+    install(Compression) {
+        gzip { minimumSize(1024) }
+    }
 
     intercept(ApplicationCallPipeline.Plugins) {
         // HTTP/1.1 always carries Host; without it (HTTP/1.0, the in-process test engine) the address the engine saw is used.
@@ -318,6 +327,9 @@ private fun Route.snapshotRoutes(deps: ServerDeps) {
     }
 
     /** Both snapshots (same session) must be open unless the result is cached; the 409 names the one that is not. */
+    fun notAnalysedNamed(id: String) =
+        ApiException(HttpStatusCode.Conflict, "not analysed: $id", SnapshotRegistry.notAnalysed().hint, "NOT_ANALYSED")
+
     fun diff(sid: String, snap: String, base: String): DiffResult {
         lookup(sid, base)
         for (id in listOf(base, snap)) {
@@ -326,11 +338,15 @@ private fun Route.snapshotRoutes(deps: ServerDeps) {
         }
         return deps.diffs.getOrCompute("$sid/$snap|$base") {
             for (id in listOf(base, snap)) {
-                if (!deps.snapshots.contains("$sid/$id")) {
-                    throw ApiException(HttpStatusCode.Conflict, "not analysed: $id", SnapshotRegistry.notAnalysed().hint, "NOT_ANALYSED")
-                }
+                if (!deps.snapshots.contains("$sid/$id")) throw notAnalysedNamed(id)
             }
-            query(sid, snap) { after -> query(sid, base) { before -> after.diff(before) } }
+            try {
+                query(sid, snap) { after -> query(sid, base) { before -> after.diff(before) } }
+            } catch (e: ApiException) {
+                // A snapshot was evicted between the check above and the query: say which one.
+                if (e.kind != "NOT_ANALYSED" || e.message != "not analysed") throw e
+                throw notAnalysedNamed(listOf(base, snap).firstOrNull { !deps.snapshots.contains("$sid/$it") } ?: snap)
+            }
         }
     }
 
@@ -415,7 +431,7 @@ private fun Route.snapshotRoutes(deps: ServerDeps) {
         get("/diff") {
             val (s, n) = ids()
             val base = call.str("base")
-            call.respond(io { diff(s, n, base) })
+            call.respondText(DiffJson.encode(io { diff(s, n, base) }), ContentType.Application.Json)
         }
         get("/classes") { val (s, n) = ids(); call.respond(io { query(s, n) { it.classes() } }) }
         get("/instances") {
