@@ -386,6 +386,14 @@ export function createCapture({ onSnapshot, onNoSnapshot, onEmptyState, onSessio
     if (!session || busy || !session.snapshots.some((s) => s.id === id)) return;
     snapSel.value = id;
     const meta = selectedSnapshotMeta();
+    if (meta && meta.status !== 'OK') {
+      // unreadable or failed: say why instead of trying to open it
+      showFailure({
+        message: `Snapshot ${meta.label || meta.id} cannot be opened (${meta.status.toLowerCase()})`,
+        hint: (meta.error ? meta.error + ' ' : '') + 'Capture a new snapshot to replace it.',
+      }, () => retryOpen(meta.id));
+      return;
+    }
     if (meta) await onSnapshot(session.id, meta);
   }
 

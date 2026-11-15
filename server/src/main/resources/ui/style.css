@@ -245,3 +245,14 @@ table.fields td:first-child { word-break: normal; overflow-wrap: anywhere; min-w
 .tl-r-row { display: flex; align-items: center; gap: 6px; }
 .tl-r-row b { margin-left: auto; padding-left: 12px; font-family: var(--mono); font-weight: 600; }
 .tl-r-total { border-top: 1px solid var(--border); margin-top: 2px; padding-top: 2px; }
+
+/* snapshot chips and status under the timeline */
+.tl-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; align-items: center; }
+.tl-chip { min-width: 26px; height: 26px; padding: 0 6px; border: 1.5px solid var(--text); background: var(--panel); color: var(--text); font: inherit; font-weight: 700; font-variant-numeric: tabular-nums; cursor: pointer; border-radius: 13px; }
+.tl-chip.dump { border-radius: 4px; border-style: dashed; }
+.tl-chip:hover:not(:disabled), .tl-chip.selected { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.tl-chip:disabled { opacity: .5; cursor: not-allowed; }
+.tl-marker.hl .tl-badge { fill: var(--accent); stroke: var(--accent); }
+.tl-marker.hl .tl-mnum { fill: var(--accent-ink); }
+.tl-marker.hl .tl-mline { stroke: var(--accent); stroke-width: 2.5; }
+.tl-status { margin-top: 4px; color: var(--err-ink); }

@@ -3,7 +3,7 @@
 <body style="font:14px monospace"><pre id="out"></pre>
 <script type="module">
 import { shareInFlight, formatBytes, formatPercent, splitClassName, refKind, hasObjectDetails, rowSize, rowPercent, rowVisible, sortRows } from './util.js';
-import { downsample, niceStep, timeStep, pausedBands, nearestIndex } from './timeline.js';
+import { downsample, niceStep, timeStep, heldBands, capSamples, nearestIndex } from './timeline.js';
 const out = document.getElementById('out');
 let fails = 0;
 function eq(name, got, want) {
@@ -51,7 +51,14 @@ eq('niceStep 62 MB', niceStep(62), 25);
 eq('niceStep 0', niceStep(0), 1);
 eq('timeStep 30 s', timeStep(30), 5);
 eq('timeStep 1 h', timeStep(3600), 600);
-eq('pausedBands', pausedBands([smp(0, 1), smp(1000, 1, true), smp(2000, 1, true), smp(3000, 1), smp(4000, 1, true)]), [[1000, 3000], [4000, 5000]]);
+eq('heldBands closed and open', heldBands([{ startMs: 1000, endMs: 3000 }, { startMs: 4000 }], 4500), [[1000, 3000], [4000, 4500]]);
+{
+  const many = Array.from({ length: 9000 }, (_, i) => smp(i * 1000, i === 10 ? 99999 : i));
+  const c = capSamples(many);
+  eq('capSamples bounds the array', c.length <= 5000, true);
+  eq('capSamples keeps the newest exactly', c.slice(-1000).map((x) => x.tMs), many.slice(-1000).map((x) => x.tMs));
+  eq('capSamples keeps old peaks', c.some((x) => x.totalPssKb === 99999), true);
+}
 eq('nearestIndex', [nearestIndex([smp(0, 1), smp(1000, 1), smp(2000, 1)], 1400), nearestIndex([smp(0, 1), smp(1000, 1)], 5000), nearestIndex([smp(0, 1), smp(1000, 1)], 0)], [1, 1, 0]);
 {
   let starts = 0;

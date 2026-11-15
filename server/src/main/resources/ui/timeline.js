@@ -6,6 +6,7 @@ import { el, prefs } from './util.js';
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const POLL_MS = 2000;
 const MAX_POINTS = 600;      // drawn points; more samples are bucketed (max kept) so an hour of 1 Hz samples stays cheap
+const MAX_KEPT = 5000;        // accumulated samples; beyond that the older ones are re-bucketed
 const GAP_MS = 20000;        // a longer hole between samples (process gone, polls failing) is not interpolated
 const HEIGHT = 210;
 const M = { left: 44, right: 14, top: 42, bottom: 24 };
@@ -51,20 +52,16 @@ export function timeStep(spanSec, maxTicks = 8) {
   return steps.find((s) => spanSec / s <= maxTicks) || steps[steps.length - 1];
 }
 
-/**
- * Intervals [from, to] (ms) during which the app was held: each run of paused samples, ending at the first sample
- * after the run (or one second after its last paused sample).
- */
-export function pausedBands(samples) {
-  const bands = [];
-  let from = null;
-  for (let i = 0; i < samples.length; i++) {
-    const s = samples[i];
-    if (s.paused && from === null) from = s.tMs;
-    if (!s.paused && from !== null) { bands.push([from, s.tMs]); from = null; }
-  }
-  if (from !== null) bands.push([from, samples[samples.length - 1].tMs + 1000]);
-  return bands;
+/** Keeps at most MAX_KEPT samples: when over, the older part is thinned (peaks kept) and the newest 1000 stay exact. */
+export function capSamples(samples, maxKept = MAX_KEPT) {
+  if (samples.length <= maxKept) return samples;
+  const recent = samples.slice(-1000);
+  return downsample(samples.slice(0, samples.length - 1000), Math.floor(maxKept / 2)).concat(recent);
+}
+
+/** [from, to] bands (ms) of the held intervals the server recorded; an interval still open ends at `endMs`. */
+export function heldBands(held, endMs) {
+  return (held || []).map((h) => [h.startMs, h.endMs == null ? Math.max(h.startMs, endMs) : h.endMs]);
 }
 
 /** Index of the sample closest in time to `t` (samples sorted by tMs, non-empty). */
@@ -105,6 +102,11 @@ export function createTimeline({ container, onSelectSnapshot, pollMs = POLL_MS }
   let loadedOnce = false;
   let failure = null;
   let hover = null;            // index into `samples`
+  let held = [];
+  let highlight = null;        // snapshot id whose marker is emphasised (chip hover / focus)
+  let pointerIn = false;       // the pointer is over the plot: do not rebuild it under the pointer
+  let dirty = false;           // a redraw was deferred because of pointerIn
+  let chipSig = '';
   let collapsed = prefs.get('timelineCollapsed', false);
   let timer = null;
   let token = 0;               // drops responses of an earlier session / request
@@ -115,8 +117,10 @@ export function createTimeline({ container, onSelectSnapshot, pollMs = POLL_MS }
   const legend = el('div', { class: 'tl-legend' });
   const head = el('div', { class: 'tl-head' }, toggle, title, legend);
   const plot = el('div', { class: 'tl-plot' });
-  const note = el('div', { class: 'tl-note muted' }, "Memory rises after each dump; this is the dump's own cost.");
-  const body = el('div', { class: 'tl-body', id: 'tl-body' }, plot, note);
+  const note = el('div', { class: 'tl-note muted' }, "Memory rises after each dump; this is the dump's own cost. While the app is held at a breakpoint only the total is measured (smaps_rollup), so the stack may not add up to the total line there.");
+  const chips = el('div', { class: 'tl-chips', role: 'group', 'aria-label': 'Snapshots on the timeline' });
+  const status = el('div', { class: 'tl-status', role: 'status', hidden: true });
+  const body = el('div', { class: 'tl-body', id: 'tl-body' }, plot, chips, status, note);
   container.classList.add('timeline');
   container.replaceChildren(head, body);
 
@@ -137,7 +141,7 @@ export function createTimeline({ container, onSelectSnapshot, pollMs = POLL_MS }
 
   function reset() {
     token++;
-    samples = []; markers = []; loadedOnce = false; failure = null; hover = null; busy = false;
+    samples = []; markers = []; held = []; chipSig = ''; pointerIn = false; dirty = false; loadedOnce = false; failure = null; hover = null; busy = false;
     clearTimeout(timer); timer = null;
   }
 
@@ -177,8 +181,9 @@ export function createTimeline({ container, onSelectSnapshot, pollMs = POLL_MS }
       const [t, s] = await Promise.all([api.timeline(sid, since), api.session(sid).catch(() => null)]);
       if (my !== token) return;
       if (s) active = s.state === 'ACTIVE';
-      if (since == null) samples = t.samples; else if (t.samples.length) samples = samples.concat(t.samples);
+      if (since == null) samples = t.samples; else if (t.samples.length) samples = capSamples(samples.concat(t.samples));
       markers = t.markers;
+      held = t.held || [];
       loadedOnce = true;
       failure = null;
       if (hover != null && hover >= samples.length) hover = null;
@@ -210,10 +215,51 @@ export function createTimeline({ container, onSelectSnapshot, pollMs = POLL_MS }
     plot.replaceChildren(el('div', { class: 'tl-empty', role: 'status' }, text, extra));
   }
 
+  function renderStatus() {
+    // a failure after the first load is shown, not swallowed; polling goes on and Retry asks again at once
+    if (failure && loadedOnce) {
+      status.hidden = false;
+      status.replaceChildren(`Could not refresh the timeline: ${failure} `, el('button', { class: 'btn small', type: 'button', onclick: () => schedule(true) }, 'Retry'));
+    } else {
+      status.hidden = true;
+      status.replaceChildren();
+    }
+  }
+
+  /** Numbered snapshot buttons: a stable, easy target row that mirrors the markers (same numbers and shapes). */
+  function renderChips() {
+    const sig = markers.map((m) => `${m.snapshotId}|${m.kind}|${m.label}`).join('\n') + '\n' + selected;
+    if (sig === chipSig) return;
+    chipSig = sig;
+    chips.hidden = !markers.length;
+    chips.replaceChildren(...markers.map((m, i) => {
+      const isMilestone = m.kind === 'milestone';
+      const label = `${i + 1}. ${m.label} (${isMilestone ? 'milestone' : 'dump'}) at ${fmtSec(m.tMs)}`;
+      const b = el('button', {
+        type: 'button', class: 'tl-chip ' + (isMilestone ? 'milestone' : 'dump') + (m.snapshotId && m.snapshotId === selected ? ' selected' : ''),
+        title: label, 'aria-label': 'Select snapshot ' + label, 'aria-pressed': m.snapshotId === selected ? 'true' : 'false', disabled: !m.snapshotId,
+      }, String(i + 1));
+      b.addEventListener('click', () => onSelectSnapshot && m.snapshotId && onSelectSnapshot(m.snapshotId));
+      b.addEventListener('mouseenter', () => setHighlight(m.snapshotId));
+      b.addEventListener('focus', () => setHighlight(m.snapshotId));
+      b.addEventListener('mouseleave', () => setHighlight(null));
+      b.addEventListener('blur', () => setHighlight(null));
+      return b;
+    }));
+  }
+
+  function setHighlight(id) {
+    highlight = id;
+    for (const g of plot.querySelectorAll('.tl-marker')) g.classList.toggle('hl', !!id && g.dataset.snapshot === id);
+  }
+
   function render() {
     applyCollapsed();
     renderLegend();
+    renderStatus();
+    renderChips();
     if (collapsed) return;
+    if (pointerIn && plot.querySelector('.tl-svg') && samples.length >= 2) { dirty = true; return; } // never rebuild under the pointer
     if (!sessionId) { message('No session yet. Memory samples appear here once you dump an app or record its startup.'); return; }
     if (failure && !samples.length) { message('Could not load the memory timeline: ' + failure); return; }
     if (!loadedOnce) { message(el('span', { class: 'spinner' }), 'Loading the memory timeline…'); return; }
@@ -229,10 +275,12 @@ export function createTimeline({ container, onSelectSnapshot, pollMs = POLL_MS }
     const width = Math.max(320, Math.floor(plot.clientWidth || container.clientWidth || 800));
     const pw = width - M.left - M.right;
     const ph = HEIGHT - M.top - M.bottom;
-    const lastT = Math.max(samples[samples.length - 1].tMs, ...markers.map((m) => m.tMs), 1000);
+    let lastT = Math.max(samples[samples.length - 1].tMs, 1000);
+    for (const m of markers) if (m.tMs > lastT) lastT = m.tMs;
     const pts = downsample(samples);
     const stackSum = (s) => SERIES.reduce((a, d) => a + d.of(s), 0);
-    const maxKb = Math.max(1, ...pts.map((s) => Math.max(s.totalPssKb, stackSum(s))));
+    let maxKb = 1;
+    for (const s of pts) maxKb = Math.max(maxKb, s.totalPssKb, stackSum(s));
     const step = niceStep(mb(maxKb), 3);
     const top = Math.max(step, Math.ceil(mb(maxKb) / step) * step);
     const x = (t) => M.left + (t / lastT) * pw;
@@ -249,7 +297,7 @@ export function createTimeline({ container, onSelectSnapshot, pollMs = POLL_MS }
 
     const children = [];
     // paused bands, under the data
-    const bands = pausedBands(samples);
+    const bands = heldBands(held, lastT);
     const bandEls = bands.map(([from, to]) => {
       const bx = x(from);
       const bw = Math.max(2, x(Math.min(to, lastT)) - bx);
@@ -311,7 +359,7 @@ export function createTimeline({ container, onSelectSnapshot, pollMs = POLL_MS }
         ? svg('circle', { cx: mx, cy: by, r: 9, class: 'tl-badge' })
         : svg('rect', { x: mx - 9, y: by - 9, width: 18, height: 18, rx: 3, class: 'tl-badge' });
       const g = svg('g', {
-        class: 'tl-marker' + (isMilestone ? ' milestone' : ' dump') + (sel ? ' selected' : ''),
+        class: 'tl-marker' + (isMilestone ? ' milestone' : ' dump') + (sel ? ' selected' : '') + (m.snapshotId && m.snapshotId === highlight ? ' hl' : ''),
         tabindex: m.snapshotId ? 0 : null, role: 'button', 'aria-label': 'Select snapshot ' + label, 'data-snapshot': m.snapshotId || null,
       },
       svg('title', null, label),
@@ -320,7 +368,7 @@ export function createTimeline({ container, onSelectSnapshot, pollMs = POLL_MS }
       svg('text', { x: mx, y: by + 4, 'text-anchor': 'middle', class: 'tl-mnum' }, String(num)));
       if (m.snapshotId) {
         const pick = (ev) => { ev.stopPropagation(); onSelectSnapshot && onSelectSnapshot(m.snapshotId); };
-        g.addEventListener('click', pick);
+        g.addEventListener('pointerdown', pick); // not click: nothing may replace the element between press and release
         g.addEventListener('keydown', (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); pick(ev); } });
       }
       markerEls.push(g);
@@ -384,15 +432,23 @@ export function createTimeline({ container, onSelectSnapshot, pollMs = POLL_MS }
 
   const resizeObserver = typeof ResizeObserver === 'function' ? new ResizeObserver(() => { if (samples.length >= 2 && !collapsed) render(); }) : null;
   if (resizeObserver) resizeObserver.observe(container);
-  document.addEventListener('visibilitychange', () => { if (!document.hidden && sessionId) schedule(true); });
+  plot.addEventListener('pointerenter', () => { pointerIn = true; });
+  plot.addEventListener('pointerleave', () => { pointerIn = false; if (dirty) { dirty = false; render(); } });
+  const onVisible = () => { if (!document.hidden && sessionId) schedule(true); };
+  document.addEventListener('visibilitychange', onVisible);
 
   applyCollapsed();
   render();
 
   return {
     setSession,
-    setSelected(id) { selected = id; if (samples.length >= 2 && !collapsed) render(); },
+    setSelected(id) {
+      selected = id;
+      render();
+      // a deferred redraw (pointer over the plot) must not leave the old selection highlighted
+      for (const g of plot.querySelectorAll('.tl-marker')) g.classList.toggle('selected', g.dataset.snapshot === id);
+    },
     refresh() { if (sessionId) schedule(true); },
-    destroy() { reset(); sessionId = null; if (resizeObserver) resizeObserver.disconnect(); },
+    destroy() { reset(); sessionId = null; document.removeEventListener('visibilitychange', onVisible); if (resizeObserver) resizeObserver.disconnect(); },
   };
 }
