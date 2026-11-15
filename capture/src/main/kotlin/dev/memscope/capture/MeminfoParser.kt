@@ -24,8 +24,12 @@ data class MemSample(
 @Serializable
 data class TimelineMarker(val tMs: Long, val kind: String, val label: String, val snapshotId: String?)
 
+/** An interval during which the app was held by the debugger; [endMs] is null while it still is. */
 @Serializable
-data class Timeline(val samples: List<MemSample>, val markers: List<TimelineMarker>)
+data class HeldInterval(val startMs: Long, val endMs: Long? = null)
+
+@Serializable
+data class Timeline(val samples: List<MemSample>, val markers: List<TimelineMarker>, val held: List<HeldInterval> = emptyList())
 
 object MeminfoParser {
     private val NUMBER = Regex("-?\\d+")

@@ -33,6 +33,7 @@ private val SUMMARY = """
 private class FakePhone : ProcessRunner {
     val commands = CopyOnWriteArrayList<List<String>>()
     val timeouts = CopyOnWriteArrayList<Duration>()
+    val tokens = CopyOnWriteArrayList<CancelToken>()
     @Volatile var meminfo: () -> ProcessResult = { ProcessResult(0, SUMMARY, "") }
     @Volatile var smapsPss = 4242
     @Volatile var pid = 777
@@ -44,6 +45,7 @@ private class FakePhone : ProcessRunner {
         val c = args.drop(3) // adb -s <serial>
         commands += c
         timeouts += timeout
+        tokens += cancel
         return when {
             c.getOrNull(1) == "dumpsys" -> meminfo()
             c.getOrNull(1) == "ps" -> ProcessResult(0, "PID NAME\n" + if (running) "$pid dev.app\n" else "", "")
@@ -162,6 +164,75 @@ class MeminfoPollerTest {
         phone.pid = 888 // came back with a new pid
         assertTrue(poller.pollOnce())
         assertEquals(listOf("shell", "run-as", "dev.app", "cat", "/proc/888/smaps_rollup"), phone.commands.last())
+    }
+
+    @Test
+    fun `setPaused during a poll in flight cancels it, discards its late result and does not back off`() {
+        val inCall = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        phone.meminfo = { inCall.countDown(); release.await(5, java.util.concurrent.TimeUnit.SECONDS); ProcessResult(0, SUMMARY, "") }
+        val result = java.util.concurrent.atomic.AtomicReference<Boolean>()
+        val t = Thread { result.set(poller.pollOnce()) }.also { it.start() }
+        assertTrue(inCall.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        now += 300
+        poller.setPaused(true)
+        assertTrue(phone.tokens.single().isCancelled, "the in-flight call must be cancelled")
+        release.countDown()
+        t.join(5000)
+        assertFalse(result.get())
+        assertTrue(samples().isEmpty(), "a result that arrives after the hold began is discarded")
+        assertEquals(1000, poller.currentIntervalMs)
+        assertTrue(poller.pollOnce())
+        assertTrue(samples().single().paused)
+    }
+
+    @Test
+    fun `a 300 ms hold still yields a held interval and an open hold has no end`() {
+        now += 1000
+        poller.setPaused(true)
+        assertEquals(listOf(HeldInterval(1000, null)), MemTimeline.read(store, sid, null).held)
+        now += 300
+        poller.setPaused(false)
+        assertEquals(listOf(HeldInterval(1000, 1300)), MemTimeline.read(store, sid, null).held)
+        poller.setPaused(false) // no change, no event
+        assertEquals(1, MemTimeline.read(store, sid, null).held.size)
+    }
+
+    @Test
+    fun `a hold still open when the session ended is closed where the data stops`() {
+        now += 1000; poller.pollOnce()
+        now += 1000; poller.setPaused(true)
+        now += 1000; poller.pollOnce()
+        store.update(sid) { it.copy(state = SessionMeta.State.ENDED) }
+        assertEquals(listOf(HeldInterval(2000, 3000)), MemTimeline.read(store, sid, null).held)
+    }
+
+    @Test
+    fun `a stopped run cannot write even if its poll finishes later`() {
+        val inCall = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        phone.meminfo = { inCall.countDown(); release.await(5, java.util.concurrent.TimeUnit.SECONDS); ProcessResult(0, SUMMARY, "") }
+        val t = Thread { poller.pollOnce() }.also { it.start() }
+        assertTrue(inCall.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        poller.stop()
+        assertTrue(phone.tokens.single().isCancelled)
+        release.countDown()
+        t.join(5000)
+        assertTrue(samples().isEmpty())
+    }
+
+    @Test
+    fun `timeline reads are incremental and a full read is capped and keeps the peak`() {
+        val file = store.dir(sid).resolve("meminfo.jsonl")
+        fun line(t: Long, total: Int) = "{\"tMs\":$t,\"javaHeapKb\":1,\"nativeHeapKb\":1,\"graphicsKb\":0,\"codeKb\":0,\"stackKb\":0,\"otherKb\":0,\"totalPssKb\":$total,\"paused\":false}\n"
+        java.nio.file.Files.writeString(file, (0 until 5000).joinToString("") { line(it * 1000L, if (it == 1234) 99999 else it) })
+        val full = MemTimeline.read(store, sid, null)
+        assertEquals(MemTimeline.MAX_POINTS, full.samples.size)
+        assertTrue(full.samples.any { it.totalPssKb == 99999 })
+        assertTrue(full.samples.zipWithNext().all { (a, b) -> a.tMs < b.tMs })
+        java.nio.file.Files.writeString(file, line(5_000_000, 5) + line(5_001_000, 6), java.nio.file.StandardOpenOption.APPEND)
+        val inc = MemTimeline.read(store, sid, 4_999_000)
+        assertEquals(listOf(5_000_000L, 5_001_000L), inc.samples.map { it.tMs })
     }
 
     @Test
