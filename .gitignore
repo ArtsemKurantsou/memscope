@@ -1,0 +1,9 @@
+.gradle/
+build/
+*.hprof
+*.idx
+local.properties
+.superpowers/
+spike/**/build/
+.DS_Store
+.idea/
