@@ -58,23 +58,29 @@ class ServerDeps(
     private var polledSession: String? = null
 
     /** Polls the memory of [processName] (default: the package) for [sessionId]; the one poller moves to this session. Never throws. */
-    fun startPolling(sessionId: String, processName: String? = null) {
+    fun startPolling(sessionId: String, processName: String? = null, held: Boolean = false) {
         if (!memoryPolling) return
         try {
-            synchronized(pollerLock) {
+            val (p, name) = synchronized(pollerLock) {
                 val session = store.get(sessionId) ?: return
                 val p = poller ?: MeminfoPoller(adb, store).also { poller = it }
                 polledSession = sessionId
-                p.start(sessionId, processName ?: session.packageName)
+                p to (processName ?: session.packageName)
             }
+            p.start(sessionId, name) // never waits for the previous run: the lock is not held and nothing blocks
+            if (held) p.setPaused(true)
         } catch (e: Exception) {
             ServerLog.error("Could not start memory polling for session $sessionId: ${e.message}")
         }
     }
 
+    /** The poller if it is polling [sessionId]; the lock is released before anyone calls into it. */
+    private fun pollerOf(sessionId: String): MeminfoPoller? = synchronized(pollerLock) { poller.takeIf { polledSession == sessionId } }
+
     /** Stops polling if it is for [sessionId]. */
-    fun stopPolling(sessionId: String) = synchronized(pollerLock) {
-        if (polledSession == sessionId) { poller?.stop(); polledSession = null }
+    fun stopPolling(sessionId: String) {
+        val p = synchronized(pollerLock) { poller.takeIf { polledSession == sessionId }?.also { polledSession = null } }
+        p?.stop()
     }
 
     /** Resumes polling the active session after a server restart (the app may be gone: polls then just back off). */
@@ -84,8 +90,8 @@ class ServerDeps(
 
     /** Feeds a startup recording's pid and held-at-milestone state to the poller of [sessionId]. */
     fun pollerListener(sessionId: String, processName: String?) = object : StartupListener {
-        override fun onPid(pid: Int) = startPolling(sessionId, processName)
-        override fun onHeld(held: Boolean) { synchronized(pollerLock) { if (polledSession == sessionId) poller?.setPaused(held) } }
+        override fun onPid(pid: Int) = startPolling(sessionId, processName, held = true) // frozen in waitForDebugger until the debugger attaches
+        override fun onHeld(held: Boolean) { pollerOf(sessionId)?.setPaused(held) }
     }
 
     /**
@@ -122,7 +128,8 @@ class ServerDeps(
                 ServerLog.error("The startup recording ${job.id} did not finish cleaning up within ${STARTUP_CLEANUP_WAIT_MS / 1000} s; the next start clears the debug app.")
             }
         }
-        synchronized(pollerLock) { poller?.stop(); polledSession = null }
+        val p = synchronized(pollerLock) { poller.also { polledSession = null } }
+        p?.stop()
         jobs.close()
         snapshots.close()
     }

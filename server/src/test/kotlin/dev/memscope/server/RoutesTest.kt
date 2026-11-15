@@ -439,11 +439,13 @@ class RoutesTest {
             val s = store.newAttachSession()
             val l = deps.pollerListener(s.id, null)
             assertTrue(client.get("/api/sessions/${s.id}/timeline").obj()["samples"]!!.jsonArray.isEmpty())
-            l.onPid(100)
-            waitUntil { client.get("/api/sessions/${s.id}/timeline").obj()["samples"]!!.jsonArray.isNotEmpty() }
-            l.onHeld(true)
+            l.onPid(100) // frozen in waitForDebugger: held from the start
             waitUntil { client.get("/api/sessions/${s.id}/timeline").obj()["samples"]!!.jsonArray.any { it.jsonObject["paused"]!!.jsonPrimitive.content == "true" } }
+            assertEquals(1, client.get("/api/sessions/${s.id}/timeline").obj()["held"]!!.jsonArray.size)
             l.onHeld(false)
+            waitUntil { client.get("/api/sessions/${s.id}/timeline").obj()["samples"]!!.jsonArray.any { it.jsonObject["paused"]!!.jsonPrimitive.content == "false" } }
+            val held = client.get("/api/sessions/${s.id}/timeline").obj()["held"]!!.jsonArray.single().jsonObject
+            assertTrue(held["endMs"]!!.jsonPrimitive.content != "null")
         }
     }
 
