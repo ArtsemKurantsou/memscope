@@ -93,3 +93,31 @@ fun runAnalysis(job: Job, exited: java.util.concurrent.CompletableFuture<Unit>, 
         }
     }
 }
+
+/**
+ * A re-open must not start while an abandoned analysis of the same snapshot is still running.
+ * Waits for [previous] in 100 ms slices so the job stays cancellable, shows why it is waiting on the first
+ * step, and gives up after [timeoutMs] (a hung `Snapshot.open` would otherwise block the snapshot for good).
+ */
+fun awaitPreviousAnalysis(job: Job, previous: java.util.concurrent.CompletableFuture<Unit>, timeoutMs: Long) {
+    val deadline = System.nanoTime() + timeoutMs * 1_000_000
+    job.step(ANALYSIS_STEPS.first()) { detail ->
+        detail("waiting for the previous analysis to stop")
+        while (true) {
+            try {
+                previous.get(100, TimeUnit.MILLISECONDS)
+                return@step
+            } catch (_: java.util.concurrent.TimeoutException) { /* keep waiting */ }
+            if (job.cancel.isCancelled) {
+                throw DeviceException(DeviceException.Kind.CANCELLED, "Analysis was cancelled.", "Open the snapshot again to retry.")
+            }
+            if (System.nanoTime() > deadline) {
+                throw DeviceException(
+                    DeviceException.Kind.TIMEOUT,
+                    "The previous analysis of this snapshot did not stop within ${timeoutMs / 1000.0} s.",
+                    "Restart MemScope, then open the snapshot again.",
+                )
+            }
+        }
+    }
+}

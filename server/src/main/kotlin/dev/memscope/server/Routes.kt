@@ -119,7 +119,7 @@ private suspend fun ApplicationCall.respondError(t: Throwable) {
     }
 }
 
-/** Runs blocking work (adb, disk, heap queries) off the event loop. */
+/** Refuses a body that is not JSON (cross-site forms can only send form or text types). */
 private fun requireJson(call: ApplicationCall) {
     val type = call.request.contentType()
     if (!type.match(ContentType.Application.Json)) {
@@ -127,6 +127,7 @@ private fun requireJson(call: ApplicationCall) {
     }
 }
 
+/** Runs blocking work (adb, disk, heap queries) off the event loop. */
 private suspend fun <T> io(block: () -> T): T = withContext(Dispatchers.IO) { block() }
 
 private fun Route.deviceRoutes(deps: ServerDeps) {
@@ -273,8 +274,10 @@ private fun Route.snapshotRoutes(deps: ServerDeps) {
                         val mine = java.util.concurrent.CompletableFuture<Unit>()
                         val prior = synchronized(openLock) { analysisThreads.put(key, mine) }
                         mine.whenComplete { _, _ -> synchronized(openLock) { analysisThreads.remove(key, mine) } }
+                        var started = false
                         try {
-                            prior?.join() // a cancelled analysis of this snapshot may still be indexing: never two at once
+                            if (prior != null) awaitPreviousAnalysis(created, prior, deps.previousAnalysisTimeoutMs)
+                            started = true // runAnalysis starts its thread at once; that thread completes `mine`
                             val view = runAnalysis(created, mine) { progress -> deps.opener.open(file.toFile(), session.appPackagePrefixes, progress) }
                             deps.snapshots.put(key, view)
                             created.complete(key)
@@ -284,6 +287,10 @@ private fun Route.snapshotRoutes(deps: ServerDeps) {
                             throw DeviceException(DeviceException.Kind.COMMAND_FAILED, e.message ?: "unreadable", unreadable("").hint)
                         } finally {
                             synchronized(openLock) { openJobs.remove(key, created) }
+                            if (!started) {
+                                // never leave `mine` pending, but never let it finish before the older analysis really has
+                                if (prior == null) mine.complete(Unit) else prior.whenComplete { _, _ -> mine.complete(Unit) }
+                            }
                         }
                     }
                     created

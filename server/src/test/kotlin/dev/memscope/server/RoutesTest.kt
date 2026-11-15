@@ -46,12 +46,13 @@ class RoutesTest {
     private lateinit var store: SessionStore
     private lateinit var deps: ServerDeps
     private var now = 1_000_000L
+    private var waitTimeoutMs = 60_000L
     private val logs = java.util.concurrent.CopyOnWriteArrayList<String>()
     private lateinit var http: HttpClient
 
     private fun server(block: suspend ApplicationTestBuilder.() -> Unit) {
         store = SessionStore(home)
-        deps = ServerDeps(store, { runner.adb }, opener, clock = { now })
+        deps = ServerDeps(store, { runner.adb }, opener, clock = { now }, previousAnalysisTimeoutMs = waitTimeoutMs)
         ServerLog.sink = { logs += it }
         try {
             testApplication {
@@ -470,7 +471,7 @@ class RoutesTest {
         assertEquals(HttpStatusCode.OK, http.get("/api/snapshots/${s.id}/$snap/summary").status)
     }
 
-    private fun waitUntil(timeoutMs: Long = 5000, cond: () -> Boolean) {
+    private inline fun waitUntil(timeoutMs: Long = 5000, cond: () -> Boolean) {
         val deadline = System.currentTimeMillis() + timeoutMs
         while (!cond() && System.currentTimeMillis() < deadline) Thread.sleep(10)
         assertTrue(cond(), "condition not met in ${timeoutMs}ms")
@@ -534,15 +535,57 @@ class RoutesTest {
         assertNull(checkPort(7070))
     }
 
+    /** Opens, cancels while the opener is blocked on [gate], and returns once the abandoned thread is the only one left. */
+    private suspend fun abandonedAnalysis(sid: String, snap: String, gate: CountDownLatch) {
+        opener.gate = gate
+        val first = str(http.postJson("/api/snapshots/$sid/$snap/open").obj(), "jobId")
+        waitUntil { opener.calls.get() == 1 }
+        http.postJson("/api/jobs/$first/cancel")
+        assertEquals("CANCELLED", str(http.waitJob(first), "state"))
+    }
+
+    @Test fun cancellingTheWaitForAnAbandonedAnalysisEndsTheJobAndAllowsALaterOpen() = server {
+        val s = store.newAttachSession()
+        val snap = store.addFakeSnapshot(s.id)
+        val gate = CountDownLatch(1)
+        abandonedAnalysis(s.id, snap, gate)
+        val waiting = str(http.postJson("/api/snapshots/${s.id}/$snap/open").obj(), "jobId")
+        waitUntil { http.get("/api/jobs/$waiting").obj()["steps"]!!.jsonArray[0].jsonObject["detail"]?.jsonPrimitive?.content?.contains("waiting for the previous analysis") == true }
+        val view = http.get("/api/jobs/$waiting").obj()
+        assertEquals("RUNNING", str(view, "state"))
+        assertEquals("RUNNING", str(view["steps"]!!.jsonArray[0].jsonObject, "state"))
+        http.postJson("/api/jobs/$waiting/cancel")
+        assertEquals("CANCELLED", str(http.waitJob(waiting), "state"))
+        gate.countDown()
+        waitUntil { opener.running.get() == 0 }
+        val third = http.openSnapshot(s.id, snap)
+        assertEquals("DONE", str(third, "state"), third.toString())
+        assertEquals(1, opener.maxRunning.get())
+    }
+
+    @Test fun waitingTooLongForAnAbandonedAnalysisFailsWithARestartHint() {
+        waitTimeoutMs = 300
+        server {
+        val s = store.newAttachSession()
+        val snap = store.addFakeSnapshot(s.id)
+        val gate = CountDownLatch(1)
+        abandonedAnalysis(s.id, snap, gate)
+        val job = http.openSnapshot(s.id, snap)
+        gate.countDown()
+        assertEquals("FAILED", str(job, "state"), job.toString())
+        assertTrue(str(job, "errorHint").contains("Restart MemScope"), job.toString())
+        assertEquals(1, opener.calls.get(), "the opener was not started a second time")
+        }
+    }
+
     // ---------------------------------------------------------------- web surface
 
-    @Test fun servesPlaceholderUiWithNoStore() = server {
+    @Test fun servesTheUiWithNoStore() = server {
         val r = client.get("/")
         assertEquals(HttpStatusCode.OK, r.status)
         assertEquals("no-store", r.headers[HttpHeaders.CacheControl])
         val body = r.bodyAsText()
         assertTrue(body.contains("MemScope"))
-        assertTrue(body.contains("/api/devices"))
     }
 
     @Test fun foreignHostHeaderIsRejected() = server {

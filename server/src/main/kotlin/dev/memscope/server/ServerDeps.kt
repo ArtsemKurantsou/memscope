@@ -10,6 +10,8 @@ class ServerDeps(
     private val adbProvider: () -> Adb,
     val opener: SnapshotOpener = SnapshotOpener.real,
     val clock: () -> Long = System::currentTimeMillis,
+    /** How long a re-open waits for a cancelled analysis of the same snapshot to stop before failing. */
+    val previousAnalysisTimeoutMs: Long = 60_000,
     val jobs: JobRegistry = JobRegistry(),
     val snapshots: SnapshotRegistry = SnapshotRegistry(capacity = 2),
 ) : AutoCloseable {
