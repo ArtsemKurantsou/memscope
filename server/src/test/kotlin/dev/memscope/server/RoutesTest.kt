@@ -604,6 +604,62 @@ class RoutesTest {
         assertEquals(HttpStatusCode.Conflict, client.get("/api/snapshots/${s.id}/${ids[2]}/summary").status)
     }
 
+    @Test fun diffComparesTwoOpenSnapshotsAndCachesTheResult() = server {
+        val s = store.newAttachSession()
+        val (a, b) = (1..2).map { store.addFakeSnapshot(s.id) }
+        client.openSnapshot(s.id, a)
+        client.openSnapshot(s.id, b)
+        val r = client.get("/api/snapshots/${s.id}/$b/diff?base=$a")
+        assertEquals(HttpStatusCode.OK, r.status, r.bodyAsText())
+        val body = r.obj()
+        assertEquals("$b.hprof vs $a.hprof", str(body["classes"]!!.jsonArray[0].jsonObject, "className"))
+        assertEquals("Static fields", str(body["roots"]!!.jsonArray[0].jsonObject, "label"))
+        assertEquals(1600, body["appHeapAfter"]!!.jsonPrimitive.int)
+        assertEquals(1000, body["reachableBefore"]!!.jsonPrimitive.int)
+        assertEquals(listOf("$a.hprof"), opener.opened[1].diffCalls, "the diff runs on the `after` view with the base as before")
+        client.get("/api/snapshots/${s.id}/$b/diff?base=$a")
+        assertEquals(1, opener.opened[1].diffCalls.size, "the second request is served from the cache")
+        // The cached result does not need the snapshots open any more.
+        val c = store.addFakeSnapshot(s.id)
+        client.openSnapshot(s.id, c)
+        client.openSnapshot(s.id, a) // evicts b
+        assertEquals(HttpStatusCode.Conflict, client.get("/api/snapshots/${s.id}/$b/summary").status)
+        assertEquals(HttpStatusCode.OK, client.get("/api/snapshots/${s.id}/$b/diff?base=$a").status)
+    }
+
+    @Test fun diffNamesTheSnapshotThatIsNotAnalysed() = server {
+        val s = store.newAttachSession()
+        val (a, b) = (1..2).map { store.addFakeSnapshot(s.id) }
+        client.openSnapshot(s.id, b)
+        val base = client.get("/api/snapshots/${s.id}/$b/diff?base=$a")
+        assertEquals(HttpStatusCode.Conflict, base.status)
+        assertEquals("not analysed: $a", str(base.obj(), "error"))
+        assertEquals("NOT_ANALYSED", str(base.obj(), "kind"))
+        client.openSnapshot(s.id, a)
+        assertEquals(HttpStatusCode.OK, client.get("/api/snapshots/${s.id}/$b/diff?base=$a").status)
+        val c = store.addFakeSnapshot(s.id)
+        client.openSnapshot(s.id, c) // evicts the least recently used: b
+        val after = client.get("/api/snapshots/${s.id}/$a/diff?base=$b")
+        assertEquals(HttpStatusCode.Conflict, after.status)
+        assertEquals("not analysed: $b", str(after.obj(), "error"))
+    }
+
+    @Test fun diffNeedsAKnownBaseInTheSameSession() = server {
+        val s = store.newAttachSession()
+        val a = store.addFakeSnapshot(s.id)
+        client.openSnapshot(s.id, a)
+        assertEquals(HttpStatusCode.BadRequest, client.get("/api/snapshots/${s.id}/$a/diff").status)
+        assertEquals(HttpStatusCode.NotFound, client.get("/api/snapshots/${s.id}/$a/diff?base=s9").status)
+        assertEquals(HttpStatusCode.NotFound, client.get("/api/snapshots/${s.id}/s9/diff?base=$a").status)
+    }
+
+    @Test fun diffOfASnapshotWithItselfIsAllowed() = server {
+        val s = store.newAttachSession()
+        val a = store.addFakeSnapshot(s.id)
+        client.openSnapshot(s.id, a)
+        assertEquals(HttpStatusCode.OK, client.get("/api/snapshots/${s.id}/$a/diff?base=$a").status)
+    }
+
     @Test fun unreadableHprofFailsTheJobPersistsStatusAndGives422() = server {
         val s = store.newAttachSession()
         val snap = store.addFakeSnapshot(s.id)

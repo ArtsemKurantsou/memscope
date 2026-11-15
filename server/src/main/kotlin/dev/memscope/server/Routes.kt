@@ -1,5 +1,6 @@
 package dev.memscope.server
 
+import dev.memscope.analysis.DiffResult
 import dev.memscope.analysis.HprofUnreadableException
 import dev.memscope.capture.DeviceArgs
 import dev.memscope.capture.Job
@@ -316,6 +317,23 @@ private fun Route.snapshotRoutes(deps: ServerDeps) {
         }
     }
 
+    /** Both snapshots (same session) must be open unless the result is cached; the 409 names the one that is not. */
+    fun diff(sid: String, snap: String, base: String): DiffResult {
+        lookup(sid, base)
+        for (id in listOf(base, snap)) {
+            val meta = lookup(sid, id).second
+            if (meta.status == SnapshotMeta.Status.UNREADABLE) throw unreadable(meta.error ?: "Snapshot $id is unreadable")
+        }
+        return deps.diffs.getOrCompute("$sid/$snap|$base") {
+            for (id in listOf(base, snap)) {
+                if (!deps.snapshots.contains("$sid/$id")) {
+                    throw ApiException(HttpStatusCode.Conflict, "not analysed: $id", SnapshotRegistry.notAnalysed().hint, "NOT_ANALYSED")
+                }
+            }
+            query(sid, snap) { after -> query(sid, base) { before -> after.diff(before) } }
+        }
+    }
+
     fun ApplicationCall.str(name: String): String =
         request.queryParameters[name] ?: throw IllegalArgumentException("missing query parameter '$name'")
 
@@ -393,6 +411,11 @@ private fun Route.snapshotRoutes(deps: ServerDeps) {
             val parent = call.str("parent")
             val child = call.str("child")
             call.respond(IndexBody(io { query(s, n) { it.indexInParent(parent, child) } }))
+        }
+        get("/diff") {
+            val (s, n) = ids()
+            val base = call.str("base")
+            call.respond(io { diff(s, n, base) })
         }
         get("/classes") { val (s, n) = ids(); call.respond(io { query(s, n) { it.classes() } }) }
         get("/instances") {

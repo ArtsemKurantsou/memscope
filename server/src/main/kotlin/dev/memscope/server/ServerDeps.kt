@@ -32,6 +32,8 @@ class ServerDeps(
     val previousAnalysisTimeoutMs: Long = 60_000,
     val jobs: JobRegistry = JobRegistry(),
     val snapshots: SnapshotRegistry = SnapshotRegistry(capacity = 2),
+    /** Finished snapshot diffs; they outlive the snapshots they were computed from. */
+    val diffs: DiffCache = DiffCache(),
     val startupRunner: StartupRunner = StartupRunner.real,
     /** False in tests that must not see background `dumpsys meminfo` traffic. */
     private val memoryPolling: Boolean = true,

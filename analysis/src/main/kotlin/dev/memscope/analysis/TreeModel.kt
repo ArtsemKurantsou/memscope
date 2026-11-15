@@ -66,6 +66,10 @@ data class ClassStat(
     val shallowBytes: Long,
     val retainedBytes: Long,
     val isAppCode: Boolean,
+    /** The same three numbers counting only app-heap objects (heap "app", or unknown when the dump has no heap info). */
+    val appInstanceCount: Int = 0,
+    val appShallowBytes: Long = 0,
+    val appRetainedBytes: Long = 0,
 )
 
 /** Top-level rows of the tree, in display order. Ref: `cat:<key>`. */

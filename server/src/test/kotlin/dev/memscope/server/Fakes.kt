@@ -1,6 +1,9 @@
 package dev.memscope.server
 
 import dev.memscope.analysis.ClassStat
+import dev.memscope.analysis.ClassDelta
+import dev.memscope.analysis.DiffResult
+import dev.memscope.analysis.RootDelta
 import dev.memscope.analysis.FieldValue
 import dev.memscope.analysis.HeapSummary
 import dev.memscope.analysis.ObjectDetails
@@ -95,6 +98,15 @@ class FakeView(val name: String = "fake") : SnapshotView {
     }
     override fun classes() = listOf(ClassStat("java.lang.String", 3, 48, 96, false))
     override fun instances(className: String, offset: Int, limit: Int) = TreePage(listOf(treeRow("obj:2")), 1)
+    val diffCalls = CopyOnWriteArrayList<String>()
+    /** Canned: one class and one root delta; [name] and the base view's name are in the class name so tests see what was compared. */
+    override fun diff(base: SnapshotView): DiffResult {
+        diffCalls += (base as FakeView).name
+        return DiffResult(
+            listOf(ClassDelta("$name vs ${base.name}", false, 1, 3, 10, 30, 10, 30, 1, 3, 10, 30, 10, 30)),
+            listOf(RootDelta("Static fields", 100, 300, 50, 150)), 1000, 2000, 600, 1600,
+        )
+    }
     override fun revealPath(ref: String): List<String> { revealFails?.let { throw it }; return revealPath }
     override fun indexInParent(parentRef: String, childRef: String) = 4
     override fun close() { closed = true }

@@ -1,6 +1,8 @@
 package dev.memscope.server
 
 import dev.memscope.analysis.ClassStat
+import dev.memscope.analysis.DiffResult
+import dev.memscope.analysis.SnapshotDiff
 import dev.memscope.analysis.HeapSummary
 import dev.memscope.analysis.ObjectDetails
 import dev.memscope.analysis.Progress
@@ -18,7 +20,12 @@ interface SnapshotView : AutoCloseable {
     fun instances(className: String, offset: Int, limit: Int): TreePage
     fun revealPath(ref: String): List<String>
     fun indexInParent(parentRef: String, childRef: String): Int
+    /** What grew between [base] (before) and this snapshot (after); [base] comes from the same registry. */
+    fun diff(base: SnapshotView): DiffResult
 }
+
+/** A view over a real [Snapshot]; [SnapshotView.diff] needs the base's snapshot. */
+interface SnapshotBacked { val snapshot: Snapshot }
 
 /** Thrown by a view whose path from the root is longer than [REVEAL_MAX_DEPTH]. */
 class TooDeepToReveal : Exception("too deep to reveal")
@@ -33,7 +40,8 @@ fun interface SnapshotOpener {
     }
 }
 
-fun Snapshot.asView(): SnapshotView = object : SnapshotView {
+fun Snapshot.asView(): SnapshotView = object : SnapshotView, SnapshotBacked {
+    override val snapshot get() = this@asView
     override fun summary() = this@asView.summary()
     override fun children(ref: String, offset: Int, limit: Int) = this@asView.children(ref, offset, limit)
     override fun details(ref: String) = this@asView.details(ref)
@@ -45,5 +53,9 @@ fun Snapshot.asView(): SnapshotView = object : SnapshotView {
         throw TooDeepToReveal()
     }
     override fun indexInParent(parentRef: String, childRef: String) = this@asView.indexInParent(parentRef, childRef)
+    override fun diff(base: SnapshotView): DiffResult {
+        val before = (base as? SnapshotBacked)?.snapshot ?: throw IllegalArgumentException("base is not an analysed snapshot")
+        return SnapshotDiff.diff(before, this@asView)
+    }
     override fun close() = this@asView.close()
 }

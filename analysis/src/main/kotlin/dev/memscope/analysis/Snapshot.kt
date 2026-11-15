@@ -393,6 +393,9 @@ class Snapshot private constructor(private val hprof: File, val index: HeapIndex
         val count = IntArray(names.size)
         val shallow = LongArray(names.size)
         val retained = LongArray(names.size)
+        val appCount = IntArray(names.size)
+        val appShallow = LongArray(names.size)
+        val appRetained = LongArray(names.size)
         val active = IntArray(names.size) // instances of the name on the current dominator-tree path
 
         // Iterative DFS over the dominator tree from the super-root.
@@ -412,6 +415,9 @@ class Snapshot private constructor(private val hprof: File, val index: HeapIndex
                 count[c]++
                 shallow[c] += index.shallow[v]
                 if (active[c] == 0) retained[c] += index.retained[v]
+                val kind = index.heapKind[v]
+                if (kind == HeapKind.APP || kind == HeapKind.UNKNOWN) { appCount[c]++; appShallow[c] += index.shallow[v] }
+                if (active[c] == 0) appRetained[c] += tree.appRetained[v]
                 active[c]++
                 if (sp == stackNode.size) {
                     stackNode = stackNode.copyOf(sp * 2)
@@ -426,7 +432,7 @@ class Snapshot private constructor(private val hprof: File, val index: HeapIndex
             }
         }
         return names.indices.filter { count[it] > 0 }
-            .map { ClassStat(names[it], count[it], shallow[it], retained[it], tree.isAppCode(names[it])) }
+            .map { ClassStat(names[it], count[it], shallow[it], retained[it], tree.isAppCode(names[it]), appCount[it], appShallow[it], appRetained[it]) }
             .sortedWith(compareByDescending<ClassStat> { it.retainedBytes }.thenBy { it.className })
     }
 }
