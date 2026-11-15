@@ -50,12 +50,13 @@ class RoutesTest {
     private lateinit var deps: ServerDeps
     private var now = 1_000_000L
     private var waitTimeoutMs = 60_000L
+    private var memoryPolling = false
     private val logs = java.util.concurrent.CopyOnWriteArrayList<String>()
     private lateinit var http: HttpClient
 
     private fun server(block: suspend ApplicationTestBuilder.() -> Unit) {
         store = SessionStore(home)
-        deps = ServerDeps(store, { runner.adb }, opener, clock = { now }, previousAnalysisTimeoutMs = waitTimeoutMs, startupRunner = startupRunner)
+        deps = ServerDeps(store, { runner.adb }, opener, clock = { now }, previousAnalysisTimeoutMs = waitTimeoutMs, startupRunner = startupRunner, memoryPolling = memoryPolling)
         ServerLog.sink = { logs += it }
         try {
             testApplication {
@@ -319,6 +320,75 @@ class RoutesTest {
     @Test fun traversalLookingSessionIdIs400Or404() = server {
         val status = client.get("/api/sessions/..%2F..").status
         assertTrue(status == HttpStatusCode.BadRequest || status == HttpStatusCode.NotFound, "was $status")
+    }
+
+    // ---------------------------------------------------------------- timeline
+
+    private val summary = " App Summary\n   Java Heap:  1000\n Native Heap:  2000\n Code: 300\n Stack: 40\n Graphics: 500\n Private Other: 60\n System: 70\n\n TOTAL PSS: 3970\n\n Objects\n"
+
+    private fun SessionStore.addSnap(sid: String, id: String, milestone: String?, atMs: Long) =
+        addSnapshot(sid, SnapshotMeta(id, "label $id", milestone, "dev.app", atMs, "$id.hprof", 1, SnapshotMeta.Status.OK))
+
+    @Test fun timelineServesSamplesSinceAndAllMarkers() = server {
+        val s = store.newAttachSession()
+        val file = store.dir(s.id).resolve("meminfo.jsonl")
+        java.nio.file.Files.writeString(file, (1..3).joinToString("") { "{\"tMs\":${it * 1000},\"javaHeapKb\":$it,\"nativeHeapKb\":0,\"graphicsKb\":0,\"codeKb\":0,\"stackKb\":0,\"otherKb\":0,\"totalPssKb\":$it,\"paused\":false}\n" })
+        store.addSnap(s.id, "s1", "application_oncreate", s.createdAtMs + 1500)
+        store.addSnap(s.id, "s2", null, s.createdAtMs + 2500)
+        val all = client.get("/api/sessions/${s.id}/timeline").obj()
+        assertEquals(3, all["samples"]!!.jsonArray.size)
+        val markers = all["markers"]!!.jsonArray.map { it.jsonObject }
+        assertEquals(listOf("milestone", "dump"), markers.map { str(it, "kind") })
+        assertEquals(listOf("s1", "s2"), markers.map { str(it, "snapshotId") })
+        assertEquals(1500, markers[0]["tMs"]!!.jsonPrimitive.content.toInt())
+        val since = client.get("/api/sessions/${s.id}/timeline?sinceMs=2000").obj()
+        assertEquals(listOf(3000), since["samples"]!!.jsonArray.map { it.jsonObject["tMs"]!!.jsonPrimitive.int })
+        assertEquals(2, since["markers"]!!.jsonArray.size)
+    }
+
+    @Test fun timelineOfASessionWithoutSamplesIsEmptyNotAnError() = server {
+        val s = store.newAttachSession()
+        val t = client.get("/api/sessions/${s.id}/timeline").obj()
+        assertEquals(0, t["samples"]!!.jsonArray.size)
+        assertEquals(0, t["markers"]!!.jsonArray.size)
+    }
+
+    @Test fun timelineErrors() = server {
+        assertEquals(HttpStatusCode.NotFound, client.get("/api/sessions/nope/timeline").status)
+        val s = store.newAttachSession()
+        assertEquals(HttpStatusCode.BadRequest, client.get("/api/sessions/${s.id}/timeline?sinceMs=abc").status)
+    }
+
+    @Test fun attachSessionStartsPollingMemoryAndEndingItStops() {
+        memoryPolling = true
+        runner.meminfo = summary
+        server {
+            val s = client.postJson("/api/sessions", """{"serial":"emulator-5554","packageName":"dev.app","mode":"ATTACH"}""").obj()
+            val id = str(s, "id")
+            waitUntil { client.get("/api/sessions/$id/timeline").obj()["samples"]!!.jsonArray.isNotEmpty() }
+            assertEquals(3970, client.get("/api/sessions/$id/timeline").obj()["samples"]!!.jsonArray[0].jsonObject["totalPssKb"]!!.jsonPrimitive.int)
+            client.postJson("/api/sessions/$id/end")
+            Thread.sleep(100)
+            val n = client.get("/api/sessions/$id/timeline").obj()["samples"]!!.jsonArray.size
+            Thread.sleep(1300)
+            assertEquals(n, client.get("/api/sessions/$id/timeline").obj()["samples"]!!.jsonArray.size)
+        }
+    }
+
+    @Test fun theStartupListenerStartsPollingOnPidAndPausesWhileHeld() {
+        memoryPolling = true
+        runner.meminfo = summary
+        runner.processes = listOf("100 dev.app")
+        server {
+            val s = store.newAttachSession()
+            val l = deps.pollerListener(s.id, null)
+            assertTrue(client.get("/api/sessions/${s.id}/timeline").obj()["samples"]!!.jsonArray.isEmpty())
+            l.onPid(100)
+            waitUntil { client.get("/api/sessions/${s.id}/timeline").obj()["samples"]!!.jsonArray.isNotEmpty() }
+            l.onHeld(true)
+            waitUntil { client.get("/api/sessions/${s.id}/timeline").obj()["samples"]!!.jsonArray.any { it.jsonObject["paused"]!!.jsonPrimitive.content == "true" } }
+            l.onHeld(false)
+        }
     }
 
     // ---------------------------------------------------------------- dump and jobs

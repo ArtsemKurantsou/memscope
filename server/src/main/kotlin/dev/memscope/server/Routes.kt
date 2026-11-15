@@ -2,6 +2,7 @@ package dev.memscope.server
 
 import dev.memscope.analysis.HprofUnreadableException
 import dev.memscope.capture.Job
+import dev.memscope.capture.MemTimeline
 import dev.memscope.capture.Milestones
 import dev.memscope.capture.OnDemandDumper
 import dev.memscope.capture.SessionMeta
@@ -175,6 +176,7 @@ private fun Route.sessionRoutes(deps: ServerDeps) {
     fun createExclusive(req: CreateSessionRequest): SessionMeta {
         store.list().filter { it.state == SessionMeta.State.ACTIVE }.forEach { other ->
             store.update(other.id) { it.copy(state = SessionMeta.State.ENDED) }
+            deps.stopPolling(other.id)
         }
         val created = store.create(req.serial, req.packageName, req.mode)
         return req.appPackagePrefixes?.takeIf { it.isNotEmpty() }
@@ -217,15 +219,22 @@ private fun Route.sessionRoutes(deps: ServerDeps) {
                 createExclusive(req)
             }
         }
+        deps.startPolling(session.id)
         call.respond(session)
     }
     get("/sessions") { call.respond(io { store.list() }) }
     get("/sessions/{id}") {
         call.respond(io { store.get(call.parameters["id"]!!) } ?: throw notFound("Session"))
     }
+    get("/sessions/{id}/timeline") {
+        val id = call.parameters["id"]!!
+        val since = call.request.queryParameters["sinceMs"]?.let { it.toLongOrNull() ?: throw IllegalArgumentException("query parameter 'sinceMs' must be an integer") }
+        call.respond(io { MemTimeline.read(store, id, since) })
+    }
     post("/sessions/{id}/end") {
         val id = call.parameters["id"]!!
         deps.runningStartup()?.takeIf { it.sessionId == id }?.job?.cancel?.cancel() // the recording detaches and cleans up
+        deps.stopPolling(id)
         call.respond(io { store.update(id) { it.copy(state = SessionMeta.State.ENDED) } })
     }
     post("/sessions/{id}/dump") {

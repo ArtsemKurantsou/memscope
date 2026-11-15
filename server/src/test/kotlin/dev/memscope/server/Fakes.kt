@@ -31,6 +31,7 @@ class FakeAdbRunner : ProcessRunner {
     var debuggable = setOf("dev.app")
     var processes = listOf("100 dev.app", "101 dev.app:remote")
     var hprofSize = 4096
+    var meminfo = ""
     @Volatile var disconnected = false
 
     fun count(vararg prefix: String) = calls.count { c -> c.drop(1).let { a -> a.windowed(prefix.size).any { it == prefix.toList() } } }
@@ -46,6 +47,7 @@ class FakeAdbRunner : ProcessRunner {
             c[0] == "devices" -> ProcessResult(0, devicesOutput, "")
             c[0] == "shell" && c[1] == "getprop" -> ProcessResult(0, "35\n", "")
             c[0] == "shell" && c[1] == "pm" -> ProcessResult(0, packages.joinToString("\n") { "package:$it" }, "")
+            c[0] == "shell" && c[1] == "run-as" && c.getOrNull(3) == "cat" -> ProcessResult(0, "Rss: 9 kB\nPss: 4242 kB\n", "")
             c[0] == "shell" && c[1] == "run-as" ->
                 if (c[2] in debuggable) ProcessResult(0, "uid=1", "")
                 else if (c[2] in packages) ProcessResult(1, "", "run-as: package not debuggable: ${c[2]}")
@@ -54,6 +56,7 @@ class FakeAdbRunner : ProcessRunner {
                 val name = "dev.app"
                 ProcessResult(0, "PID NAME\n" + processes.filter { it.endsWith(name) || it.contains("$name:") }.joinToString("\n"), "")
             }
+            c[0] == "shell" && c[1] == "dumpsys" -> ProcessResult(0, meminfo, "")
             c[0] == "shell" && c[1] == "stat" -> ProcessResult(0, "$hprofSize\n", "")
             c[0] == "shell" && c[1] == "cmd" && c.last() == "dev.app" -> ProcessResult(0, "priority=0\ndev.app/.Main\n", "")
             c[0] == "pull" -> {

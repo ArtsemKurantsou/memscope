@@ -85,6 +85,7 @@ fun main(args: Array<String>) {
     val adb: Adb by lazy { Adb(AdbLocator.find()) } // not found is reported per request, with its hint
     val deps = ServerDeps(SessionStore(), { adb })
     deps.staleRecovery = recoverStaleDebugApps(deps)
+    deps.resumePolling()
     val engine = startServer(deps, chosen, wait = false)
     Runtime.getRuntime().addShutdownHook(Thread {
         engine.stop(0, 2000)
