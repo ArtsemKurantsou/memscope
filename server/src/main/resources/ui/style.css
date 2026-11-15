@@ -180,3 +180,6 @@ table.fields td { padding: 2px 4px; border-bottom: 1px solid color-mix(in srgb, 
 }
 .details .pkg, .step .pkg, li .pkg { margin-left: 6px; }
 table.fields td:first-child { word-break: normal; overflow-wrap: anywhere; min-width: 90px; }
+.search-list li.search-error { display: block; cursor: default; color: var(--err-ink); background: var(--err-bg); }
+.search-list li.search-error:hover { background: var(--err-bg); }
+.search-list li.search-error .btn { margin-top: 4px; }

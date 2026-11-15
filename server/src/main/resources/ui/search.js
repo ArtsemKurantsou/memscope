@@ -18,13 +18,21 @@ export function createSearch({ input, list, getClasses, onPick }) {
     list.hidden = matches.length === 0;
   }
 
+  /** The class list could not be loaded: say so (with the server's hint) and offer a retry. */
+  function showError(e) {
+    list.replaceChildren(el('li', { class: 'search-error', role: 'alert' },
+      el('strong', null, 'Could not load the class list: ' + e.message), e.hint ? el('div', null, e.hint) : null,
+      el('button', { class: 'btn small', onmousedown: (ev) => { ev.preventDefault(); update(); } }, 'Retry')));
+    list.hidden = false;
+  }
+
   function pick(name) { input.value = name; close(); onPick(name); }
 
   async function update() {
     const text = input.value.trim().toLowerCase();
     if (!text) { matches = []; close(); return; }
     let all;
-    try { all = await getClasses(); } catch { matches = []; close(); return; }
+    try { all = await getClasses(); } catch (e) { matches = []; showError(e); return; }
     const simple = (n) => n.slice(n.lastIndexOf('.') + 1).toLowerCase();
     const scored = [];
     for (const c of all) {

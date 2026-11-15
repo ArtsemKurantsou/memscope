@@ -90,7 +90,15 @@ const tree = createTree({
 const search = createSearch({
   input: $('search'),
   list: $('search-list'),
-  getClasses: () => (state.classes ||= state.snap.classes()),
+  getClasses: () => {
+    // Never keep a rejected promise: the next keystroke or Retry asks again.
+    if (!state.classes) {
+      const p = state.snap.classes();
+      state.classes = p;
+      p.catch(() => { if (state.classes === p) state.classes = null; });
+    }
+    return state.classes;
+  },
   onPick: (name) => runSearch(name),
 });
 
@@ -166,7 +174,7 @@ async function runSearch(name) {
   try {
     await tree.setSource(state.snap, (o, l) => state.snap.instances(name, o, l).then((p) => {
       const c = document.getElementById('search-count');
-      if (c) c.textContent = `${formatInt(p.total)} instance${p.total === 1 ? '' : 's'}, largest first`;
+      if (c && my === state.loadToken) c.textContent = `${formatInt(p.total)} instance${p.total === 1 ? '' : 's'}, largest first`;
       return p;
     }), { onEmpty: `No instances of ${name} in this snapshot.` });
   } catch (e) {

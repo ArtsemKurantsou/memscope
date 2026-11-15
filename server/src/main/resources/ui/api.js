@@ -61,15 +61,27 @@ export const job = (id) => get(`/api/jobs/${id}`);
 export const cancelJob = (id) => post(`/api/jobs/${id}/cancel`);
 export const openSnapshot = (sid, snap) => post(`/api/snapshots/${sid}/${snap}/open`);
 
-/** Polls a job every 500 ms, calling onUpdate with each JobView, until it leaves RUNNING. */
-export async function pollJob(jobId, onUpdate) {
+/** Polls a job every 500 ms, calling onUpdate with each JobView, until it leaves RUNNING. onLost(n) is called while the server is unreachable. */
+export async function pollJob(jobId, onUpdate, onLost) {
+  let lost = 0;
   for (;;) {
-    const j = await job(jobId);
+    let j;
+    try {
+      j = await job(jobId);
+      lost = 0;
+    } catch (e) {
+      // The job keeps running on the server: back off and keep polling (bounded, about two minutes).
+      if (!e.isNetwork || ++lost > MAX_LOST_POLLS) throw e;
+      if (onLost) onLost(lost);
+      await sleep(Math.min(500 * 2 ** lost, 5000));
+      continue;
+    }
     onUpdate(j);
     if (j.state !== 'RUNNING') return j;
     await sleep(500);
   }
 }
+const MAX_LOST_POLLS = 30;
 
 const reopening = new Map();
 async function reopen(sid, snap) {

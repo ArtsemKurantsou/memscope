@@ -2,7 +2,7 @@
 <meta charset="utf-8"><title>MemScope selftest</title>
 <body style="font:14px monospace"><pre id="out"></pre>
 <script type="module">
-import { formatBytes, formatPercent, splitClassName, refKind, hasObjectDetails, rowSize, rowPercent, rowVisible, sortRows } from './util.js';
+import { shareInFlight, formatBytes, formatPercent, splitClassName, refKind, hasObjectDetails, rowSize, rowPercent, rowVisible, sortRows } from './util.js';
 const out = document.getElementById('out');
 let fails = 0;
 function eq(name, got, want) {
@@ -36,6 +36,19 @@ eq('percent hide', rowPercent(r(100, 40), true, { appHeapBytes: 80 }), 50);
 eq('percent show', rowPercent(r(100, 40), false, { appHeapBytes: 80 }), 10);
 eq('visible', [rowVisible(r(5, 0), true), rowVisible(r(5, 0), false)], [false, true]);
 eq('sort', sortRows([r(9, 1), r(5, 5), r(7, 5)], true).map((x) => x.retainedBytes), [5, 7, 9]);
+{
+  let starts = 0;
+  const holder = { loading: null };
+  const start = () => { starts++; return new Promise((r) => setTimeout(() => r(starts), 20)); };
+  const [a, b] = await Promise.all([shareInFlight(holder, start), shareInFlight(holder, start)]);
+  eq("in-flight shared: one start, same result", [starts, a, b], [1, 1, 1]);
+  eq("holder cleared after settle", holder.loading, null);
+  await shareInFlight(holder, start);
+  eq("new call after settle starts again", starts, 2);
+  const failing = { loading: null };
+  await shareInFlight(failing, () => Promise.reject(new Error("x"))).catch(() => {});
+  eq("holder cleared after rejection", failing.loading, null);
+}
 out.textContent += fails ? '\n' + fails + ' FAILED' : '\nALL PASSED';
 document.title = fails ? 'selftest FAIL' : 'selftest OK';
 </script>

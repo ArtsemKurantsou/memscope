@@ -1,8 +1,8 @@
 // The GC-root tree: lazy children, incremental DOM updates, keyboard navigation, reveal.
-// The model (Node objects) is separate from the DOM: collapsing removes elements but keeps
+// The model (TreeNode objects) is separate from the DOM: collapsing removes elements but keeps
 // loaded data, expanding inserts only the new rows after the parent row.
 import {
-  el, formatBytes, formatPercent, formatInt, splitClassName, rowSize, rowPercent, rowVisible, sortRows, debounce,
+  el, formatBytes, formatPercent, formatInt, splitClassName, rowSize, rowPercent, rowVisible, sortRows, debounce, shareInFlight,
 } from './util.js';
 
 const PAGE = 25;
@@ -10,7 +10,7 @@ const MAX_BATCHES = 10; // while hiding system rows: stop looking for visible ro
 const INDENT = 16;
 const AGGREGATE = new Set(['CATEGORY', 'SHARED', 'THREAD']);
 
-class Node {
+class TreeNode {
   constructor(row, parent, fetchPage) {
     this.row = row;
     this.parent = parent;
@@ -22,6 +22,8 @@ class Node {
     this.expanded = false;
     this.el = null;
     this.moreEl = null;
+    this.loading = null;       // in-flight fetchInto promise, shared by every caller
+    this.seq = 0;              // bumps on every expand/collapse so stale continuations can tell
   }
   get expandable() { return this.row.childCount > 0; }
   get hasMore() { return this.kids !== null && this.fetched < this.total; }
@@ -46,7 +48,7 @@ export function createTree({ container, getOptions, getSummary, onSelect, onStat
   // ------------------------------------------------------------------ model
 
   function makeKids(parent, rows) {
-    return rows.map((r) => new Node(r, parent, (o, l) => api.tree(r.ref, o, l)));
+    return rows.map((r) => new TreeNode(r, parent, (o, l) => api.tree(r.ref, o, l)));
   }
 
   /** Loads pages into node.kids. Stops once `wantVisible` visible rows arrived, or (untilIndex >= 0) that index is loaded. */
@@ -70,6 +72,9 @@ export function createTree({ container, getOptions, getSummary, onSelect, onStat
       else if (got >= wantVisible || batches >= MAX_BATCHES) break;
     }
   }
+
+  /** One in-flight fetch per node: concurrent callers share it (no duplicated rows). */
+  function load(node, opts) { return shareInFlight(node, () => fetchInto(node, opts)); }
 
   function sortedVisibleKids(node) {
     const { hideSystem } = getOptions();
@@ -149,7 +154,7 @@ export function createTree({ container, getOptions, getSummary, onSelect, onStat
     const remaining = node.total - node.fetched;
     const e = el('div', { class: 'row more', role: 'treeitem', tabindex: '-1', 'aria-level': String(node.level + 2) },
       el('div', { class: 'c-name', style: `padding-left:${(node.level + 1) * INDENT + 6}px` },
-        el('span', { class: 'tw' }), el('span', { class: 'more-text' }, `show ${Math.min(PAGE, remaining)} more (${formatInt(remaining)} remaining)`)));
+        el('span', { class: 'tw' }), el('span', { class: 'more-text' }, `show more (${formatInt(remaining)} remaining)`)));
     e._more = node;
     node.moreEl = e;
     return e;
@@ -183,12 +188,6 @@ export function createTree({ container, getOptions, getSummary, onSelect, onStat
     // status/empty rows have no node link: they sit between rows and are cleared by clearStatus
   }
 
-  function clearInline(node) {
-    // Removes status/empty rows directly following node.el that belong to its children block.
-    let n = node.el && node.el.nextElementSibling;
-    while (n && n.classList.contains('status')) { const next = n.nextElementSibling; n.remove(); n = next; }
-  }
-
   function rerenderKids(node) {
     // Replace whatever children of `node` are in the DOM with a fresh render.
     if (node.el) { removeKidsDom(node); clearAfter(node); }
@@ -217,17 +216,20 @@ export function createTree({ container, getOptions, getSummary, onSelect, onStat
   async function expand(node) {
     if (!node.expandable || node.expanded) return;
     node.expanded = true;
+    const seq = ++node.seq;
     fillRow(node);
+    clearAfter(node); // stale status / error rows from an earlier attempt
+    // After every await: was the node collapsed (or collapsed and re-expanded) meanwhile?
+    const stale = () => seq !== node.seq || !node.expanded || !node.el.isConnected;
     if (node.kids === null) {
       const st = statusRow(node, 'Loading children…');
       node.el.after(st);
-      const my = epoch;
       try {
-        await fetchInto(node);
+        await load(node);
       } catch (e) {
-        if (e.name === 'AbortError' || my !== epoch) return;
+        if (e.name === 'AbortError' || stale()) return;
         st.replaceWith(statusRow(node, `Could not load children: ${e.message}${e.hint ? ' — ' + e.hint : ''}`, {
-          error: true, retry: () => { node.expanded = false; node.kids = null; expand(node); },
+          error: true, retry: () => expand(node),
         }));
         node.expanded = false;
         fillRow(node);
@@ -235,7 +237,7 @@ export function createTree({ container, getOptions, getSummary, onSelect, onStat
       }
       st.remove();
     }
-    if (!node.el.isConnected || !node.expanded) return;
+    if (stale()) return;
     const frag = document.createDocumentFragment();
     renderKids(node, frag);
     node.el.after(frag);
@@ -243,6 +245,7 @@ export function createTree({ container, getOptions, getSummary, onSelect, onStat
 
   function collapse(node) {
     if (!node.expanded) return;
+    node.seq++;
     node.expanded = false;
     if (current && isDescendant(current, node)) setCurrent(node, { focus: true });
     clearAfter(node);
@@ -256,17 +259,29 @@ export function createTree({ container, getOptions, getSummary, onSelect, onStat
   }
 
   async function showMore(node) {
-    const at = node.moreEl;
-    if (at) at.replaceWith(statusRow(node, 'Loading more…'));
+    if (node.loading) return; // a click while the previous page is still loading
+    const seq = node.seq;
+    const before = node.kids.length;
+    const { hideSystem } = getOptions();
+    const st = statusRow(node, 'Loading more…');
+    if (node.moreEl) node.moreEl.replaceWith(st);
     try {
-      await fetchInto(node);
+      await load(node);
     } catch (e) {
       if (e.name === 'AbortError') return;
       onStatus(`Could not load more rows: ${e.message}`);
     }
-    // The server order of loaded rows is retained-desc but the display order may be app-heap desc:
-    // re-render this node's children as one block.
-    rerenderKids(node);
+    if (node !== root && (seq !== node.seq || !node.expanded || !node.el.isConnected)) return; // collapsed meanwhile
+    if (!hideSystem && st.isConnected) {
+      // Server order is the display order: append only the new rows.
+      const frag = document.createDocumentFragment();
+      for (const k of node.kids.slice(before)) frag.append(ensureEl(k));
+      if (node.hasMore) frag.append(moreRow(node));
+      st.replaceWith(frag);
+    } else {
+      // Hiding system rows sorts by app-heap size: re-render this node's children as one block.
+      rerenderKids(node);
+    }
   }
 
   function setCurrent(node, { focus = false, select = false, immediate = false } = {}) {
@@ -342,10 +357,11 @@ export function createTree({ container, getOptions, getSummary, onSelect, onStat
   // ------------------------------------------------------------------ public
 
   async function setSource(newApi, fetchPage, { onEmpty } = {}) {
+    emitSelect.cancel();
     epoch++;
     api = newApi;
     current = null;
-    root = new Node(null, null, fetchPage);
+    root = new TreeNode(null, null, fetchPage);
     root.level = -1;
     root.expanded = true;
     body.replaceChildren(el('div', { class: 'row status' }, el('div', { class: 'c-name' }, el('span', { class: 'spinner' }), el('span', null, 'Loading the tree…'))));
@@ -384,13 +400,15 @@ export function createTree({ container, getOptions, getSummary, onSelect, onStat
     let forcedShowSystem = false;
     for (let i = 1; i < chain.length; i++) {
       const ref = chain[i];
-      if (node.kids === null) await fetchInto(node);
+      if (node.kids === null) await load(node);
       let child = node.kids.find((k) => k.row.ref === ref);
       if (!child) {
         const { index } = await api.indexInParent(chain[i - 1], ref);
         if (index < 0) throw new Error(`${ref} is not a child of ${chain[i - 1]}`);
-        await fetchInto(node, { untilIndex: index });
-        child = node.kids.find((k) => k.row.ref === ref);
+        for (let tries = 0; !child && tries < 5; tries++) {
+          await load(node, { untilIndex: index });
+          child = node.kids.find((k) => k.row.ref === ref);
+        }
         if (!child) throw new Error(`${ref} was not found in the loaded page`);
       }
       if (my !== epoch) throw new DOMException('superseded', 'AbortError');
@@ -409,8 +427,7 @@ export function createTree({ container, getOptions, getSummary, onSelect, onStat
     return forcedShowSystem;
   }
 
-  function focus() { (current && current.el ? current.el : body.querySelector('.row[role="treeitem"]'))?.focus(); }
   function clear(text) { epoch++; root = null; current = null; body.replaceChildren(text instanceof Node ? text : el('div', { class: 'row status' }, el('div', { class: 'c-name muted' }, text || ''))); }
 
-  return { setSource, refresh, reveal, focus, clear, get body() { return body; } };
+  return { setSource, refresh, reveal, clear, get body() { return body; } };
 }

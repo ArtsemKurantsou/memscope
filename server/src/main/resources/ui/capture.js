@@ -1,6 +1,6 @@
 // Capture bar: device / app pickers, "Dump now", job stepper, snapshot selector.
 import * as api from './api.js';
-import { el, formatBytes, formatTime, sleep } from './util.js';
+import { el, formatBytes, formatTime } from './util.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -17,6 +17,7 @@ export function createCapture({ onSnapshot, onNoSnapshot, onEmptyState }) {
   let busy = false;         // a dump/open pipeline is running
   let stepClock = new Map(); // "jobId/stepName" -> { start, end }
   let hideTimer = null;
+  let appsToken = 0;        // guards loadApps against out-of-order responses
 
   // ------------------------------------------------------------ pickers
 
@@ -60,8 +61,15 @@ export function createCapture({ onSnapshot, onNoSnapshot, onEmptyState }) {
     const serial = deviceSel.value;
     if (!serial) return;
     const prev = appSel.value || (session && session.packageName) || '';
+    const my = ++appsToken;
     setSelect(appSel, [], 'Loading apps…');
-    try { apps = await api.apps(serial, refresh); } catch (e) { setSelect(appSel, [], 'Failed to load apps'); updateButtons(); throw e; }
+    let list;
+    try { list = await api.apps(serial, refresh); } catch (e) {
+      if (my !== appsToken) return;
+      setSelect(appSel, [], 'Failed to load apps'); updateButtons(); throw e;
+    }
+    if (my !== appsToken || deviceSel.value !== serial) return; // a newer scan or another device took over
+    apps = list;
     apps = [...apps].sort((a, b) => (b.running - a.running) || a.packageName.localeCompare(b.packageName));
     if (!apps.length) {
       setSelect(appSel, [], 'No debuggable apps');
@@ -123,7 +131,7 @@ export function createCapture({ onSnapshot, onNoSnapshot, onEmptyState }) {
 
   /** groups: [{ title, job|null, pending: text }]; job is a JobView. */
   let lastGroups = [];
-  function renderPanel(groups, { cancel, failure, success } = {}) {
+  function renderPanel(groups, { cancel, failure, success, note } = {}) {
     lastGroups = groups;
     clearHideTimer();
     jobPanel.hidden = false;
@@ -135,6 +143,7 @@ export function createCapture({ onSnapshot, onNoSnapshot, onEmptyState }) {
           ? el('ol', { class: 'jsteps' }, g.job.steps.map((s) => stepRow(g.job.id, s)))
           : el('div', { class: 'status-line' }, el('span', { class: 'spinner' }), g.pending || 'Starting…')));
     }
+    if (note) parts.push(el('div', { class: 'status-line' }, el('span', { class: 'spinner' }), note));
     if (cancel) parts.push(el('div', { class: 'jactions' }, el('button', { class: 'btn small', onclick: cancel }, 'Cancel')));
     if (success) parts.push(el('div', { class: 'jsuccess' }, success));
     if (failure) {
@@ -157,7 +166,12 @@ export function createCapture({ onSnapshot, onNoSnapshot, onEmptyState }) {
   /** Polls a job while rendering `groups` (earlier groups first); returns the final JobView. */
   async function runJob(jobId, title, doneGroups) {
     const cancel = async () => { try { await api.cancelJob(jobId); } catch { /* the next poll shows the outcome */ } };
-    const j = await api.pollJob(jobId, (job) => renderPanel([...doneGroups, { title, job }], { cancel: job.state === 'RUNNING' ? cancel : null }));
+    let latest = null;
+    const j = await api.pollJob(jobId, (job) => {
+      latest = job;
+      renderPanel([...doneGroups, { title, job }], { cancel: job.state === 'RUNNING' ? cancel : null });
+    }, () => renderPanel([...doneGroups, { title, job: latest, pending: 'Waiting for the server\u2026' }],
+      { cancel, note: 'Connection to MemScope lost, retrying\u2026 (the job keeps running on the server)' }));
     return j;
   }
 
@@ -185,32 +199,36 @@ export function createCapture({ onSnapshot, onNoSnapshot, onEmptyState }) {
     return api.createSession(serial, pkg);
   }
 
-  async function dumpNow() {
+  /** Runs one pipeline pass; on failure shows the error with a Retry that resumes from the stage reached. */
+  async function guarded(run, initialRetry) {
     if (busy) return;
-    const serial = deviceSel.value;
-    const pkg = appSel.value;
     busy = true;
     updateButtons();
-    let failedStage = 'dump';
-    let snapId = null;
-    try {
-      session = await ensureSession(serial, pkg);
-      const { jobId } = await api.dump(session.id);
-      const dumpTitle = `Dump heap of ${pkg}`;
-      renderPanel([{ title: dumpTitle, job: null, pending: 'Starting the dump…' }]);
-      const dj = await runJob(jobId, dumpTitle, []);
-      if (dj.state !== 'DONE') throw failJob(dj, 'Heap dump');
-      snapId = dj.resultRef;
-      session = await api.session(session.id);
-      renderSnapshots(snapId);
-      failedStage = 'open';
-      await analyse(session.id, snapId, [{ title: dumpTitle, job: dj }]);
-    } catch (e) {
-      showFailure(e, failedStage === 'open' && snapId ? () => retryOpen(snapId) : dumpNow);
-    } finally {
-      busy = false;
-      updateButtons();
-    }
+    const ctl = { retry: initialRetry };
+    try { await run(ctl); } catch (e) { showFailure(e, ctl.retry); } finally { busy = false; updateButtons(); }
+  }
+
+  const dumpNow = () => guarded(async (ctl) => {
+    const serial = deviceSel.value;
+    const pkg = appSel.value;
+    session = await ensureSession(serial, pkg);
+    const { jobId } = await api.dump(session.id);
+    await dumpFrom(jobId, pkg, ctl);
+  }, dumpNow);
+
+  const resumeDump = (jobId, pkg) => guarded((ctl) => dumpFrom(jobId, pkg, ctl), () => resumeDump(jobId, pkg));
+
+  /** Poll the dump job, then analyse its snapshot. Retry never starts a second dump once a job exists. */
+  async function dumpFrom(jobId, pkg, ctl) {
+    ctl.retry = () => resumeDump(jobId, pkg);
+    const dumpTitle = `Dump heap of ${pkg}`;
+    renderPanel([{ title: dumpTitle, job: null, pending: 'Starting the dump\u2026' }]);
+    const dj = await runJob(jobId, dumpTitle, []);
+    if (dj.state !== 'DONE') { ctl.retry = dumpNow; throw failJob(dj, 'Heap dump'); }
+    const snapId = dj.resultRef;
+    ctl.retry = () => retryOpen(snapId);
+    try { session = await api.session(session.id); renderSnapshots(snapId); } catch { /* retryOpen refreshes the list */ }
+    await analyse(session.id, snapId, [{ title: dumpTitle, job: dj }]);
   }
 
   async function analyse(sid, snapId, doneGroups) {
@@ -221,12 +239,11 @@ export function createCapture({ onSnapshot, onNoSnapshot, onEmptyState }) {
     await onSnapshot(sid, selectedSnapshotMeta() || { id: snapId });
   }
 
-  async function retryOpen(snapId) {
-    if (busy) return;
-    busy = true;
-    updateButtons();
-    try { await analyse(session.id, snapId, []); } catch (e) { showFailure(e, () => retryOpen(snapId)); } finally { busy = false; updateButtons(); }
-  }
+  const retryOpen = (snapId) => guarded(async (ctl) => {
+    ctl.retry = () => retryOpen(snapId);
+    try { session = await api.session(session.id); renderSnapshots(snapId); } catch { /* the snapshot id is already known */ }
+    await analyse(session.id, snapId, []);
+  }, () => retryOpen(snapId));
 
   function showFailure(e, retry) {
     const message = e.message || String(e);
@@ -253,7 +270,8 @@ export function createCapture({ onSnapshot, onNoSnapshot, onEmptyState }) {
   appSel.addEventListener('change', async () => {
     updateButtons();
     // Switching app: show the active session's snapshots if it is for this app.
-    const all = await api.sessions().catch(() => []);
+    let all;
+    try { all = await api.sessions(); } catch (e) { reportLoad(e); return; }
     session = all.find((s) => s.state === 'ACTIVE' && s.serial === deviceSel.value && s.packageName === appSel.value) || null;
     renderSnapshots(session && lastOk(session)?.id);
   });
@@ -284,6 +302,5 @@ export function createCapture({ onSnapshot, onNoSnapshot, onEmptyState }) {
   }
 
   updateButtons();
-  void sleep;
   return { init, refreshDevices: () => loadDevices() };
 }

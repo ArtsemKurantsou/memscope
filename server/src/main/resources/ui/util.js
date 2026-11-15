@@ -103,3 +103,9 @@ export const prefs = {
   },
   set(key, on) { try { localStorage.setItem('memscope.' + key, on ? '1' : '0'); } catch { /* ignore */ } },
 };
+
+/** Runs `start()` unless `holder.loading` is already in flight; every concurrent caller gets the same promise. */
+export function shareInFlight(holder, start) {
+  if (!holder.loading) holder.loading = start().finally(() => { holder.loading = null; });
+  return holder.loading;
+}
