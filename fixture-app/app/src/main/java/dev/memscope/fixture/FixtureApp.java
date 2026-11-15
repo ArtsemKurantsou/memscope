@@ -1,9 +1,9 @@
 package dev.memscope.fixture;
 
 import android.app.Application;
+import android.content.ComponentName;
 import android.content.Intent;
 import android.content.ServiceConnection;
-import android.content.ComponentName;
 import android.os.IBinder;
 
 public class FixtureApp extends Application {
@@ -11,6 +11,8 @@ public class FixtureApp extends Application {
 
     @Override public void onCreate() {
         super.onCreate();
+        // Application.onCreate also runs in the :remote process; only the main process plants data.
+        if (!getPackageName().equals(Application.getProcessName())) return;
         appBlob = new byte[10 * 1024 * 1024];
         Intent i = new Intent(this, RemoteService.class);
         try {

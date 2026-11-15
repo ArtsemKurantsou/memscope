@@ -10,4 +10,9 @@ public class LeakyActivity extends Activity {
         Leaks.activity = this;
         finish();
     }
+
+    @Override protected void onDestroy() {
+        super.onDestroy();
+        Actions.leakDone();
+    }
 }
