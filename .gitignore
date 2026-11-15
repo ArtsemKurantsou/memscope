@@ -7,3 +7,4 @@ local.properties
 spike/**/build/
 .DS_Store
 .idea/
+.kotlin/
