@@ -62,6 +62,9 @@ class Job(
         return result
     }
 
+    /** Marks step [name] FAILED with [detail] without running it (e.g. a milestone that was never reached). */
+    fun failStep(name: String, detail: String) = setStep(name, StepState.FAILED, detail)
+
     /** Marks the job as finished successfully. */
     fun complete(resultRef: String?) = synchronized(lock) {
         if (state != State.RUNNING) return

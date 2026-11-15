@@ -90,9 +90,7 @@ class OnDemandDumper(private val adb: Adb, private val store: SessionStore) {
         }
         val size = Files.size(part)
         val expected = remoteSize(serial, remote)
-        val problem = when {
-            size < MIN_HPROF_BYTES -> "the pulled file is only $size bytes"
-            !startsWithHprofMagic(part) -> "the pulled file is not a heap dump (missing JAVA PROFILE header)"
+        val problem = hprofProblem(part) ?: when {
             expected != null && expected != size -> "pulled $size bytes but the device file has $expected bytes"
             else -> null
         }
@@ -138,11 +136,6 @@ class OnDemandDumper(private val adb: Adb, private val store: SessionStore) {
             } catch (_: InterruptedException) { /* pull finished */ }
         }.apply { isDaemon = true; start() }
 
-    private fun startsWithHprofMagic(file: Path): Boolean = Files.newInputStream(file).use { input ->
-        val head = input.readNBytes(MAGIC.size)
-        head.contentEquals(MAGIC)
-    }
-
     private fun deleteQuietly(path: Path) {
         try { Files.deleteIfExists(path) } catch (_: java.io.IOException) { /* best effort */ }
     }
@@ -157,5 +150,16 @@ class OnDemandDumper(private val adb: Adb, private val store: SessionStore) {
         private val PULL_TIMEOUT = 300.seconds
         private const val MIN_HPROF_BYTES = 1024L
         private val MAGIC = "JAVA PROFILE".toByteArray(Charsets.US_ASCII)
+
+        /** Why a pulled [file] is not a usable heap dump (too small, no `JAVA PROFILE` header), or null if it looks fine. */
+        internal fun hprofProblem(file: Path): String? {
+            val size = Files.size(file)
+            return when {
+                size < MIN_HPROF_BYTES -> "the pulled file is only $size bytes"
+                !Files.newInputStream(file).use { it.readNBytes(MAGIC.size) }.contentEquals(MAGIC) ->
+                    "the pulled file is not a heap dump (missing JAVA PROFILE header)"
+                else -> null
+            }
+        }
     }
 }

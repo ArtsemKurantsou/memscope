@@ -200,4 +200,25 @@ class AdbTest {
         assertEquals(setOf(111, 222), Adb(script).jdwpPids("s"))
         assertTrue((System.nanoTime() - start) < 6_000_000_000L)
     }
+
+    @Test
+    fun `trackJdwp streams into a file until cancelled and maps adb failures`() {
+        val script = tmp.resolve("fake adb")
+        Files.writeString(script, "#!/bin/sh\nprintf '0004111\\n'\nexec sleep 30\n")
+        script.toFile().setExecutable(true)
+        val dest = tmp.resolve("track.bin")
+        val cancel = CancelToken()
+        val t = Thread { Adb(script).trackJdwp("s", dest, 30.seconds, cancel) }.apply { start() }
+        val deadline = System.nanoTime() + 5_000_000_000L
+        while ((!Files.exists(dest) || Files.size(dest) < 8) && System.nanoTime() < deadline) Thread.sleep(20)
+        assertEquals("0004111\n", Files.readString(dest))
+        cancel.cancel()
+        t.join(5_000)
+        assertFalse(t.isAlive, "cancel is the normal way out and returns")
+
+        val (gone, fake) = adb { err("adb: error: closed") }
+        val e = assertThrows<DeviceException> { gone.trackJdwp("s", dest, 1.seconds, CancelToken()) }
+        assertEquals(DeviceException.Kind.DISCONNECTED, e.kind)
+        assertEquals(listOf(adbPath.toString(), "-s", "s", "track-jdwp"), fake.calls[0])
+    }
 }

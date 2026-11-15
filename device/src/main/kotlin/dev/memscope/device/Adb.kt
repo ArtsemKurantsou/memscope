@@ -107,6 +107,20 @@ class Adb(val adbPath: Path, val runner: ProcessRunner = RealProcessRunner()) {
         }
     }
 
+    /**
+     * Streams `adb track-jdwp` (4 hex digits of length, then newline-separated pids; repeated on every change) into
+     * [dest] until [cancel] or [timeout], which are both the normal way out. Blocks: run it on its own thread.
+     */
+    fun trackJdwp(serial: String, dest: Path, timeout: Duration, cancel: CancelToken) {
+        val result = try {
+            adbRun(serial, listOf("track-jdwp"), timeout, stdoutTo = dest, cancel = cancel)
+        } catch (e: DeviceException) {
+            if (e.kind == DeviceException.Kind.CANCELLED || e.kind == DeviceException.Kind.TIMEOUT) return
+            throw e
+        }
+        requireSuccess(result, serial, "track-jdwp")
+    }
+
     /** Processes whose name is [packageName] or starts with "[packageName]:". */
     fun processes(serial: String, packageName: String): List<ProcessInfo> {
         val result = shell(serial, listOf("ps", "-A", "-o", "PID,NAME"))

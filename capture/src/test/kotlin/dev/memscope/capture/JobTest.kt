@@ -74,6 +74,18 @@ class JobTest {
     }
 
     @Test
+    fun `failStep marks a step FAILED with a detail without running it, appending unknown names`() {
+        val job = Job("j", "t", listOf("A", "B"))
+        job.failStep("B", "not reached within 120 s")
+        job.failStep("C", "extra")
+        val v = job.snapshot()
+        assertEquals(listOf("A", "B", "C"), v.steps.map { it.name })
+        assertEquals(Job.Step("B", Job.StepState.FAILED, "not reached within 120 s"), v.steps[1])
+        assertEquals(Job.StepState.PENDING, v.steps[0].state)
+        assertEquals(Job.State.RUNNING, v.state, "a failed step alone does not fail the job")
+    }
+
+    @Test
     fun `JobView is serializable`() {
         val json = kotlinx.serialization.json.Json.encodeToString(JobView.serializer(), Job("j", "t", listOf("A")).snapshot())
         assertTrue("\"PENDING\"" in json, json)
