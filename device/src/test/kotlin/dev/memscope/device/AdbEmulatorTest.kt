@@ -4,7 +4,6 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertTrue
-import org.junit.jupiter.api.Assumptions
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
@@ -15,6 +14,11 @@ import kotlin.time.Duration.Companion.seconds
 class AdbEmulatorTest {
     private val serial = "emulator-5554"
     private val adb = Adb(AdbLocator.find())
+
+    private companion object {
+        const val FIXTURE_PACKAGE = "dev.memscope.fixture"
+        const val FIXTURE_ACTIVITY = ".MainActivity"
+    }
 
     private fun forwardList(): String =
         adb.runner.run(listOf(adb.adbPath.toString(), "forward", "--list"), 10.seconds).stdout
@@ -33,9 +37,12 @@ class AdbEmulatorTest {
 
     @Test
     fun `forwardJdwp then removeForward removes exactly that forward`() {
-        val pid = adb.jdwpPids(serial).firstOrNull()
-        Assumptions.assumeTrue(pid != null, "no debuggable process is running on the emulator to forward to")
-        pid!!
+        val pkg = FIXTURE_PACKAGE
+        if (pkg !in adb.shell(serial, listOf("pm", "list", "packages", pkg)).stdout.lineSequence().map { it.trim().removePrefix("package:") }.toList()) {
+            throw AssertionError("fixture app not installed: run fixture-app/build-and-install.sh")
+        }
+        adb.shell(serial, listOf("am", "start", "-n", "$pkg/$FIXTURE_ACTIVITY"))
+        val pid = waitForJdwpPid(pkg)
         val port = adb.forwardJdwp(serial, pid)
         try {
             assertTrue("tcp:$port jdwp:$pid" in forwardList(), "forward not listed")
@@ -45,8 +52,18 @@ class AdbEmulatorTest {
         assertFalse("tcp:$port " in forwardList(), "tcp:$port still forwarded")
     }
 
+    private fun waitForJdwpPid(pkg: String): Int {
+        val deadline = System.nanoTime() + 15_000_000_000L
+        while (System.nanoTime() < deadline) {
+            val pids = adb.processes(serial, pkg).map { it.pid }.toSet()
+            adb.jdwpPids(serial).firstOrNull { it in pids }?.let { return it }
+            Thread.sleep(300)
+        }
+        throw AssertionError("no JDWP process for $pkg appeared within 15 s after am start")
+    }
+
     @Test
-    fun `system packages and unknown packages are refused`() {
+    fun `unknown package is NOT_INSTALLED and settings has a launcher component`() {
         val e = assertThrows<DeviceException> { adb.requireDebuggable(serial, "no.such.package.memscope") }
         assertEquals(DeviceException.Kind.NOT_INSTALLED, e.kind)
         assertNotNull(adb.launcherComponent(serial, "com.android.settings"))

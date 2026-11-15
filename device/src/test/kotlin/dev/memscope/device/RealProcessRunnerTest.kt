@@ -89,4 +89,38 @@ class RealProcessRunnerTest {
         val r = runner.run(listOf("/bin/sh", "-c", "head -c 500000 /dev/zero | tr '\\0' x >&2"), 10.seconds)
         assertTrue(r.stderr.isNotEmpty())
     }
+
+    @Test
+    fun `a throwing onBytes fails fast as COMMAND_FAILED and kills the child`() {
+        val dest = tmp.resolve("o.bin")
+        val start = System.nanoTime()
+        val e = assertThrows<DeviceException> {
+            runner.run(
+                listOf("/bin/sh", "-c", "yes"), 30.seconds, stdoutTo = dest,
+                onBytes = { throw IllegalStateException("sink broke") },
+            )
+        }
+        assertEquals(DeviceException.Kind.COMMAND_FAILED, e.kind)
+        assertTrue("could not write" in e.message!!, e.message)
+        assertFalse(e.hint.isBlank())
+        assertTrue((System.nanoTime() - start) < 3_000_000_000L, "took too long")
+    }
+
+    @Test
+    fun `an unwritable destination fails fast as COMMAND_FAILED`() {
+        val start = System.nanoTime()
+        val e = assertThrows<DeviceException> {
+            runner.run(listOf("/bin/echo", "hi"), 30.seconds, stdoutTo = tmp.resolve("no/such/dir/o.bin"))
+        }
+        assertEquals(DeviceException.Kind.COMMAND_FAILED, e.kind)
+        assertTrue((System.nanoTime() - start) < 3_000_000_000L)
+    }
+
+    @Test
+    fun `a write failure mid-stream (device full) fails fast as COMMAND_FAILED`() {
+        val e = assertThrows<DeviceException> {
+            runner.run(listOf("/bin/sh", "-c", "yes"), 30.seconds, stdoutTo = java.nio.file.Path.of("/dev/full"))
+        }
+        assertEquals(DeviceException.Kind.COMMAND_FAILED, e.kind)
+    }
 }
