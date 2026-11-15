@@ -39,6 +39,12 @@ class JobRegistry(workers: Int = 4, private val keepFinished: Int = 50) : AutoCl
                 work()
             } catch (t: Throwable) {
                 job.fail(t)
+                val device = t as? dev.memscope.device.DeviceException
+                if (device != null) {
+                    ServerLog.error("job ${job.id} (${job.title}) failed: kind=${device.kind} message=${device.message} hint=${device.hint}")
+                } else {
+                    ServerLog.error("job ${job.id} (${job.title}) failed: ${t.message}", t)
+                }
             }
         }
     }

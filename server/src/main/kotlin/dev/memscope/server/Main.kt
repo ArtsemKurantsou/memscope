@@ -40,19 +40,35 @@ private fun openBrowser(url: String) {
     }
 }
 
+private const val USAGE = "Usage: server [--port <n>] [--no-open]"
+
+private fun usageError(message: String): Nothing {
+    System.err.println("$message\n$USAGE")
+    kotlin.system.exitProcess(2)
+}
+
+/** Browsers omit the default port from Host and Origin, so 80/443 would never match the "host:port" guard; also reject out-of-range ports. */
+fun checkPort(port: Int): String? = when {
+    port == 80 || port == 443 -> "Port $port is reserved for web servers; pick another with --port (e.g. 7070)."
+    port !in 1..65535 -> "Port $port is out of range (1-65535)."
+    else -> null
+}
+
 fun main(args: Array<String>) {
     var port: Int? = null
     var open = true
     var i = 0
     while (i < args.size) {
         when (args[i]) {
-            "--port" -> port = args.getOrNull(++i)?.toIntOrNull() ?: error("--port needs a number")
+            "--port" -> port = args.getOrNull(++i)?.toIntOrNull() ?: usageError("--port needs a number.")
             "--no-open" -> open = false
-            else -> error("Unknown argument '${args[i]}'. Usage: [--port <n>] [--no-open]")
+            else -> usageError("Unknown argument '${args[i]}'.")
         }
         i++
     }
+    port?.let { p -> checkPort(p)?.let { usageError(it) } }
     val chosen = port ?: firstFreePort()
+
     val adb: Adb by lazy { Adb(AdbLocator.find()) } // not found is reported per request, with its hint
     val deps = ServerDeps(SessionStore(), { adb })
     val engine = startServer(deps, chosen, wait = false)

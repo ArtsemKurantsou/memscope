@@ -20,9 +20,10 @@ private class Failed(val error: Throwable) : Event
  * "tree", and "load" (cache hit) or "cache" (cache write). They map to: Parse = pass 1; Index = pass 2
  * or loading the cache; Dominators = dominators, retained sizes, tree; cache write stays in Dominators.
  * Steps never go backwards. Steps that never ran (cache hit skips Parse) are marked done at the end.
- * Cancelling the job abandons the work; a snapshot opened afterwards is closed.
+ * Cancelling the job abandons the work; a snapshot opened afterwards is closed. [exited] completes when the
+ * analysis thread has really finished (also after an abandon), so callers can avoid running two at once.
  */
-fun runAnalysis(job: Job, open: (Progress) -> SnapshotView): SnapshotView {
+fun runAnalysis(job: Job, exited: java.util.concurrent.CompletableFuture<Unit>, open: (Progress) -> SnapshotView): SnapshotView {
     val queue = LinkedBlockingQueue<Event>()
     val lock = Any()
     var abandoned = false
@@ -45,6 +46,8 @@ fun runAnalysis(job: Job, open: (Progress) -> SnapshotView): SnapshotView {
             synchronized(lock) { if (abandoned) view.close() else queue.put(Finished(view)) }
         } catch (t: Throwable) {
             queue.put(Failed(t))
+        } finally {
+            exited.complete(Unit) // only now may another analysis of the same file start
         }
     }, "memscope-analysis").apply { isDaemon = true; start() }
 
@@ -78,7 +81,11 @@ fun runAnalysis(job: Job, open: (Progress) -> SnapshotView): SnapshotView {
                     while (true) {
                         detail(current.detail)
                         val n = next()
-                        if (n is Report && n.step == e.step) current = n else { following = n; break }
+                        when {
+                            n is Failed -> throw n.error // the running step fails with it
+                            n is Report && n.step == e.step -> current = n
+                            else -> { following = n; break }
+                        }
                     }
                 }
                 event = following!!

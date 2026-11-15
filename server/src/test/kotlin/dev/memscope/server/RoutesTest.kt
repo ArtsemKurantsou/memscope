@@ -46,11 +46,13 @@ class RoutesTest {
     private lateinit var store: SessionStore
     private lateinit var deps: ServerDeps
     private var now = 1_000_000L
+    private val logs = java.util.concurrent.CopyOnWriteArrayList<String>()
     private lateinit var http: HttpClient
 
     private fun server(block: suspend ApplicationTestBuilder.() -> Unit) {
         store = SessionStore(home)
         deps = ServerDeps(store, { runner.adb }, opener, clock = { now })
+        ServerLog.sink = { logs += it }
         try {
             testApplication {
                 application { memscopeModule(deps, setOf("localhost")) }
@@ -59,6 +61,7 @@ class RoutesTest {
             }
         } finally {
             deps.close()
+            ServerLog.sink = { System.err.println(it) }
         }
     }
 
@@ -358,6 +361,7 @@ class RoutesTest {
         assertEquals("FAILED", str(job, "state"))
         assertTrue(str(job, "errorMessage").contains(file.name))
         assertTrue(str(job, "errorHint").contains("capture", ignoreCase = true))
+        assertTrue((job["steps"]!!.jsonArray).any { str(it.jsonObject, "state") == "FAILED" }, "the step running when the failure came is FAILED: $job")
         assertEquals(SnapshotMeta.Status.UNREADABLE, store.get(s.id)!!.snapshots.single().status)
         val summary = client.get("/api/snapshots/${s.id}/$snap/summary")
         assertEquals(HttpStatusCode.UnprocessableEntity, summary.status)
@@ -443,6 +447,91 @@ class RoutesTest {
         while (view.detailsCalls.isEmpty() && System.currentTimeMillis() < deadline) Thread.sleep(10)
         assertEquals(listOf("obj:1"), view.detailsCalls, "details of the first root row")
         assertTrue(Triple("root", 0, 1) in view.childrenCalls)
+    }
+
+    @Test fun cancelledOpenNeverOverlapsAReopenOfTheSameSnapshot() = server {
+        val s = store.newAttachSession()
+        val snap = store.addFakeSnapshot(s.id)
+        val gate = CountDownLatch(1)
+        opener.gate = gate
+        val first = str(http.postJson("/api/snapshots/${s.id}/$snap/open").obj(), "jobId")
+        waitUntil { opener.calls.get() == 1 }
+        http.postJson("/api/jobs/$first/cancel")
+        assertEquals("CANCELLED", str(http.waitJob(first), "state"))
+        val second = str(http.postJson("/api/snapshots/${s.id}/$snap/open").obj(), "jobId")
+        assertNotEquals(first, second)
+        Thread.sleep(400)
+        assertEquals(1, opener.calls.get(), "the re-open waits for the abandoned analysis to exit")
+        gate.countDown()
+        assertEquals("DONE", str(http.waitJob(second), "state"))
+        assertEquals(2, opener.calls.get())
+        assertEquals(1, opener.maxRunning.get(), "never two analyses of one snapshot at once")
+        assertTrue(opener.opened.size == 2)
+        assertEquals(HttpStatusCode.OK, http.get("/api/snapshots/${s.id}/$snap/summary").status)
+    }
+
+    private fun waitUntil(timeoutMs: Long = 5000, cond: () -> Boolean) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (!cond() && System.currentTimeMillis() < deadline) Thread.sleep(10)
+        assertTrue(cond(), "condition not met in ${timeoutMs}ms")
+    }
+
+    @Test fun internalErrorsAreLoggedWithStackTrace() = server {
+        val s = store.newAttachSession()
+        val snap = store.addFakeSnapshot(s.id)
+        http.openSnapshot(s.id, snap)
+        opener.opened.single().onChildren = { throw RuntimeException("boom in heap query") }
+        val r = http.get("/api/snapshots/${s.id}/$snap/tree?ref=root")
+        assertEquals(HttpStatusCode.InternalServerError, r.status)
+        assertEquals("INTERNAL", str(r.obj(), "kind"))
+        val line = logs.single { it.contains("boom in heap query") }
+        assertTrue(line.contains("RoutesTest") || line.contains("at "), "stack trace is logged: $line")
+        assertTrue(line.contains("/tree"), "the request is named: $line")
+    }
+
+    @Test fun failedJobsAreLoggedWithKindMessageAndHint() = server {
+        val s = store.newAttachSession()
+        runner.disconnected = true
+        http.waitJob(str(http.postJson("/api/sessions/${s.id}/dump").obj(), "jobId"))
+        waitUntil { logs.any { it.contains("failed") } }
+        val line = logs.first { it.contains("failed") }
+        assertTrue(line.contains("kind=") && line.contains("message=") && line.contains("hint="), line)
+    }
+
+    @Test fun crossSiteOriginIsRefusedOnStateChangingRequests() = server {
+        val s = store.newAttachSession()
+        for (path in listOf("/api/sessions/${s.id}/end", "/api/jobs/j1/cancel", "/api/snapshots/${s.id}/s1/open", "/api/sessions/${s.id}/dump")) {
+            val r = http.post(path) { header(HttpHeaders.Origin, "http://evil.example.com") }
+            assertEquals(HttpStatusCode.Forbidden, r.status, path)
+            assertEquals("FORBIDDEN_ORIGIN", str(r.obj(), "kind"), path)
+        }
+        assertEquals(SessionMeta.State.ACTIVE, store.get(s.id)!!.state, "the end request never ran")
+        assertEquals(HttpStatusCode.Forbidden, http.post("/api/sessions/${s.id}/end") { header(HttpHeaders.Origin, "http://localhost.evil.com") }.status)
+        assertEquals(HttpStatusCode.Forbidden, http.post("/api/sessions/${s.id}/end") { header(HttpHeaders.Origin, "null") }.status)
+        val own = http.post("/api/sessions/${s.id}/end") { header(HttpHeaders.Origin, "http://localhost") }
+        assertEquals(HttpStatusCode.OK, own.status, "the page's own origin is accepted")
+        assertEquals(HttpStatusCode.OK, http.get("/api/devices") { header(HttpHeaders.Origin, "http://evil.example.com") }.status, "reads are not origin-checked (the Host guard and missing CORS cover them)")
+    }
+
+    @Test fun postBodiesMustBeJson() = server {
+        val create = http.post("/api/sessions") {
+            contentType(ContentType.Text.Plain)
+            setBody("""{"serial":"emulator-5554","packageName":"dev.app","mode":"ATTACH"}""")
+        }
+        assertEquals(HttpStatusCode.UnsupportedMediaType, create.status)
+        assertTrue(store.list().isEmpty())
+        val s = store.newAttachSession()
+        val dump = http.post("/api/sessions/${s.id}/dump") { contentType(ContentType.Text.Plain); setBody("""{"label":"x"}""") }
+        assertEquals(HttpStatusCode.UnsupportedMediaType, dump.status)
+        assertEquals(0, runner.count("shell", "am"), "nothing ran")
+    }
+
+    @Test fun portsThatCannotMatchTheHostGuardAreRejected() {
+        assertTrue(checkPort(80)!!.contains("80"))
+        assertTrue(checkPort(443) != null)
+        assertTrue(checkPort(0) != null)
+        assertTrue(checkPort(70000) != null)
+        assertNull(checkPort(7070))
     }
 
     // ---------------------------------------------------------------- web surface

@@ -8,6 +8,8 @@ import dev.memscope.capture.SnapshotMeta
 import dev.memscope.device.DeviceException
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
+import io.ktor.http.HttpMethod
+import io.ktor.server.request.contentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.ContentConvertException
 import io.ktor.serialization.kotlinx.json.json
@@ -65,6 +67,16 @@ fun Application.memscopeModule(deps: ServerDeps, allowedHosts: Set<String>) {
             finish()
             return@intercept
         }
+        // Cross-site request forgery: a web page can POST to localhost, and its browser says where it came from.
+        val origin = call.request.headers[HttpHeaders.Origin]
+        if (call.request.local.method != HttpMethod.Get && origin != null && origin !in allowedHosts.map { "http://$it" }) {
+            call.respond(
+                HttpStatusCode.Forbidden,
+                ErrorBody("Cross-site request refused", "Use the MemScope page itself (http://localhost:<port>); other origins may not change state.", "FORBIDDEN_ORIGIN"),
+            )
+            finish()
+            return@intercept
+        }
         call.response.header(HttpHeaders.CacheControl, "no-store")
     }
 
@@ -100,11 +112,21 @@ private suspend fun ApplicationCall.respondError(t: Throwable) {
         is IllegalArgumentException, is SerializationException, is ContentTransformationException,
         is ContentConvertException, is BadRequestException ->
             body(HttpStatusCode.BadRequest, msg, "Check the request body and query parameters; refs come from earlier tree/object responses.", "BAD_REQUEST")
-        else -> body(HttpStatusCode.InternalServerError, msg, "This is a bug in MemScope; the server log has the details.", "INTERNAL")
+        else -> {
+            ServerLog.error("internal error on ${request.local.method.value} ${request.local.uri}: $msg", t)
+            body(HttpStatusCode.InternalServerError, msg, "This is a bug in MemScope; the terminal running the server has the stack trace.", "INTERNAL")
+        }
     }
 }
 
 /** Runs blocking work (adb, disk, heap queries) off the event loop. */
+private fun requireJson(call: ApplicationCall) {
+    val type = call.request.contentType()
+    if (!type.match(ContentType.Application.Json)) {
+        throw ApiException(HttpStatusCode.UnsupportedMediaType, "Content-Type must be application/json", "Send the body as JSON with Content-Type: application/json.", "UNSUPPORTED_MEDIA_TYPE")
+    }
+}
+
 private suspend fun <T> io(block: () -> T): T = withContext(Dispatchers.IO) { block() }
 
 private fun Route.deviceRoutes(deps: ServerDeps) {
@@ -124,6 +146,7 @@ private fun Route.sessionRoutes(deps: ServerDeps) {
     val store = deps.store
 
     post("/sessions") {
+        requireJson(call)
         val req = call.receive<CreateSessionRequest>()
         require(req.serial.isNotBlank() && req.packageName.isNotBlank()) { "serial and packageName are required" }
         if (req.mode == SessionMeta.Mode.STARTUP) {
@@ -154,6 +177,7 @@ private fun Route.sessionRoutes(deps: ServerDeps) {
     post("/sessions/{id}/dump") {
         val id = call.parameters["id"]!!
         val text = call.receiveText()
+        if (text.isNotBlank()) requireJson(call)
         val req = if (text.isBlank()) DumpRequest() else apiJson.decodeFromString(DumpRequest.serializer(), text)
         val session = io { store.get(id) } ?: throw notFound("Session")
         if (session.state != SessionMeta.State.ACTIVE) {
@@ -181,6 +205,9 @@ private fun Route.jobRoutes(deps: ServerDeps) {
 private val openLock = Any()
 private val openJobs = HashMap<String, Job>()
 
+/** Analysis threads still running per snapshot key, including ones abandoned by a cancelled job. Guarded by [openLock]. */
+private val analysisThreads = HashMap<String, java.util.concurrent.CompletableFuture<Unit>>()
+
 private fun Route.snapshotRoutes(deps: ServerDeps) {
     val store = deps.store
 
@@ -191,9 +218,14 @@ private fun Route.snapshotRoutes(deps: ServerDeps) {
         return session to (session.snapshots.firstOrNull { it.id == snap } ?: throw notFound("Snapshot"))
     }
 
+    /** Never throws: bookkeeping must not mask the error being reported. */
     fun markUnreadable(sid: String, snap: String, message: String) {
-        store.update(sid) { s ->
-            s.copy(snapshots = s.snapshots.map { if (it.id == snap) it.copy(status = SnapshotMeta.Status.UNREADABLE, error = message) else it })
+        try {
+            store.update(sid) { s ->
+                s.copy(snapshots = s.snapshots.map { if (it.id == snap) it.copy(status = SnapshotMeta.Status.UNREADABLE, error = message) else it })
+            }
+        } catch (t: Exception) {
+            ServerLog.error("could not record snapshot $sid/$snap as UNREADABLE: ${t.message}")
         }
     }
 
@@ -238,8 +270,12 @@ private fun Route.snapshotRoutes(deps: ServerDeps) {
                     }
                     openJobs[key] = created
                     deps.jobs.submit(created) {
+                        val mine = java.util.concurrent.CompletableFuture<Unit>()
+                        val prior = synchronized(openLock) { analysisThreads.put(key, mine) }
+                        mine.whenComplete { _, _ -> synchronized(openLock) { analysisThreads.remove(key, mine) } }
                         try {
-                            val view = runAnalysis(created) { progress -> deps.opener.open(file.toFile(), session.appPackagePrefixes, progress) }
+                            prior?.join() // a cancelled analysis of this snapshot may still be indexing: never two at once
+                            val view = runAnalysis(created, mine) { progress -> deps.opener.open(file.toFile(), session.appPackagePrefixes, progress) }
                             deps.snapshots.put(key, view)
                             created.complete(key)
                             deps.jobs.background { warmUp(deps, key) }
@@ -247,7 +283,7 @@ private fun Route.snapshotRoutes(deps: ServerDeps) {
                             markUnreadable(sid, snap, e.message ?: "unreadable")
                             throw DeviceException(DeviceException.Kind.COMMAND_FAILED, e.message ?: "unreadable", unreadable("").hint)
                         } finally {
-                            synchronized(openLock) { openJobs.remove(key) }
+                            synchronized(openLock) { openJobs.remove(key, created) }
                         }
                     }
                     created

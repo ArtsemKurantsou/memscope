@@ -102,17 +102,24 @@ class FakeOpener(
 ) : SnapshotOpener {
     val opened = CopyOnWriteArrayList<FakeView>()
     val calls = AtomicInteger()
+    val running = AtomicInteger()
+    val maxRunning = AtomicInteger()
     @Volatile var failWith: Throwable? = null
     @Volatile var gate: java.util.concurrent.CountDownLatch? = null
     @Volatile var seenPrefixes: List<String> = emptyList()
 
     override fun open(file: File, appPackagePrefixes: List<String>, progress: Progress): SnapshotView {
         calls.incrementAndGet()
-        seenPrefixes = appPackagePrefixes
-        gate?.await()
-        reports.forEach { (s, f) -> progress.report(s, f) }
-        failWith?.let { throw it }
-        return FakeView(file.name).also { opened += it }
+        maxRunning.accumulateAndGet(running.incrementAndGet(), ::maxOf)
+        try {
+            seenPrefixes = appPackagePrefixes
+            gate?.await()
+            reports.forEach { (s, f) -> progress.report(s, f) }
+            failWith?.let { throw it }
+            return FakeView(file.name).also { opened += it }
+        } finally {
+            running.decrementAndGet()
+        }
     }
 }
 
