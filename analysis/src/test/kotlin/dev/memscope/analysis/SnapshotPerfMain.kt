@@ -55,8 +55,13 @@ fun main(args: Array<String>) {
         val tail = snapshot.instances("dev.memscope.fixture.Node", nodes - 1, 1).rows.single().ref
         val deep = timed("details() of the deepest Node") { snapshot.details(tail) }
         println("  path ${deep.pathFromRoot.size} steps shown (${deep.pathFromRoot.getOrNull(Snapshot.PATH_END_STEPS)?.className})")
-        val path = timed("revealPath() of the deepest Node") { snapshot.revealPath(tail) }
-        println("  ${path.size} refs")
+        timed("revealPath() of the deepest Node (refused)") {
+            try {
+                snapshot.revealPath(tail)
+            } catch (e: RevealTooDeepException) {
+                println("  RevealTooDeepException: depth ${e.depth}")
+            }
+        }
     }
     snapshot.close()
 }

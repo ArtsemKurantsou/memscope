@@ -35,8 +35,12 @@ data class HeapSummary(
     val appHeapBytes: Long,
 )
 
+/**
+ * One step of a path. [edgeLabel] names the edge leaving this step (toward the next step or the target).
+ * An elision step stands for [elided] omitted steps; it has `ref == null` and a descriptive [className].
+ */
 @Serializable
-data class PathStep(val ref: String, val className: String, val edgeLabel: String?)
+data class PathStep(val ref: String?, val className: String, val edgeLabel: String?, val elided: Int = 0)
 
 @Serializable
 data class FieldValue(val name: String, val type: String, val value: String, val ref: String?)
@@ -187,6 +191,7 @@ internal class TreeModel(val index: HeapIndex, private val appPackagePrefixes: L
 
     private class Roots(
         val members: Array<IntArray>, // per Category ordinal, retained desc (THREADS: all thread members)
+        val retained: LongArray, // summed retained per Category ordinal
         val threads: IntArray, // Thread objects, by summed retained desc
         val threadMembers: Map<Int, IntArray>,
     )
@@ -199,23 +204,36 @@ internal class TreeModel(val index: HeapIndex, private val appPackagePrefixes: L
         val off = index.domChildOffsets
         for (k in off[superRoot] until off[superRoot + 1]) {
             val c = index.domChildren[k] // retained desc order is kept in every list below
-            val pos = rootPos(c)
-            val category = if (pos < 0) Category.SHARED else when (index.rootKinds[pos].toInt()) {
-                RootKind.CLASS.ordinal -> Category.STATIC
-                RootKind.THREAD.ordinal -> { byThread.getOrPut(c) { IntBuf() }.add(c); Category.THREADS }
-                RootKind.JAVA_FRAME.ordinal, RootKind.JNI_LOCAL.ordinal -> {
-                    val t = index.rootThreadObj[pos]
-                    if (t >= 0) { byThread.getOrPut(t) { IntBuf() }.add(c); Category.THREADS } else Category.OTHER
-                }
-                RootKind.JNI_GLOBAL.ordinal -> Category.JNI
-                else -> Category.OTHER
+            val category = when (val parent = parentOfRootChild(c)) {
+                is Ref.Thread -> { byThread.getOrPut(parent.obj) { IntBuf() }.add(c); Category.THREADS }
+                is Ref.Cat -> parent.category
+                else -> error("unexpected parent ${parent.text}")
             }
             buffers[category.ordinal].add(c)
         }
         val threadMembers = byThread.mapValues { it.value.trimmed() }
         val threadSums = threadMembers.mapValues { (_, m) -> m.sumOf { index.retained[it] } }
         val threads = threadMembers.keys.sortedWith(compareByDescending<Int> { threadSums[it] }.thenBy { it }).toIntArray()
-        return Roots(Array(buffers.size) { buffers[it].trimmed() }, threads, threadMembers)
+        val members = Array(buffers.size) { buffers[it].trimmed() }
+        val retained = LongArray(members.size) { c -> members[c].sumOf { index.retained[it] } }
+        return Roots(members, retained, threads, threadMembers)
+    }
+
+    /**
+     * The row a dominator-tree child of the super-root is listed under: a category, or for thread
+     * roots the THREAD row of its thread. The single source of truth for [children] and [revealPath].
+     */
+    private fun parentOfRootChild(c: Int): Ref {
+        val pos = rootPos(c)
+        if (pos < 0) return Ref.Cat(Category.SHARED)
+        return when (index.rootKinds[pos].toInt()) {
+            RootKind.CLASS.ordinal -> Ref.Cat(Category.STATIC)
+            RootKind.THREAD.ordinal -> Ref.Thread(c)
+            RootKind.JAVA_FRAME.ordinal, RootKind.JNI_LOCAL.ordinal ->
+                index.rootThreadObj[pos].let { t -> if (t >= 0) Ref.Thread(t) else Ref.Cat(Category.OTHER) }
+            RootKind.JNI_GLOBAL.ordinal -> Ref.Cat(Category.JNI)
+            else -> Ref.Cat(Category.OTHER)
+        }
     }
 
     fun isThread(d: Int): Boolean = roots.threadMembers.containsKey(d)
@@ -264,7 +282,9 @@ internal class TreeModel(val index: HeapIndex, private val appPackagePrefixes: L
 
     private fun buildChildList(ref: Ref): ChildList = when (ref) {
         Ref.Root -> {
+            // Non-empty categories by summed retained desc; ties keep the enum order (sortedWith is stable).
             val present = Category.entries.filter { roots.members[it.ordinal].isNotEmpty() }
+                .sortedWith(compareByDescending { roots.retained[it.ordinal] })
             ChildList(IntArray(present.size) { present[it].ordinal }, IntArray(0), emptyMap())
         }
         is Ref.Cat -> when (ref.category) {
@@ -320,10 +340,22 @@ internal class TreeModel(val index: HeapIndex, private val appPackagePrefixes: L
         val to = index.domChildOffsets[d + 1]
         if (to - from < GROUP_MIN) return to - from
         cache["obj:$d"]?.let { return it.entries.size }
+        // O(k) with a reused per-class counter table (reset afterwards): no sort, no allocation.
+        val counts = classCounts
+        val children = index.domChildren
+        for (k in from until to) counts[index.classOf[children[k]]]++
         var rows = 0
-        forEachClassRun(index.domChildren, from, to) { _, count -> rows += if (count >= GROUP_MIN) 1 else count }
+        for (k in from until to) {
+            val c = index.classOf[children[k]]
+            val count = counts[c]
+            if (count in 1 until GROUP_MIN) rows++
+            else if (count >= GROUP_MIN) { rows++; counts[c] = -1 } // one GROUP row; count it once
+        }
+        for (k in from until to) counts[index.classOf[children[k]]] = 0
         return rows
     }
+
+    private val classCounts = IntArray(index.classNames.size)
 
     /** Calls [action] once per distinct class among `objects[from until to]` with its number of objects. */
     private inline fun forEachClassRun(objects: IntArray, from: Int, to: Int, action: (classIndex: Int, count: Int) -> Unit) {
@@ -465,34 +497,37 @@ internal class TreeModel(val index: HeapIndex, private val appPackagePrefixes: L
 
     // ---------------------------------------------------------------- reveal
 
-    /** Refs from "root" down to [ref]; each one is among the `children` of the previous one. */
-    fun revealPath(ref: Ref): List<String> = when (ref) {
+    /**
+     * Refs from "root" down to [ref]; each one is among the `children` of the previous one.
+     * Throws [RevealTooDeepException] when the object's dominator-tree depth exceeds [maxDepth]
+     * (checked on the int chain before any ref string is built).
+     */
+    fun revealPath(ref: Ref, maxDepth: Int): List<String> = when (ref) {
         Ref.Root -> listOf("root")
         is Ref.Cat -> listOf("root", ref.text)
         is Ref.Thread -> listOf("root", Category.THREADS.ref, ref.text)
-        is Ref.Group -> revealPath(ref.parent) + ref.text
-        is Ref.Obj -> revealObject(ref.obj)
+        is Ref.Group -> revealPath(ref.parent, maxDepth) + ref.text
+        is Ref.Obj -> revealObject(ref.obj, maxDepth)
     }
 
-    private fun revealObject(d: Int): List<String> {
+    /** Number of objects on the dominator-tree chain from the super-root's child down to [d] (reachable [d]). */
+    private fun dominatorDepth(d: Int): Int {
+        var depth = 0
+        var x = d
+        while (x != superRoot) { depth++; x = index.idom[x] }
+        return depth
+    }
+
+    private fun revealObject(d: Int, maxDepth: Int): List<String> {
         require(index.idom[d] != Dominators.UNREACHABLE) { "Object obj:$d is unreachable and not in the tree" }
-        val chain = IntBuf() // d up to the dominator-tree child of the super-root
+        val depth = dominatorDepth(d)
+        if (depth > maxDepth) throw RevealTooDeepException(depth)
+        val chain = IntBuf(depth) // d up to the dominator-tree child of the super-root
         var x = d
         while (x != superRoot) { chain.add(x); x = index.idom[x] }
         val top = chain[chain.size - 1]
         val path = arrayListOf("root")
-        val pos = rootPos(top)
-        var parent: Ref = when {
-            pos < 0 -> Ref.Cat(Category.SHARED)
-            else -> when (index.rootKinds[pos].toInt()) {
-                RootKind.CLASS.ordinal -> Ref.Cat(Category.STATIC)
-                RootKind.THREAD.ordinal -> Ref.Thread(top)
-                RootKind.JAVA_FRAME.ordinal, RootKind.JNI_LOCAL.ordinal ->
-                    if (index.rootThreadObj[pos] >= 0) Ref.Thread(index.rootThreadObj[pos]) else Ref.Cat(Category.OTHER)
-                RootKind.JNI_GLOBAL.ordinal -> Ref.Cat(Category.JNI)
-                else -> Ref.Cat(Category.OTHER)
-            }
-        }
+        var parent = parentOfRootChild(top)
         if (parent is Ref.Thread) path += Category.THREADS.ref
         path += parent.text
         for (k in chain.size - 1 downTo 0) {

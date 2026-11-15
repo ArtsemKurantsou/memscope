@@ -41,7 +41,7 @@ class Snapshot private constructor(private val hprof: File, val index: HeapIndex
         const val MAX_REFERRERS = 100
         const val MAX_ARRAY_ELEMENTS = 100
         const val MAX_ROOTS_REACHING = 10
-        /** Longer paths from a root keep this many steps at each end around one elision step (ref ""). */
+        /** Longer paths from a root keep this many steps at each end around one elision step (ref null, [PathStep.elided] > 0). */
         const val PATH_END_STEPS = 50
         private const val MAX_STRING_CHARS = 200
         private const val ROOTS_REACHING_VISIT_BUDGET = 2_000_000
@@ -64,8 +64,20 @@ class Snapshot private constructor(private val hprof: File, val index: HeapIndex
     @Volatile var graphOpenMillis: Long = -1
         private set
 
+    private var closed = false
+
+    /** Every query after [close] fails: a closed snapshot never silently reopens the hprof. */
+    private fun checkOpen() = check(!closed) { "snapshot closed" }
+
+    private inline fun <T> whileOpen(block: () -> T): T {
+        checkOpen()
+        return block()
+    }
+
     @Synchronized
-    fun summary(): HeapSummary = heapSummary ?: computeSummary().also { heapSummary = it }
+    fun summary(): HeapSummary = whileOpen {
+        heapSummary ?: computeSummary().also { heapSummary = it }
+    }
 
     private fun computeSummary(): HeapSummary {
         var native = 0L
@@ -87,6 +99,7 @@ class Snapshot private constructor(private val hprof: File, val index: HeapIndex
     /** One page of the rows under [ref] ("root" for the top level). */
     @Synchronized
     fun children(ref: String, offset: Int = 0, limit: Int = 25): TreePage {
+        checkOpen()
         require(offset >= 0 && limit >= 0) { "offset and limit must be >= 0 (were $offset, $limit)" }
         return tree.page(tree.parse(ref), offset, limit, labels)
     }
@@ -94,6 +107,7 @@ class Snapshot private constructor(private val hprof: File, val index: HeapIndex
     /** Details of an `obj:` ref, or of the Thread object of a `thr:` ref; other refs name no single object. */
     @Synchronized
     fun details(ref: String): ObjectDetails {
+        checkOpen()
         val d = when (val r = tree.parse(ref)) {
             is Ref.Obj -> r.obj
             is Ref.Thread -> r.obj
@@ -114,11 +128,12 @@ class Snapshot private constructor(private val hprof: File, val index: HeapIndex
      * the instances that have no instance of the same class among their dominator-tree ancestors.
      */
     @Synchronized
-    fun classes(): List<ClassStat> = classStats ?: computeClasses().also { classStats = it }
+    fun classes(): List<ClassStat> = whileOpen { classStats ?: computeClasses().also { classStats = it } }
 
     /** Reachable instances of [className] as OBJECT rows, by retained desc. Unknown names give an empty page. */
     @Synchronized
     fun instances(className: String, offset: Int, limit: Int): TreePage {
+        checkOpen()
         require(offset >= 0 && limit >= 0) { "offset and limit must be >= 0 (were $offset, $limit)" }
         val list = instanceLists.getOrPut(className) {
             val named = BooleanArray(index.classNames.size) { index.classNames[it] == className } // one name, several loaders
@@ -133,17 +148,26 @@ class Snapshot private constructor(private val hprof: File, val index: HeapIndex
         return TreePage((from until to).map { tree.objectRow(list[it], null, RowKind.OBJECT) }, list.size)
     }
 
-    /** Refs from "root" down to [ref]; each one is among the `children` of the previous one (possibly past the first page). */
+    /**
+     * Refs from "root" down to [ref]; each one is among the `children` of the previous one (possibly past
+     * the first page). Throws [RevealTooDeepException] when the object is more than [maxDepth] levels
+     * deep in the dominator tree (checked before the path is built).
+     */
     @Synchronized
-    fun revealPath(ref: String): List<String> = tree.revealPath(tree.parse(ref))
+    fun revealPath(ref: String, maxDepth: Int = 2000): List<String> = whileOpen {
+        require(maxDepth >= 0) { "maxDepth must be >= 0, was $maxDepth" }
+        tree.revealPath(tree.parse(ref), maxDepth)
+    }
 
     /** Row offset of [childRef] within the children of [parentRef], or -1 if it is not one of them. */
     @Synchronized
-    fun indexInParent(parentRef: String, childRef: String): Int =
+    fun indexInParent(parentRef: String, childRef: String): Int = whileOpen {
         tree.indexInParent(tree.parse(parentRef), tree.parse(childRef))
+    }
 
     @Synchronized
     override fun close() {
+        closed = true
         graph?.close()
         graph = null
         graphOpenMillis = -1
@@ -165,10 +189,26 @@ class Snapshot private constructor(private val hprof: File, val index: HeapIndex
         opened
     }
 
-    private fun heapObject(d: Int): HeapObject? = graph().findObjectByIdOrNull(index.objectIds[d])
+    private fun heapObject(d: Int): HeapObject? = readingHprof { graph().findObjectByIdOrNull(index.objectIds[d]) }
+
+    /**
+     * Runs Shark reads of object records; their failures (file changed, truncated or corrupt since the
+     * index was built) become [HprofUnreadableException], like a failed graph open.
+     */
+    private inline fun <T> readingHprof(block: () -> T): T = try {
+        block()
+    } catch (e: HprofUnreadableException) {
+        throw e
+    } catch (e: IOException) {
+        throw HprofUnreadableException(hprof, "Heap dump ${hprof.path} could not be read: ${e.message}", e)
+    } catch (e: RuntimeException) {
+        throw HprofUnreadableException(hprof, "Heap dump ${hprof.path} could not be read: ${e.javaClass.simpleName}: ${e.message}", e)
+    }
 
     private val labels = object : HeapLabels {
-        override fun directLabels(parent: Int, targets: IntArray): Array<String?> {
+        override fun directLabels(parent: Int, targets: IntArray): Array<String?> = readingHprof { readDirectLabels(parent, targets) }
+
+        private fun readDirectLabels(parent: Int, targets: IntArray): Array<String?> {
             val result = arrayOfNulls<String>(targets.size)
             val wanted = HashMap<Long, Int>()
             for (k in targets.indices) wanted[index.objectIds[targets[k]]] = k
@@ -222,7 +262,7 @@ class Snapshot private constructor(private val hprof: File, val index: HeapIndex
         if (nodes.size <= 2 * PATH_END_STEPS + 1) return nodes.indices.map { step(it) }
         val omitted = nodes.size - 2 * PATH_END_STEPS
         return (0 until PATH_END_STEPS).map { step(it) } +
-            PathStep("", String.format(java.util.Locale.US, "… %,d more steps …", omitted), null) +
+            PathStep(null, String.format(java.util.Locale.US, "… %,d more steps …", omitted), null, elided = omitted) +
             (nodes.size - PATH_END_STEPS until nodes.size).map { step(it) }
     }
 
@@ -281,7 +321,9 @@ class Snapshot private constructor(private val hprof: File, val index: HeapIndex
         return found
     }
 
-    private fun fields(d: Int): List<FieldValue> = when (val o = heapObject(d)) {
+    private fun fields(d: Int): List<FieldValue> = readingHprof { readFields(d) }
+
+    private fun readFields(d: Int): List<FieldValue> = when (val o = heapObject(d)) {
         is HeapInstance -> o.readFields().map { fieldValue(it.name, it.value) }.toList()
         is HeapClass -> o.readStaticFields().map { fieldValue(it.name, it.value) }.toList()
         is HeapObjectArray -> {
@@ -388,3 +430,7 @@ class Snapshot private constructor(private val hprof: File, val index: HeapIndex
             .sortedWith(compareByDescending<ClassStat> { it.retainedBytes }.thenBy { it.className })
     }
 }
+
+/** [Snapshot.revealPath] refused an object whose dominator-tree [depth] exceeds the requested maximum. */
+class RevealTooDeepException(val depth: Int) :
+    RuntimeException("Object is $depth levels deep in the dominator tree; too deep to reveal")

@@ -55,16 +55,20 @@ class SnapshotTreeTest {
     private fun row(parent: String, ref: String) = snapshot.allChildren(parent).single { it.ref == ref }
 
     @Test
-    fun rootCategoriesInFixedOrderSumToReachableHeap() {
+    fun rootCategoriesSortedByRetainedSumToReachableHeap() {
         val rows = snapshot.children("root").rows
+        // Shared: 1000 B; Thread stacks: Thread 32 + name String 16 + chars 12 + LOCAL 24 = 84 B;
+        // JNI globals (GLOBAL 32 B) and Other roots (LOCAL2 24 + UNKNOWN 8 = 32 B) tie: enum order breaks it.
         assertEquals(
-            listOf("Static fields", "Thread stacks", "JNI globals", "Other roots", "Shared (held by several roots)"),
+            listOf("Static fields", "Shared (held by several roots)", "Thread stacks", "JNI globals", "Other roots"),
             rows.map { it.label },
         )
+        assertEquals(listOf(1000L, 84L, 32L, 32L), rows.drop(1).map { it.retainedBytes })
+        assertEquals(rows.sortedByDescending { it.retainedBytes }, rows)
         assertEquals(snapshot.summary().reachableBytes, rows.sumOf { it.retainedBytes })
         assertEquals(100.0, rows.sumOf { it.percentOfHeap }, 1e-9)
-        assertEquals(RowKind.SHARED, rows.last().kind)
-        for (r in rows.dropLast(1)) assertEquals(RowKind.CATEGORY, r.kind)
+        for (r in rows) assertEquals(if (r.label.startsWith("Shared")) RowKind.SHARED else RowKind.CATEGORY, r.kind)
+        for ((k, r) in rows.withIndex()) assertEquals(k, snapshot.indexInParent("root", r.ref))
         for (r in rows) {
             assertFalse(r.isAppCode)
             assertEquals(r.retainedBytes, snapshot.allChildren(r.ref).sumOf { it.retainedBytes }, "category = sum of children")
@@ -234,6 +238,61 @@ class SnapshotTreeTest {
         assertEquals(Tree.OTHER_COUNT, classes.single { it.className == "test.Other" }.instanceCount, "unreachable GARBAGE is not counted")
         assertTrue(classes === snapshot.classes(), "computed once")
         assertEquals(snapshot.summary().classCount, classes.size)
+    }
+
+    /** A second snapshot of the same dump with empty caches. */
+    private fun freshSnapshot(): Snapshot {
+        snapshot.index // writes tree.hprof
+        return Snapshot.open(File(dir, "tree.hprof"), listOf("test."))
+    }
+
+    @Test
+    fun childCountOfEveryRowEqualsTheTotalOfItsChildren() {
+        // On a fresh snapshot each row's childCount is computed before its own child list is cached.
+        freshSnapshot().use { s ->
+            val queue = ArrayDeque(listOf("root"))
+            var rows = 0
+            while (queue.isNotEmpty()) {
+                val parent = queue.removeFirst()
+                for (row in s.allChildren(parent)) {
+                    rows++
+                    assertEquals(s.children(row.ref, 0, 0).total, row.childCount, "childCount of ${row.ref} (${row.label})")
+                    if (row.childCount > 0) queue.addLast(row.ref)
+                }
+            }
+            assertTrue(rows > Tree.CHAIN_LENGTH, "walked the whole tree ($rows rows)")
+        }
+    }
+
+    @Test
+    fun revealPathRefusesChainsDeeperThanMaxDepth() {
+        val tail = obj(Tree.link(Tree.CHAIN_LENGTH - 1))
+        val depth = Tree.CHAIN_LENGTH + 1 // test.Chain's class object, then every link
+        val e = assertThrows<RevealTooDeepException> { snapshot.revealPath(tail) } // default maxDepth 2000
+        assertEquals(depth, e.depth)
+        assertEquals(depth, assertThrows<RevealTooDeepException> { snapshot.revealPath(tail, depth - 1) }.depth)
+        val path = snapshot.revealPath(tail, depth)
+        assertEquals(listOf("root", "cat:static", classObj("test.Chain"), obj(Tree.link(0))), path.take(4))
+        assertEquals(2 + depth, path.size)
+        assertEquals(tail, path.last())
+        // Exactly at the default limit: the link at depth 2000 is revealed, as a valid chain.
+        val atLimit = snapshot.revealPath(obj(Tree.link(1998)))
+        assertEquals(2 + 2000, atLimit.size)
+        snapshot.assertChildChain(atLimit)
+        assertThrows<IllegalArgumentException> { snapshot.revealPath("root", -1) }
+    }
+
+    @Test
+    fun aClosedSnapshotRefusesEveryQuery() {
+        val s = freshSnapshot()
+        s.children(obj(Tree.A)) // opens the lazy Shark graph
+        s.close()
+        s.close() // idempotent
+        val calls = listOf<() -> Any>(
+            { s.summary() }, { s.children("root") }, { s.details(obj(Tree.A)) }, { s.classes() },
+            { s.instances("test.Item", 0, 25) }, { s.revealPath("root") }, { s.indexInParent("root", "cat:static") },
+        )
+        for (call in calls) assertEquals("snapshot closed", assertThrows<IllegalStateException> { call() }.message)
     }
 
     @Test

@@ -65,3 +65,41 @@ On the 78 MB dump: graph route 1.04 s vs. parse 0.66 s.
 - The cache is larger than the dump (≈ 60 bytes/object: all per-object arrays are stored so a load
   needs no recomputation). Trading disk for time could drop the derivable arrays (retained, dominator
   children, BFS parents: ≈ 1.6 s to recompute here) and roughly halve it.
+
+# Snapshot query performance
+
+## How to reproduce
+
+```
+./gradlew :analysis:perfSnapshot -Phprof="$PWD/analysis/build/test-dumps/perf-inflate500.hprof"   # -Xmx6g
+```
+
+`perfSnapshot` builds the index cache if it is missing (untimed), then opens a `Snapshot` and times the first
+calls of the UI's typical queries. Heap figures are taken after `System.gc()`, relative to the heap before open.
+
+## Measurements (2026-11-14, same machine and `perf-inflate500` dump as above; 3 runs, ranges)
+
+| query | time |
+|---|---|
+| `Snapshot.open`, warm cache (cache load + O(n) precompute incl. app-heap retained sizes) | 0.62–1.07 s |
+| `children("root")` (classifies 261k roots, groups ~240k "Other roots" into 6,129 rows) | 0.10 s |
+| `children("cat:static")` | 4 ms |
+| first object-level `children()` (opens the lazy Shark `HprofHeapGraph` for labels) | 1.80–1.96 s |
+| further `children()` levels | 0.1–2.6 ms |
+| `classes()` (4,549 class names; computed once) | 0.24–0.34 s |
+| `summary()` (first call; cached) | 23–49 ms |
+| first `details()` (builds the predecessor CSR) | 0.13–0.18 s; later calls < 1 ms |
+| `details()` of the deepest object (8.19M-step path, elided to 101 steps) | 46–48 ms |
+| `revealPath()` of the deepest object (refused: `RevealTooDeepException`, depth 8,192,001) | 17 ms |
+
+| memory (live heap above baseline) | MB |
+|---|---|
+| index + tree precomputation after open | 1,144 |
+| + lazy Shark graph | ≈ 237 |
+| + predecessor CSR | ≈ 196 |
+
+Notes:
+- The Shark graph is opened on the first edge-label, field or thread-name request, not in `Snapshot.open`. That
+  request is the first expansion below a category, or the "Thread stacks" category, whose rows need thread names.
+- `revealPath` checks the dominator-tree depth (an int walk) before building any ref string; the default limit
+  is 2,000 levels.

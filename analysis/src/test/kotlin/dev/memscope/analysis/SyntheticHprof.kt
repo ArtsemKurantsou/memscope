@@ -142,6 +142,7 @@ object SyntheticHprof {
      *   LOCAL2 (test.Local)   root JAVA_FRAME of unknown thread serial 9 (-> "Other roots")
      *   GLOBAL (test.Global)  root JNI_GLOBAL
      *   UNKNOWN (test.Unknown) root UNKNOWN
+     *   test.Chain.head (static) -> LINK_0 -> LINK_1 -> ... -> LINK_2499 (test.Link.next): a deep dominator chain
      *   GARBAGE (test.Other)  unreachable
      */
     object Tree {
@@ -149,6 +150,7 @@ object SyntheticHprof {
         const val C_THREAD = 204L; const val C_APP = 205L; const val C_ITEM = 206L; const val C_OTHER = 207L
         const val C_NODE = 208L; const val C_LEAF = 209L; const val C_SHARED_A = 210L; const val C_SHARED_B = 211L
         const val C_LOCAL = 212L; const val C_GLOBAL = 213L; const val C_UNKNOWN = 214L
+        const val C_CHAIN = 215L; const val C_LINK = 216L
 
         const val ITEMS = 3000L; const val A = 3001L; const val B = 3002L; const val C = 3003L; const val D = 3004L
         const val SHARED = 3005L; const val THREAD = 3006L; const val NAME = 3007L; const val NAME_CHARS = 3008L
@@ -159,6 +161,8 @@ object SyntheticHprof {
         fun item(i: Int): Long = 4000L + i
         fun payload(i: Int): Long = 5000L + i
         fun other(i: Int): Long = 6000L + i
+        fun link(i: Int): Long = 10000L + i
+        const val CHAIN_LENGTH = 2500
 
         const val ITEM_SIZE = 16
         const val SHARED_LENGTH = 1000
@@ -185,6 +189,8 @@ object SyntheticHprof {
                 K(C_LOCAL, "test.Local", 24, emptyList()),
                 K(C_GLOBAL, "test.Global", 32, emptyList()),
                 K(C_UNKNOWN, "test.Unknown", 8, emptyList()),
+                K(C_CHAIN, "test.Chain", 8, emptyList(), listOf("head" to link(0))),
+                K(C_LINK, "test.Link", 16, listOf("next")),
             )
             // Field types: "count" is an int, everything else an object reference.
             fun type(field: String) = if (field == "count") INT else OBJ
@@ -239,6 +245,7 @@ object SyntheticHprof {
                 inst(GLOBAL, C_GLOBAL)
                 inst(UNKNOWN, C_UNKNOWN)
                 inst(GARBAGE, C_OTHER)
+                for (i in 0 until CHAIN_LENGTH) inst(link(i), C_LINK, if (i + 1 < CHAIN_LENGTH) link(i + 1).toInt() else 0)
             }
         }
     }

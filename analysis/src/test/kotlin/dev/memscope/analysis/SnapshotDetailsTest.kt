@@ -9,6 +9,7 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
 import org.junit.jupiter.api.assertThrows
 import java.io.File
+import java.io.RandomAccessFile
 import java.nio.file.Files
 
 /** Device-free details tests on [SyntheticHprof.Tree]. */
@@ -114,6 +115,37 @@ class SnapshotDetailsTest {
     fun rowsThatAreNotObjectsHaveNoDetails() {
         val group = snapshot.children(obj(Tree.ITEMS)).rows.first().ref
         for (ref in listOf("root", "cat:static", group)) assertThrows<IllegalArgumentException>(ref) { snapshot.details(ref) }
+    }
+
+    @Test
+    fun longPathsAreElidedWithAnExplicitStep() {
+        val tail = obj(Tree.link(Tree.CHAIN_LENGTH - 1))
+        val path = snapshot.details(tail).pathFromRoot
+        val ends = Snapshot.PATH_END_STEPS
+        val total = Tree.CHAIN_LENGTH + 1 // test.Chain's class object, then every link
+        assertEquals(2 * ends + 1, path.size)
+        assertEquals(PathStep(classObj("test.Chain"), "test.Chain", "head"), path.first())
+        assertEquals(PathStep(obj(Tree.link(0)), "test.Link", "next"), path[1])
+        val gap = path[ends]
+        assertEquals(null, gap.ref)
+        assertEquals(total - 2 * ends, gap.elided)
+        assertEquals("… 2,401 more steps …", gap.className)
+        assertEquals(PathStep(tail, "test.Link", null), path.last())
+        assertTrue(path.filterIndexed { k, _ -> k != ends }.all { it.ref != null && it.elided == 0 })
+    }
+
+    @Test
+    fun hprofReadFailuresAfterOpenAreUnreadableDumpErrors() {
+        val copy = File(dir, "copy.hprof")
+        snapshot.index // writes tree.hprof
+        File(dir, "tree.hprof").copyTo(copy)
+        Snapshot.open(copy, listOf("test.")).use { s ->
+            s.children(obj(Tree.A)) // opens the lazy Shark graph on the intact file
+            RandomAccessFile(copy, "rw").use { it.setLength(it.length() / 2) } // the dump is cut afterwards
+            val e = assertThrows<HprofUnreadableException> { s.details(obj(Tree.link(Tree.CHAIN_LENGTH - 1))) }
+            assertEquals(copy, e.file)
+            assertTrue(e.message!!.contains(copy.path), e.message)
+        }
     }
 
     @Test
