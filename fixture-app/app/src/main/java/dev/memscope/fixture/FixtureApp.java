@@ -13,7 +13,7 @@ public class FixtureApp extends Application {
         super.onCreate();
         // Application.onCreate also runs in the :remote process; only the main process plants data.
         if (!getPackageName().equals(Application.getProcessName())) return;
-        appBlob = new byte[10 * 1024 * 1024];
+        appBlob = Fill.bytes(10 * 1024 * 1024);
         Intent i = new Intent(this, RemoteService.class);
         try {
             startService(i);

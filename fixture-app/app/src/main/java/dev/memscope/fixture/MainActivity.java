@@ -9,7 +9,7 @@ public class MainActivity extends Activity {
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
-        activityBlob = new byte[3 * 1024 * 1024];
+        activityBlob = Fill.bytes(3 * 1024 * 1024);
         TextView tv = new TextView(this);
         tv.setText("MemScope fixture");
         setContentView(tv);

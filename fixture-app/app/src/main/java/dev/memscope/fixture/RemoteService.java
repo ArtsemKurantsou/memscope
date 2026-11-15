@@ -8,7 +8,7 @@ import android.os.IBinder;
 public class RemoteService extends Service {
     public static byte[] remoteBlob;
 
-    @Override public void onCreate() { super.onCreate(); remoteBlob = new byte[2 * 1024 * 1024]; }
+    @Override public void onCreate() { super.onCreate(); remoteBlob = Fill.bytes(2 * 1024 * 1024); }
     @Override public int onStartCommand(Intent i, int f, int id) { return START_STICKY; }
     @Override public IBinder onBind(Intent i) { return null; }
 }

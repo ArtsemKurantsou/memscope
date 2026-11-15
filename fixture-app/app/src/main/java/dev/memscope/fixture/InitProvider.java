@@ -9,7 +9,7 @@ import android.net.Uri;
 public class InitProvider extends ContentProvider {
     public static byte[] providerBlob;
 
-    @Override public boolean onCreate() { providerBlob = new byte[5 * 1024 * 1024]; return true; }
+    @Override public boolean onCreate() { providerBlob = Fill.bytes(5 * 1024 * 1024); return true; }
     @Override public Cursor query(Uri u, String[] p, String s, String[] a, String o) { return null; }
     @Override public String getType(Uri u) { return null; }
     @Override public Uri insert(Uri u, ContentValues v) { return null; }

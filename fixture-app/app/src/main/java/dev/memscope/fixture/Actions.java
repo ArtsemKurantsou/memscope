@@ -102,18 +102,18 @@ public class Actions {
             }
             case "static_cache": {
                 HashMap<Integer, byte[]> m = new HashMap<>();
-                for (int i = 0; i < 200; i++) m.put(i, new byte[100 * 1024]);
+                for (int i = 0; i < 200; i++) m.put(i, Fill.bytes(100 * 1024));
                 Caches.imageCache = m;
                 break;
             }
             case "shared": {
-                byte[] b = new byte[1024 * 1024];
+                byte[] b = Fill.bytes(1024 * 1024);
                 SharedA.ref = b;
                 SharedB.ref = b;
                 break;
             }
             case "grow":
-                Growth.list.add(new byte[1024 * 1024]);
+                Growth.list.add(Fill.bytes(1024 * 1024));
                 break;
             default:
                 if (a.startsWith("inflate:")) {
