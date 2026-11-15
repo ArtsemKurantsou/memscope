@@ -109,3 +109,45 @@ export function shareInFlight(holder, start) {
   if (!holder.loading) holder.loading = start().finally(() => { holder.loading = null; });
   return holder.loading;
 }
+
+// ---------------------------------------------------------------- snapshot diff
+
+/** "+1.5 KB", "−2.0 MB" (real minus sign), "0" for no change. */
+export function formatDeltaBytes(n) {
+  if (n == null || Number.isNaN(n)) return '–';
+  if (n === 0) return '0';
+  return (n > 0 ? '+' : '−') + formatBytes(Math.abs(n));
+}
+
+/** "+1,234", "−7", "0". */
+export function formatDeltaInt(n) {
+  if (n == null || Number.isNaN(n)) return '–';
+  if (n === 0) return '0';
+  return (n > 0 ? '+' : '−') + formatInt(Math.abs(n));
+}
+
+/**
+ * Index of a DiffResult for lookups: classes by name, roots by label. `hideSystem` picks the numbers a
+ * view shows: app-heap bytes (default) or all reachable bytes.
+ */
+export function indexDiff(diff) {
+  return {
+    ...diff,
+    classByName: new Map(diff.classes.map((c) => [c.className, c])),
+    rootByLabel: new Map(diff.roots.map((r) => [r.label, r])),
+  };
+}
+
+/** Retained-size change (after − before) of the root row labelled `label`, or null if the diff has no such label. */
+export function rootDelta(diff, label, hideSystem) {
+  const r = diff.rootByLabel.get(label);
+  if (!r) return null;
+  return hideSystem ? r.appRetainedAfter - r.appRetainedBefore : r.retainedAfter - r.retainedBefore;
+}
+
+/** The root label of a tree row, as `RootDelta.label` writes it; null for rows the diff does not cover. */
+export function rootLabelOf(row) {
+  if (row.kind === 'CATEGORY' || row.kind === 'SHARED') return row.label;
+  if (row.kind === 'CLASS_STATICS') return 'Static fields / ' + (row.className || row.label);
+  return null;
+}

@@ -36,17 +36,16 @@
     <label class="field">Snapshot
       <select id="snapshot-select" disabled><option>No snapshots yet</option></select>
     </label>
-    <span class="soon" title="Coming in a later step">
-      <label class="field">compare with
-        <select id="compare-select" disabled><option>–</option></select>
-      </label>
-    </span>
+    <div class="compare">
+      <label class="check" title="Show what changed since another snapshot of this session (in a startup recording: since the previous milestone)"><input id="compare-on" type="checkbox" disabled> Compare with</label>
+      <select id="compare-select" aria-label="Snapshot to compare with" disabled><option value="">none</option></select>
+    </div>
   </div>
 
   <div class="tabsrow">
     <div class="tabs" role="tablist">
       <button class="tab active" role="tab" aria-selected="true" id="tab-tree" type="button">Tree</button>
-      <span class="soon" title="Coming in a later step"><button class="tab" role="tab" aria-disabled="true" disabled type="button">Classes</button></span>
+      <button class="tab" role="tab" aria-selected="false" id="tab-classes" type="button">Classes</button>
       <span class="soon" title="Coming in a later step"><button class="tab" role="tab" aria-disabled="true" disabled type="button">Findings</button></span>
     </div>
     <div class="controls">
@@ -62,8 +61,10 @@
   <main class="main">
     <section class="treepane" aria-label="Heap tree">
       <div id="summary" class="summary"></div>
+      <div id="compare-line" class="compare-line" aria-live="polite" hidden></div>
       <div id="search-banner" class="search-banner" hidden></div>
       <div id="tree" class="tree"></div>
+      <div id="classes" class="classes" hidden></div>
     </section>
     <aside id="details" class="details" aria-label="Details"></aside>
   </main>

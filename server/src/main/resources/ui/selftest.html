@@ -4,6 +4,8 @@
 <script type="module">
 import { shareInFlight, formatBytes, formatPercent, splitClassName, refKind, hasObjectDetails, rowSize, rowPercent, rowVisible, sortRows } from './util.js';
 import { downsample, niceStep, timeStep, heldBands, capSamples, nearestIndex } from './timeline.js';
+import { buildRows, sortAndFilter } from "./classes.js";
+import { formatDeltaBytes, formatDeltaInt, indexDiff, rootDelta, rootLabelOf } from "./util.js";
 const out = document.getElementById('out');
 let fails = 0;
 function eq(name, got, want) {
@@ -72,6 +74,30 @@ eq('nearestIndex', [nearestIndex([smp(0, 1), smp(1000, 1), smp(2000, 1)], 1400),
   const failing = { loading: null };
   await shareInFlight(failing, () => Promise.reject(new Error("x"))).catch(() => {});
   eq("holder cleared after rejection", failing.loading, null);
+}
+{
+  // snapshot diff helpers
+  eq("delta bytes", [formatDeltaBytes(0), formatDeltaBytes(1536), formatDeltaBytes(-2048)], ["0", "+1.5 KB", "\u22122.0 KB"]);
+  eq("delta int", [formatDeltaInt(0), formatDeltaInt(1234), formatDeltaInt(-7)], ["0", "+1,234", "\u22127"]);
+  const stat = (n, c, s, r, app) => ({ className: n, instanceCount: c, shallowBytes: s, retainedBytes: r, isAppCode: false, appInstanceCount: app, appShallowBytes: app * 10, appRetainedBytes: app * 20 });
+  const delta = (n, cb, ca, app) => ({ className: n, isAppCode: false, countBefore: cb, countAfter: ca, shallowBefore: cb * 10, shallowAfter: ca * 10, retainedBefore: cb * 20, retainedAfter: ca * 20,
+    appCountBefore: app[0], appCountAfter: app[1], appShallowBefore: app[0] * 10, appShallowAfter: app[1] * 10, appRetainedBefore: app[0] * 20, appRetainedAfter: app[1] * 20 });
+  const diff = indexDiff({ classes: [delta("grown", 2, 5, [2, 5]), delta("fresh", 0, 3, [0, 3]), delta("vanished", 4, 0, [4, 0])], roots: [{ label: "Static fields", retainedBefore: 10, retainedAfter: 50, appRetainedBefore: 4, appRetainedAfter: 9 }], reachableBefore: 0, reachableAfter: 0, appHeapBefore: 0, appHeapAfter: 0 });
+  const classes = [stat("grown", 5, 50, 100, 5), stat("fresh", 3, 30, 60, 3), stat("same", 7, 70, 140, 7), stat("sysonly", 9, 90, 180, 0)];
+  const rows = buildRows(classes, diff, true);
+  eq("hide system drops classes without app instances", rows.map((r) => r.className), ["grown", "fresh", "same", "vanished"]);
+  eq("grown deltas", rows.find((r) => r.className === "grown"), { className: "grown", isApp: false, count: 5, shallow: 50, retained: 100, dCount: 3, dShallow: 30, dRetained: 60, isNew: false, gone: false });
+  eq("new class", rows.find((r) => r.className === "fresh").isNew, true);
+  eq("unchanged class has zero deltas", rows.find((r) => r.className === "same").dRetained, 0);
+  eq("vanished class", rows.find((r) => r.className === "vanished"), { className: "vanished", isApp: false, count: 0, shallow: 0, retained: 0, dCount: -4, dShallow: -40, dRetained: -80, isNew: false, gone: true });
+  eq("system numbers when shown", buildRows(classes, diff, false).find((r) => r.className === "grown").dRetained, 3 * 20);
+  eq("no diff: no deltas, sysonly kept when shown", buildRows(classes, null, false).map((r) => [r.className, r.dRetained]), [["grown", 0], ["fresh", 0], ["same", 0], ["sysonly", 0]]);
+  eq("sort by delta desc, ties by name", sortAndFilter(rows, { filter: "", key: "dRetained", dir: "desc" }).map((r) => r.className), ["fresh", "grown", "same", "vanished"]);
+  eq("filter is a case-insensitive substring", sortAndFilter(rows, { filter: "RES", key: "name", dir: "asc" }).map((r) => r.className), ["fresh"]);
+  eq("root label of a category", rootLabelOf({ kind: "CATEGORY", label: "Static fields" }), "Static fields");
+  eq("root label of class statics", rootLabelOf({ kind: "CLASS_STATICS", label: "x.Y", className: "x.Y" }), "Static fields / x.Y");
+  eq("deeper rows have no root label", rootLabelOf({ kind: "OBJECT", label: "x.Y" }), null);
+  eq("root delta app / all", [rootDelta(diff, "Static fields", true), rootDelta(diff, "Static fields", false), rootDelta(diff, "nope", true)], [5, 40, null]);
 }
 out.textContent += fails ? '\n' + fails + ' FAILED' : '\nALL PASSED';
 document.title = fails ? 'selftest FAIL' : 'selftest OK';

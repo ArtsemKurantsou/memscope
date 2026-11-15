@@ -104,6 +104,24 @@ async function defaultReopen(sid, snap) {
   if (j.state !== 'DONE') throw new ApiError(500, { error: j.errorMessage || 'Analysis failed', hint: j.errorHint || '', kind: 'JOB_FAILED' });
 }
 
+/**
+ * What grew between snapshot `baseId` (before) and `snap` (after). Both must be open on the server: a 409
+ * "not analysed: <id>" re-opens the named one and retries (the other is touched first so it stays the more
+ * recently used of the two).
+ */
+async function diff(sid, snap, baseId) {
+  const url = `/api/snapshots/${sid}/${snap}/diff` + q({ base: baseId });
+  for (let attempt = 0; ; attempt++) {
+    try { return await get(url); } catch (e) {
+      if (!e.notAnalysed || attempt >= 2) throw e;
+      const missing = /^not analysed: (\S+)/.exec(e.message)?.[1] || snap;
+      const open = missing === snap ? baseId : snap;
+      await get(`/api/snapshots/${sid}/${open}/summary`).catch(() => {});
+      await reopen(sid, missing);
+    }
+  }
+}
+
 /** Snapshot-scoped calls; a 409 "not analysed" triggers one transparent re-open and a retry. */
 export function snapshotApi(sid, snap) {
   const base = `/api/snapshots/${sid}/${snap}`;
@@ -123,5 +141,6 @@ export function snapshotApi(sid, snap) {
     indexInParent: (parent, child) => call('/indexInParent' + q({ parent, child })),
     classes: () => call('/classes'),
     instances: (cls, offset = 0, limit = 25) => call('/instances' + q({ class: cls, offset, limit })),
+    diff: (baseId) => diff(sid, snap, baseId),
   };
 }

@@ -6,7 +6,9 @@ import { createTree } from './tree.js';
 import { createDetails } from './details.js';
 import { createSearch } from './search.js';
 import { createTimeline } from './timeline.js';
-import { el, formatBytes, formatInt, prefs } from './util.js';
+import { createClasses } from './classes.js';
+import { createCompare } from './compare.js';
+import { el, formatBytes, formatInt, formatDeltaBytes, indexDiff, prefs } from './util.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -16,8 +18,16 @@ const state = {
   snap: null,      // snapshotApi of the open snapshot
   summary: null,
   classes: null,   // Promise<ClassStat[]>, fetched once per snapshot
+  classesLoaded: false, // the Classes tab shows the classes of the open snapshot
   query: null,     // class name of the active search, or null
   loadToken: 0,
+  tab: 'tree',
+  base: null,      // SnapshotMeta compared against, or null
+  diff: null,      // indexed DiffResult of (open snapshot, base), or null
+  diffKey: null,   // "snap|base" of the diff loaded or loading
+  diffLoading: false,
+  diffError: null,
+  diffToken: 0,
 };
 
 const hideBox = $('hide-system');
@@ -25,6 +35,7 @@ const myCodeBox = $('my-code');
 hideBox.checked = state.hideSystem;
 myCodeBox.checked = state.myCode;
 $('tree').classList.toggle('my-code', state.myCode);
+$('classes').classList.toggle('my-code', state.myCode);
 
 // ---------------------------------------------------------------- banner (server unreachable)
 
@@ -63,6 +74,34 @@ function renderSummary() {
   box.replaceChildren(...bits);
 }
 
+// ---------------------------------------------------------------- compare line
+
+/** "App heap: 12.3 MB → 27.9 MB (+15.6 MB) since <base>", or the loading / failure state of the diff. */
+function renderCompareLine() {
+  const box = $('compare-line');
+  const base = state.base;
+  box.hidden = !base;
+  box.className = 'compare-line';
+  if (!base) return;
+  const name = base.label || base.id;
+  if (state.diffLoading) {
+    box.replaceChildren(el('span', { class: 'spinner' }), `Comparing with ${name}…`);
+  } else if (state.diffError) {
+    const e = state.diffError;
+    box.classList.add('error');
+    box.replaceChildren(el('strong', null, `Could not compare with ${name}: ${e.message}`), e.hint ? el('span', null, e.hint) : null,
+      el('button', { class: 'btn small', onclick: () => fetchDiff(true) }, 'Retry'));
+  } else if (state.diff) {
+    const d = state.diff;
+    const [label, before, after] = state.hideSystem ? ['App heap', d.appHeapBefore, d.appHeapAfter] : ['Heap incl. system', d.reachableBefore, d.reachableAfter];
+    const change = after - before;
+    box.replaceChildren(
+      el('span', null, `${label}: `, el('b', null, formatBytes(before)), ' → ', el('b', null, formatBytes(after)), ' (',
+        el('b', { class: change > 0 ? 'up' : change < 0 ? 'down' : '' }, formatDeltaBytes(change)), ')'),
+      el('span', { class: 'muted' }, `since ${name}`));
+  }
+}
+
 // ---------------------------------------------------------------- modules
 
 const details = createDetails({
@@ -77,6 +116,7 @@ const tree = createTree({
   getOptions: () => ({
     hideSystem: state.hideSystem,
     myCode: state.myCode,
+    get diff() { return state.diff; },
     forceShowSystem: () => { setHideSystem(false); },
   }),
   getSummary: () => state.summary,
@@ -88,34 +128,127 @@ const tree = createTree({
   },
 });
 
+/** The class table of the open snapshot, fetched once; a rejected promise is never kept (the next call asks again). */
+function classList() {
+  if (!state.classes) {
+    const p = state.snap.classes();
+    state.classes = p;
+    p.catch(() => { if (state.classes === p) state.classes = null; });
+  }
+  return state.classes;
+}
+
 const search = createSearch({
   input: $('search'),
   list: $('search-list'),
-  getClasses: () => {
-    // Never keep a rejected promise: the next keystroke or Retry asks again.
-    if (!state.classes) {
-      const p = state.snap.classes();
-      state.classes = p;
-      p.catch(() => { if (state.classes === p) state.classes = null; });
-    }
-    return state.classes;
-  },
+  getClasses: classList,
   onPick: (name) => runSearch(name),
 });
+
+const classesView = createClasses({
+  container: $('classes'),
+  getOptions: () => ({ hideSystem: state.hideSystem }),
+  onPickClass: (name) => { setTab('tree'); $('search').value = name; runSearch(name); },
+});
+
+const compare = createCompare({ box: $('compare-on'), select: $('compare-select'), onChange: (meta) => applyBase(meta) });
 
 function setHideSystem(on) {
   state.hideSystem = on;
   hideBox.checked = on;
   prefs.set('hideSystem', on);
   renderSummary();
+  renderCompareLine();
   tree.refresh();
+  if (state.classesLoaded) classesView.refresh();
 }
 hideBox.addEventListener('change', () => setHideSystem(hideBox.checked));
 myCodeBox.addEventListener('change', () => {
   state.myCode = myCodeBox.checked;
   prefs.set('myCode', state.myCode);
   $('tree').classList.toggle('my-code', state.myCode);
+  $('classes').classList.toggle('my-code', state.myCode);
 });
+
+// ---------------------------------------------------------------- tabs
+
+function setTab(name) {
+  state.tab = name;
+  const classes = name === 'classes';
+  $('tab-tree').classList.toggle('active', !classes);
+  $('tab-tree').setAttribute('aria-selected', String(!classes));
+  $('tab-classes').classList.toggle('active', classes);
+  $('tab-classes').setAttribute('aria-selected', String(classes));
+  $('tree').hidden = classes;
+  $('classes').hidden = !classes;
+  $('search-banner').hidden = classes || !state.query;
+  document.querySelector('.search').hidden = classes;
+  document.querySelector('.main').classList.toggle('classes-mode', classes);
+  if (classes) loadClassesView();
+}
+$('tab-tree').addEventListener('click', () => setTab('tree'));
+$('tab-classes').addEventListener('click', () => setTab('classes'));
+
+/** Fills the Classes tab with the open snapshot's classes (once per snapshot). */
+async function loadClassesView() {
+  if (!state.snap || state.classesLoaded) return;
+  const snap = state.snap;
+  classesView.setMessage(el('div', { class: 'empty' }, el('span', { class: 'spinner' }), ' Loading classes…'));
+  try {
+    const list = await classList();
+    if (snap !== state.snap) return;
+    state.classesLoaded = true;
+    classesView.setClasses(list);
+    classesView.setDiff(state.diff);
+  } catch (e) {
+    if (snap !== state.snap) return;
+    classesView.setMessage(errorPanel(e, loadClassesView));
+  }
+}
+
+// ---------------------------------------------------------------- compare
+
+/** The compare selector chose another base snapshot (or none). */
+function applyBase(meta) {
+  state.base = meta;
+  state.diff = null;
+  state.diffError = null;
+  state.diffKey = null;
+  state.diffToken++;
+  state.diffLoading = false;
+  renderCompareLine();
+  applyDiff();
+  if (meta) fetchDiff();
+}
+
+/** Pushes the diff (or its absence) into the tree's delta column and the Classes table. */
+function applyDiff() {
+  tree.refresh();
+  if (state.classesLoaded) classesView.setDiff(state.diff);
+}
+
+/** Loads the diff of the open snapshot against the base; one request per (snapshot, base) pair unless `force`. */
+async function fetchDiff(force = false) {
+  if (!state.base || !state.snap) return;
+  const key = `${state.snap.snap}|${state.base.id}`;
+  if (!force && state.diffKey === key && (state.diffLoading || state.diff)) return;
+  state.diffKey = key;
+  const my = ++state.diffToken;
+  state.diffLoading = true;
+  state.diffError = null;
+  state.diff = null;
+  renderCompareLine();
+  let result = null;
+  let error = null;
+  try { result = indexDiff(await state.snap.diff(state.base.id)); } catch (e) { error = e; }
+  if (my !== state.diffToken) return;
+  state.diffLoading = false;
+  state.diff = result;
+  state.diffError = error;
+  if (error) state.diffKey = null;
+  renderCompareLine();
+  applyDiff();
+}
 
 // ---------------------------------------------------------------- snapshot loading
 
@@ -146,12 +279,22 @@ async function openSnapshot(sid, meta) {
   state.snap = api.snapshotApi(sid, meta.id);
   state.summary = null;
   state.classes = null;
+  state.classesLoaded = false;
+  state.diff = null;
+  state.diffKey = null;
+  state.diffLoading = false;
+  state.diffError = null;
+  state.diffToken++;
   state.query = null;
   $('search').value = '';
   $('search').disabled = false;
   $('search-banner').hidden = true;
   details.clear();
   renderSummary();
+  if (state.tab === 'classes') loadClassesView();
+  compare.setCurrent(meta.id); // an automatic base moves to the previous milestone and starts its diff
+  fetchDiff(); // a kept base needs the diff of the new snapshot (no-op if setCurrent just started it)
+  renderCompareLine();
   tree.clear(el('div', { class: 'empty' }, el('span', { class: 'spinner' }), ` Loading snapshot ${meta.label || meta.id}…`));
   try {
     state.summary = await state.snap.summary();
@@ -170,7 +313,7 @@ async function runSearch(name) {
   const my = ++state.loadToken;
   state.query = name;
   const banner = $('search-banner');
-  banner.hidden = false;
+  banner.hidden = state.tab === 'classes';
   banner.replaceChildren(el('span', null, 'Instances of ', el('b', { class: 'mono' }, name), ' '), el('span', { class: 'muted', id: 'search-count' }, 'searching…'),
     el('button', { class: 'btn small', onclick: clearSearch }, 'Clear search'));
   try {
@@ -226,7 +369,7 @@ const timeline = createTimeline({ container: $('timeline'), onSelectSnapshot: (i
 
 const capture = createCapture({
   onSnapshot: openSnapshot,
-  onSession: (s) => timeline.setSession(s),
+  onSession: (s) => { timeline.setSession(s); compare.setSession(s); },
   onNoSnapshot: () => {},
   onEmptyState,
 });

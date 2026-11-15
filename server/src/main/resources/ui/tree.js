@@ -3,6 +3,7 @@
 // loaded data, expanding inserts only the new rows after the parent row.
 import {
   el, formatBytes, formatPercent, formatInt, splitClassName, rowSize, rowPercent, rowVisible, sortRows, debounce, shareInFlight,
+  formatDeltaBytes, rootDelta, rootLabelOf,
 } from './util.js';
 
 const PAGE = 25;
@@ -36,7 +37,8 @@ export function createTree({ container, getOptions, getSummary, onSelect, onStat
     el('div', { class: 'c-ret' }, 'Retained'),
     el('div', { class: 'c-pct' }, '%'),
     el('div', { class: 'c-sh' }, 'Shallow'),
-    el('div', { class: 'c-nat', title: 'Estimated native memory attributed to these objects (e.g. bitmap pixel buffers)' }, 'Native (est.)'));
+    el('div', { class: 'c-nat', title: 'Estimated native memory attributed to these objects (e.g. bitmap pixel buffers)' }, 'Native (est.)'),
+    el('div', { class: 'c-dl', title: 'Change of the retained size since the compared snapshot' }, 'Δ retained'));
   container.replaceChildren(head, body);
 
   let api = null;
@@ -110,6 +112,15 @@ export function createTree({ container, getOptions, getSummary, onSelect, onStat
     return c;
   }
 
+  /** Change since the base snapshot: roots and class statics are matched by label; deeper rows have no identity across dumps. */
+  function deltaCell(r) {
+    const { diff, hideSystem } = getOptions();
+    const label = rootLabelOf(r);
+    if (!label) return el('div', { class: 'c-dl none', title: 'Object identity is not tracked across dumps' }, '–');
+    const d = rootDelta(diff, label, hideSystem) ?? 0; // a row the diff lacks has no bytes in either snapshot
+    return el('div', { class: `c-dl ${d > 0 ? 'up' : d < 0 ? 'down' : 'zero'}`, title: `${label}: ${formatDeltaBytes(d)} retained since the compared snapshot` }, formatDeltaBytes(d));
+  }
+
   function fillRow(node) {
     const r = node.row;
     const { hideSystem } = getOptions();
@@ -130,6 +141,7 @@ export function createTree({ container, getOptions, getSummary, onSelect, onStat
       cell('c-pct num', formatPercent(pct)),
       cell('c-sh num', AGGREGATE.has(r.kind) ? '' : dash(r.shallowBytes)),
       cell('c-nat num', dash(r.nativeEstBytes)),
+      ...(getOptions().diff ? [deltaCell(r)] : []),
     );
   }
 
@@ -376,6 +388,7 @@ export function createTree({ container, getOptions, getSummary, onSelect, onStat
       body.replaceChildren(el('div', { class: 'row status' }, el('div', { class: 'c-name muted' }, onEmpty || 'Nothing to show.')));
       return;
     }
+    container.classList.toggle('diff', !!getOptions().diff);
     rerenderKids(root);
     const first = body.querySelector('.row[role="treeitem"]');
     if (first && first._node) setCurrent(first._node);
@@ -384,6 +397,7 @@ export function createTree({ container, getOptions, getSummary, onSelect, onStat
   /** Re-render after a toggle (hide system / my code) from loaded data; no refetching. */
   function refresh() {
     if (!root || !root.kids) return;
+    container.classList.toggle('diff', !!getOptions().diff);
     const cur = current;
     rerenderKids(root);
     if (cur && cur.el && cur.el.isConnected) setCurrent(cur);
