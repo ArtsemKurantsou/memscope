@@ -14,21 +14,30 @@ object TestDumps {
 
     /** The standard fixture dump, captured if missing; skips the calling test if that is impossible. */
     @Synchronized
-    fun fixtureBasic(): File {
-        val name = "fixture-basic" // what the script captures when run without arguments
-        val file = File(dumpDir, "$name.hprof")
-        if (file.isFile && file.length() > 0) return file
+    fun fixtureBasic(): File = capture(listOf("fixture-basic"), emptyList()).single()
+
+    /**
+     * Two dumps of one fixture process: `before` straight after a plain launch, `after` once `grow` x5
+     * and `static_cache` have run (Growth.list +5 MB, StaticCache +20 MB). Captured if missing; skips the
+     * calling test if that is impossible.
+     */
+    @Synchronized
+    fun fixtureBeforeAfter(): Pair<File, File> = capture(listOf("fixture-before", "fixture-after"), listOf("diff")).let { it[0] to it[1] }
+
+    private fun capture(names: List<String>, scriptArgs: List<String>): List<File> {
+        val files = names.map { File(dumpDir, "$it.hprof") }
+        if (files.all { it.isFile && it.length() > 0 }) return files
         val script = File(moduleDir, "capture-test-dumps.sh")
-        val log = File(dumpDir, "$name.capture.log").also { it.parentFile.mkdirs() }
-        val process = ProcessBuilder(listOf(script.absolutePath))
+        val log = File(dumpDir, "${names.first()}.capture.log").also { it.parentFile.mkdirs() }
+        val process = ProcessBuilder(listOf(script.absolutePath) + scriptArgs)
             .redirectErrorStream(true).redirectOutput(log).start()
         val finished = process.waitFor(5, TimeUnit.MINUTES)
         if (!finished) process.destroyForcibly()
-        val ok = finished && process.exitValue() == 0 && file.isFile
+        val ok = finished && process.exitValue() == 0 && files.all { it.isFile }
         assumeTrue(ok) {
-            "Skipped: $name.hprof is not in ${dumpDir.path} and could not be captured " +
+            "Skipped: ${names.joinToString()} not in ${dumpDir.path} and could not be captured " +
                 "(needs emulator-5554 with dev.memscope.fixture installed). Capture output: ${log.readText().trim()}"
         }
-        return file
+        return files
     }
 }
