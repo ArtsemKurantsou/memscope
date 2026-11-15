@@ -59,6 +59,8 @@ export const createSession = (serial, packageName) => post('/api/sessions', { se
 export const dump = (sessionId, body) => post(`/api/sessions/${sessionId}/dump`, body || {});
 /** Starts a startup recording; answers { session, jobId }. */
 export const createStartupSession = (serial, packageName, startup) => post('/api/sessions', { serial, packageName, mode: 'STARTUP', startup });
+/** Memory samples newer than sinceMs (all when null) plus every snapshot marker of a session. */
+export const timeline = (id, sinceMs) => get(`/api/sessions/${id}/timeline` + (sinceMs == null ? '' : `?sinceMs=${sinceMs}`));
 export const milestoneDefaults = () => get('/api/milestones/defaults');
 export const launcher = (serial, pkg) => get(`/api/devices/${encodeURIComponent(serial)}/apps/${encodeURIComponent(pkg)}/launcher`);
 export const job = (id) => get(`/api/jobs/${id}`);

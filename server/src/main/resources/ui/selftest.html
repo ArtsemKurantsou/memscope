@@ -3,6 +3,7 @@
 <body style="font:14px monospace"><pre id="out"></pre>
 <script type="module">
 import { shareInFlight, formatBytes, formatPercent, splitClassName, refKind, hasObjectDetails, rowSize, rowPercent, rowVisible, sortRows } from './util.js';
+import { downsample, niceStep, timeStep, pausedBands, nearestIndex } from './timeline.js';
 const out = document.getElementById('out');
 let fails = 0;
 function eq(name, got, want) {
@@ -36,6 +37,22 @@ eq('percent hide', rowPercent(r(100, 40), true, { appHeapBytes: 80 }), 50);
 eq('percent show', rowPercent(r(100, 40), false, { appHeapBytes: 80 }), 10);
 eq('visible', [rowVisible(r(5, 0), true), rowVisible(r(5, 0), false)], [false, true]);
 eq('sort', sortRows([r(9, 1), r(5, 5), r(7, 5)], true).map((x) => x.retainedBytes), [5, 7, 9]);
+const smp = (t, total, paused = false) => ({ tMs: t, totalPssKb: total, paused });
+eq('downsample keeps small input', downsample([smp(1, 1), smp(2, 2)], 600).length, 2);
+{
+  const big = Array.from({ length: 3600 }, (_, i) => smp(i * 1000, i === 1234 ? 99999 : i));
+  const d = downsample(big, 600);
+  eq('downsample caps points', d.length, 600);
+  eq('downsample keeps the peak', d.some((s) => s.totalPssKb === 99999), true);
+  eq('downsample keeps order', d.every((s, i) => i === 0 || s.tMs > d[i - 1].tMs), true);
+}
+eq('niceStep 100 MB', niceStep(100), 50);
+eq('niceStep 62 MB', niceStep(62), 25);
+eq('niceStep 0', niceStep(0), 1);
+eq('timeStep 30 s', timeStep(30), 5);
+eq('timeStep 1 h', timeStep(3600), 600);
+eq('pausedBands', pausedBands([smp(0, 1), smp(1000, 1, true), smp(2000, 1, true), smp(3000, 1), smp(4000, 1, true)]), [[1000, 3000], [4000, 5000]]);
+eq('nearestIndex', [nearestIndex([smp(0, 1), smp(1000, 1), smp(2000, 1)], 1400), nearestIndex([smp(0, 1), smp(1000, 1)], 5000), nearestIndex([smp(0, 1), smp(1000, 1)], 0)], [1, 1, 0]);
 {
   let starts = 0;
   const holder = { loading: null };

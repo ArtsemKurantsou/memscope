@@ -5,6 +5,7 @@ import { createCapture } from './capture.js';
 import { createTree } from './tree.js';
 import { createDetails } from './details.js';
 import { createSearch } from './search.js';
+import { createTimeline } from './timeline.js';
 import { el, formatBytes, formatInt, prefs } from './util.js';
 
 const $ = (id) => document.getElementById(id);
@@ -140,6 +141,7 @@ async function loadRoot() {
 }
 
 async function openSnapshot(sid, meta) {
+  timeline.setSelected(meta.id);
   const my = ++state.loadToken;
   state.snap = api.snapshotApi(sid, meta.id);
   state.summary = null;
@@ -220,8 +222,11 @@ function onEmptyState(kind, devices) {
   }
 }
 
+const timeline = createTimeline({ container: $('timeline'), onSelectSnapshot: (id) => capture.selectSnapshot(id) });
+
 const capture = createCapture({
   onSnapshot: openSnapshot,
+  onSession: (s) => timeline.setSession(s),
   onNoSnapshot: () => {},
   onEmptyState,
 });

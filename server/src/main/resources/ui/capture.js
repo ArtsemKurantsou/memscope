@@ -5,7 +5,7 @@ import { askStartupConfig } from './startup.js';
 
 const $ = (id) => document.getElementById(id);
 
-export function createCapture({ onSnapshot, onNoSnapshot, onEmptyState }) {
+export function createCapture({ onSnapshot, onNoSnapshot, onEmptyState, onSession = () => {} }) {
   const deviceSel = $('device-select');
   const appSel = $('app-select');
   const dumpBtn = $('dump-btn');
@@ -114,6 +114,7 @@ export function createCapture({ onSnapshot, onNoSnapshot, onEmptyState }) {
   // ------------------------------------------------------------ snapshots
 
   function renderSnapshots(selectId) {
+    onSession(session);
     const snaps = session ? session.snapshots : [];
     if (!snaps.length) { setSelect(snapSel, [], 'No snapshots yet'); return; }
     setSelect(snapSel, snaps.map((s, i) => ({
@@ -380,5 +381,13 @@ export function createCapture({ onSnapshot, onNoSnapshot, onEmptyState }) {
   }
 
   updateButtons();
-  return { init, refreshDevices: () => loadDevices() };
+  /** Marker click on the timeline: select that snapshot in the selector and open it. */
+  async function selectSnapshot(id) {
+    if (!session || busy || !session.snapshots.some((s) => s.id === id)) return;
+    snapSel.value = id;
+    const meta = selectedSnapshotMeta();
+    if (meta) await onSnapshot(session.id, meta);
+  }
+
+  return { init, refreshDevices: () => loadDevices(), selectSnapshot };
 }
