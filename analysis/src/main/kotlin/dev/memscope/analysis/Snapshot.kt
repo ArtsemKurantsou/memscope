@@ -173,6 +173,28 @@ class Snapshot private constructor(private val hprof: File, val index: HeapIndex
         graphOpenMillis = -1
     }
 
+    // ---------------------------------------------------------------- findings support
+
+    /** The hprof this snapshot was indexed from. */
+    val hprofFile: File get() = hprof
+
+    internal val appRetained: LongArray get() = tree.appRetained
+
+    internal fun displayName(d: Int): String = tree.displayName(d)
+
+    internal fun isAppCode(className: String): Boolean = tree.isAppCode(className)
+
+    /**
+     * Runs [block] on the lazily opened Shark graph, serialised with every other query. Keep blocks short:
+     * the snapshot is locked meanwhile. Failures reading the hprof become [HprofUnreadableException].
+     */
+    @Synchronized
+    fun <T> withGraph(block: (shark.HeapGraph) -> T): T = whileOpen { readingHprof { block(graph()) } }
+
+    /** Field or element name of the edge from [parent] to each of [targets] (null if not found). */
+    @Synchronized
+    internal fun edgeLabels(parent: Int, targets: IntArray): Array<String?> = whileOpen { labels.directLabels(parent, targets) }
+
     // ---------------------------------------------------------------- hprof access
 
     private fun graph(): CloseableHeapGraph = graph ?: run {
