@@ -8,3 +8,5 @@ spike/**/build/
 .DS_Store
 .idea/
 .kotlin/
+spike/*
+!spike/FINDINGS.md

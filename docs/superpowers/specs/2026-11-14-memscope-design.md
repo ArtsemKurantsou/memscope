@@ -146,13 +146,18 @@ Shark reads Android hprof directly, so no `hprof-conv` step.
    tool crash on next start, so the app is never left stuck waiting for a
    debugger.
 
-**Multiple processes (my call).** `set-debug-app -w` makes every process
-of the package wait for a debugger. The session therefore watches for all
-new JDWP pids of the package for its whole duration. The profiled process
-is the main one by default (process name == package name), selectable in
-the UI. Every other process gets a debugger attached and is resumed
-immediately with no breakpoints, then detached, so nothing hangs. The data
-model keys snapshots by process name.
+**Multiple processes (corrected by the spike).** `set-debug-app -w <name>`
+makes only the process whose name equals the argument wait, and only for
+one launch. The profiled process is the main one by default (process name
+== package name), selectable in the UI; its name is what is passed to
+`set-debug-app`. Other processes of the package start normally and need no
+handling. The data model keys snapshots by process name.
+
+**Spike results** are in `spike/FINDINGS.md` and take precedence over this
+document on device, JDI and Shark facts (verified hook methods, gzip pull,
+settle delay, meminfo behaviour while suspended, native sizes, and the
+~35 MB zygote/boot-image baseline in every dump, which the tree lets the
+user hide).
 
 **One session at a time (my call).** One device, one app, one active
 session. If another debugger (e.g. Android Studio) already holds the
