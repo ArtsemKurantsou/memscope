@@ -1,0 +1,76 @@
+package dev.memscope.capture
+
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNotEquals
+import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
+import org.junit.jupiter.api.io.TempDir
+import java.nio.file.Files
+import java.nio.file.Path
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+
+class SessionStoreTest {
+    @TempDir lateinit var tmp: Path
+
+    private fun snap(id: String) = SnapshotMeta(id, "label $id", null, "dev.app", 1L, "$id.hprof", 10, SnapshotMeta.Status.OK)
+
+    @Test
+    fun `session round-trips through disk`() {
+        val store = SessionStore(tmp)
+        val s = store.create("emulator-5554", "dev.app", SessionMeta.Mode.ATTACH)
+        assertTrue(Regex("\\d{8}-\\d{6}-[a-z0-9]{4}").matches(s.id), s.id)
+        store.addSnapshot(s.id, snap("s1"))
+        val reread = SessionStore(tmp).get(s.id)!!   // fresh store instance: really read from disk
+        assertEquals(s.id, reread.id)
+        assertEquals("emulator-5554", reread.serial)
+        assertEquals(SessionMeta.State.ACTIVE, reread.state)
+        assertEquals(listOf("s1"), reread.snapshots.map { it.id })
+        assertEquals(tmp.resolve("sessions/${s.id}/s1.hprof"), store.snapshotFile(s.id, "s1"))
+        assertEquals(listOf(s.id), SessionStore(tmp).list().map { it.id })
+    }
+
+    @Test
+    fun `get of unknown or hostile id returns null or refuses`() {
+        val store = SessionStore(tmp)
+        assertNull(store.get("nope"))
+        assertThrows<IllegalArgumentException> { store.dir("../x") }
+    }
+
+    @Test
+    fun `update changes state and leaves no temp files`() {
+        val store = SessionStore(tmp)
+        val s = store.create("e", "dev.app", SessionMeta.Mode.STARTUP)
+        val ended = store.update(s.id) { it.copy(state = SessionMeta.State.ENDED, note = "app exited") }
+        assertEquals(SessionMeta.State.ENDED, store.get(s.id)!!.state)
+        assertEquals("app exited", ended.note)
+        assertEquals(listOf("session.json"), Files.list(store.dir(s.id)).use { st -> st.map { it.fileName.toString() }.toList() })
+    }
+
+    @Test
+    fun `concurrent addSnapshot calls lose nothing and ids are unique`() {
+        val store = SessionStore(tmp)
+        val s = store.create("e", "dev.app", SessionMeta.Mode.ATTACH)
+        val pool = Executors.newFixedThreadPool(8)
+        val ids = (1..40).map { pool.submit<String> { store.nextSnapshotId(s.id).also { id -> store.addSnapshot(s.id, snap(id)) } } }.map { it.get() }
+        pool.shutdown(); pool.awaitTermination(10, TimeUnit.SECONDS)
+        assertEquals(40, ids.toSet().size)
+        assertEquals(40, store.get(s.id)!!.snapshots.size)
+    }
+
+    @Test
+    fun `two sessions created in the same second get different ids`() {
+        val store = SessionStore(tmp)
+        val ids = (1..20).map { store.create("e", "p", SessionMeta.Mode.ATTACH).id }
+        assertEquals(20, ids.toSet().size)
+        assertNotEquals(ids[0], ids[1])
+    }
+
+    @Test
+    fun `memscopeHome prefers env then falls back to dot memscope`() {
+        assertEquals(Path.of("/x/y"), memscopeHome(mapOf("MEMSCOPE_HOME" to "/x/y"), "/home/u"))
+        assertEquals(Path.of("/home/u/.memscope"), memscopeHome(emptyMap(), "/home/u"))
+    }
+}
