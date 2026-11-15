@@ -60,7 +60,7 @@ class ServerDeps(
     private var polledSession: String? = null
 
     /** Polls the memory of [processName] (default: the package) for [sessionId]; the one poller moves to this session. Never throws. */
-    fun startPolling(sessionId: String, processName: String? = null, held: Boolean = false) {
+    fun startPolling(sessionId: String, processName: String? = null, held: Boolean = false, recording: Boolean = false) {
         if (!memoryPolling) return
         try {
             val (p, name) = synchronized(pollerLock) {
@@ -69,7 +69,7 @@ class ServerDeps(
                 polledSession = sessionId
                 p to (processName ?: session.packageName)
             }
-            p.start(sessionId, name) // never waits for the previous run: the lock is not held and nothing blocks
+            p.start(sessionId, name, recording = recording) // never waits for the previous run: the lock is not held and nothing blocks
             if (held) p.setPaused(true)
         } catch (e: Exception) {
             ServerLog.error("Could not start memory polling for session $sessionId: ${e.message}")
@@ -92,8 +92,10 @@ class ServerDeps(
 
     /** Feeds a startup recording's pid and held-at-milestone state to the poller of [sessionId]. */
     fun pollerListener(sessionId: String, processName: String?) = object : StartupListener {
-        override fun onPid(pid: Int) = startPolling(sessionId, processName, held = true) // frozen in waitForDebugger until the debugger attaches
+        // frozen in waitForDebugger until the debugger attaches; no dumpsys into the app until the recording is done
+        override fun onPid(pid: Int) = startPolling(sessionId, processName, held = true, recording = true)
         override fun onHeld(held: Boolean) { pollerOf(sessionId)?.setPaused(held) }
+        override fun onRecordingDone() { pollerOf(sessionId)?.setRecording(false) }
     }
 
     /**

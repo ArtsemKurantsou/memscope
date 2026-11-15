@@ -65,6 +65,9 @@ class Job(
     /** Marks step [name] FAILED with [detail] without running it (e.g. a milestone that was never reached). */
     fun failStep(name: String, detail: String) = setStep(name, StepState.FAILED, detail)
 
+    /** Sets the detail text of step [name] without changing its state (e.g. what a pending step is waiting for). */
+    fun note(name: String, detail: String) = synchronized(lock) { replace(name) { it.copy(detail = detail) } }
+
     /** Marks the job as finished successfully. */
     fun complete(resultRef: String?) = synchronized(lock) {
         if (state != State.RUNNING) return

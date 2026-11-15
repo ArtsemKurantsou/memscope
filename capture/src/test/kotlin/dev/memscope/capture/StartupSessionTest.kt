@@ -92,6 +92,22 @@ class StartupSessionTest {
     }
 
     @Test
+    fun `the listener hears that the recording is done after detach, also when it failed`() {
+        for (fail in listOf(false, true)) {
+            vm.script.clear(); vm.defaultScript()
+            vm.nextEventsError = if (fail) IllegalStateException("boom") else null
+            session = store.create(device.serial, device.pkg, SessionMeta.Mode.STARTUP)
+            var done = 0
+            var disposedFirst = false
+            val listener = object : StartupListener { override fun onRecordingDone() { done++; disposedFirst = vm.disposed } }
+            val config = StartupConfig()
+            runCatching { StartupSession(device.adb, store, guard, { vm }, fast, listener).run(session.id, config, newJob(config)) }
+            assertEquals(1, done, "fail=$fail")
+            assertTrue(disposedFirst, "only after the debugger is gone may the poller call into the app")
+        }
+    }
+
+    @Test
     fun `a failing listener never breaks the recording`() {
         vm.defaultScript()
         val boom = object : StartupListener {
@@ -219,6 +235,103 @@ class StartupSessionTest {
             // launched but never past waitForDebugger: the app would stay frozen, pid known or not
             assertEquals(2, device.count("shell am force-stop dev.app"), "$where: ${device.allCommands()}")
         }
+    }
+
+    /** Regression for the fix-round-2 stall: a JDWP reply that never comes must not hang the recording. */
+    @ParameterizedTest
+    @ValueSource(strings = ["events", "armCallerReturn:first_activity_resumed"])
+    fun `a debugger call that never gets a reply fails within the bound, stops the wedged app and cleans up`(where: String) {
+        vm.defaultScript()
+        vm.hangOn = where
+        val job = newJob()
+        val t0 = System.nanoTime()
+        val e = runFailing(job = job, s = startup(fast.copy(jdwpReplyMs = 700))) as DeviceException
+        assertTrue((System.nanoTime() - t0) / 1_000_000 < 5_000, "bounded, not the 120 s milestone timeout")
+        assertEquals(DeviceException.Kind.TIMEOUT, e.kind)
+        assertTrue("stopped answering the debugger" in e.message!!, e.message)
+        assertTrue("waiting for: First Activity resumed" in e.message!!, e.message)
+        assertTrue("deadlock" in e.hint, e.hint)
+        assertEquals(4, stored().snapshots.size, "earlier snapshots are kept")
+        assertEquals(2, device.count("shell am force-stop dev.app"), "a wedged app is stopped even though it was released: ${device.allCommands()}")
+        assertTrue("no longer answered the debugger" in step(job, StartupSession.DETACH).detail!!)
+        assertCleanDevice()
+    }
+
+    @Test
+    fun `a wedged VM that sends no event is found by the liveness ping, not after the full milestone timeout`() {
+        vm.defaultScript()
+        vm.script.removeIf { set -> set.any { it is DebugEvent.EntryHit && it.key == "first_activity_resumed" || it is DebugEvent.Reached && it.key == "first_activity_resumed" } }
+        vm.hangOn = "ping"
+        val job = newJob()
+        val t0 = System.nanoTime()
+        val e = runFailing(StartupConfig(milestoneTimeoutSec = 60), job, startup(fast.copy(jdwpReplyMs = 500, pingAfterMs = 1_000))) as DeviceException
+        assertTrue((System.nanoTime() - t0) / 1_000_000 < 5_000, "found by the ping")
+        assertTrue("checking the app still answers" in e.message!!, e.message)
+        assertEquals(2, device.count("shell am force-stop dev.app"), "the wedged app is stopped")
+        assertCleanDevice()
+    }
+
+    @Test
+    fun `a healthy VM answers the ping and the milestone timeout still applies`() {
+        vm.defaultScript()
+        vm.script.removeIf { set -> set.any { it is DebugEvent.EntryHit && it.key == "first_activity_resumed" || it is DebugEvent.Reached && it.key == "first_activity_resumed" } }
+        val job = newJob()
+        val e = runFailing(StartupConfig(milestoneTimeoutSec = 2), job, startup(fast.copy(pingAfterMs = 500))) as DeviceException
+        assertTrue(vm.calls.count { it == "ping" } >= 2, vm.calls.toString())
+        assertTrue("not reached within 2 s" in e.message!!, e.message)
+        assertEquals(1, device.count("shell am force-stop dev.app"), "a healthy released app keeps running")
+    }
+
+    @Test
+    fun `an app that was not waiting for the debugger fails only the process start milestone, with the reason`() {
+        vm.defaultScript()
+        vm.script.removeIf { set -> set.any { it is DebugEvent.WaitReturned } }
+        vm.waitArmError = "the app was not waiting for the debugger when it attached (it was already at handleBindApplication @870); the process start was missed"
+        val job = runOk()
+        assertEquals(Job.State.DONE, job.snapshot().state)
+        val s = step(job, "Dump: Process start")
+        assertEquals(Job.StepState.FAILED, s.state)
+        assertTrue("not waiting for the debugger" in s.detail!!, s.detail)
+        assertEquals(4, stored().snapshots.size)
+        assertFalse(stored().snapshots.any { it.milestoneId == "process_start" }, "no mislabelled snapshot")
+    }
+
+    @Test
+    fun `cancel reaches a recording whose debugger call never returns`() {
+        vm.defaultScript()
+        vm.hangOn = "events"
+        val job = newJob()
+        val t = thread { runCatching { startup(fast.copy(jdwpReplyMs = 60_000)).run(session.id, StartupConfig(), job) } }
+        waitUntil { stored().snapshots.size == 4 }
+        Thread.sleep(300)
+        val t0 = System.nanoTime()
+        job.cancel.cancel()
+        t.join(5_000)
+        assertFalse(t.isAlive)
+        assertTrue((System.nanoTime() - t0) / 1_000_000 < 2_000)
+        assertEquals(Job.State.CANCELLED, job.snapshot().state)
+        assertCleanDevice()
+    }
+
+    @Test
+    fun `a failed force-stop of a frozen app keeps the marker for recoverStale and says so in the hint`() {
+        vm.nextEventsError = IllegalStateException("boom") // fails before the app got past waitForDebugger
+        var stops = 0
+        device.onShell["am force-stop"] = { if (++stops == 2) device.failShell = "am force-stop" }
+        val job = newJob()
+        runFailing(job = job)
+        assertEquals(1, device.count("shell am clear-debug-app"), "the debug app is still cleared")
+        assertEquals(1, guard.pending().size, "the marker stays so the next start stops the app")
+        assertTrue(guard.pending().single().launched && !guard.pending().single().released)
+        val hint = job.snapshot().errorHint!!
+        assertTrue("am force-stop dev.app" in hint && "next start" in hint, hint)
+        assertTrue("boom" in job.snapshot().errorMessage!!, "the original failure is kept")
+
+        device.failShell = null
+        device.calls.clear()
+        guard.recoverStale()
+        assertTrue(guard.pending().isEmpty())
+        assertTrue("shell am force-stop dev.app" in device.allCommands(), device.allCommands().toString())
     }
 
     @Test
@@ -455,7 +568,7 @@ class StartupSessionTest {
         val e = runFailing(config, job) as DeviceException
         assertTrue((System.nanoTime() - t0) / 1_000_000 >= 2_000, "full timeout, not the grace")
         assertEquals(DeviceException.Kind.TIMEOUT, e.kind)
-        assertEquals("not reached within 2 s", step(job, "Dump: Foo#bar").detail)
+        assertTrue(step(job, "Dump: Foo#bar").detail!!.startsWith("not reached within 2 s · entry breakpoint on Foo.bar armed"), step(job, "Dump: Foo#bar").detail)
     }
 
     @Test
@@ -463,7 +576,7 @@ class StartupSessionTest {
         session = store.create(device.serial, "dev.app;reboot", SessionMeta.Mode.STARTUP)
         assertThrows<IllegalArgumentException> { startup().run(session.id, StartupConfig(), newJob()) }
         assertTrue(device.calls.isEmpty(), device.allCommands().toString())
-        session = store.create("emulator-5554;reboot", "dev.app", SessionMeta.Mode.STARTUP)
+        session = store.create("emulator-5554\nreboot", "dev.app", SessionMeta.Mode.STARTUP)
         assertThrows<IllegalArgumentException> { startup().run(session.id, StartupConfig(), newJob()) }
         assertTrue(device.calls.isEmpty(), device.allCommands().toString())
     }
@@ -484,6 +597,11 @@ class StartupSessionTest {
         }
         assertEquals(2, stored().snapshots.size)
         assertEquals(SessionMeta.State.ACTIVE, stored().state, "the app keeps running: on-demand dumps still work")
+        // diagnosable from the outside: what it waited for, the VM state, the recent events
+        assertTrue("waiting for: After Application.onCreate: callApplicationOnCreate entered on main" in e.message!!, e.message)
+        assertTrue("diagnosis of the fake VM" in e.message!!, e.message)
+        assertTrue("entered after_app_oncreate" in e.message!! && "reached before_app_oncreate" in e.message!!, e.message)
+        assertTrue("entry breakpoint on Activity.performResume armed" in step(job, "Dump: First Activity resumed").detail!!)
         assertCleanDevice()
     }
 

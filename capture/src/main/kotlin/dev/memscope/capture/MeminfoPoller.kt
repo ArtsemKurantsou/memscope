@@ -36,6 +36,10 @@ class MeminfoPoller(
         @Volatile var wake = false
         @Volatile var inFlight: CancelToken? = null
         @Volatile var intervalMs = baseIntervalMs
+        /** A startup recording is in progress: no `dumpsys` into the app ([setRecording]). */
+        @Volatile var recording = false
+        /** No `dumpsys` before this clock time: the app must have run [RESUME_QUIET_MS] since its last resume. */
+        @Volatile var dumpsysNotBefore = 0L
         var last: MemSample? = null // poll thread only
         var pid: Int? = null        // poll thread only
     }
@@ -51,16 +55,21 @@ class MeminfoPoller(
     val isFinished: Boolean get() = run?.finished ?: false
 
     /** Starts polling [processName] for [sessionId], replacing any earlier run (which is stopped, not waited for). */
-    fun start(sessionId: String, processName: String, intervalMs: Long = 1000) {
+    fun start(sessionId: String, processName: String, intervalMs: Long = 1000, recording: Boolean = false): Unit = synchronized(startLock) {
+        // serialised: two overlapping starts must not both start a thread on the same run (duplicate samples); nothing
+        // here blocks (halt() does not join), so holding the lock is cheap
         halt()
         if (!begin(sessionId, processName, intervalMs)) return
         val r = run ?: return
+        r.recording = recording
         val t = Thread({
             while (!r.stopped) {
                 pollOnce(r)
                 if (r.finished) break
                 synchronized(monitor) {
-                    if (!r.stopped && !r.wake) monitor.wait(r.intervalMs)
+                    val quiet = r.dumpsysNotBefore - clock()
+                    val wait = if (quiet > 0 && !r.paused && !r.recording) minOf(r.intervalMs, quiet) else r.intervalMs
+                    if (!r.stopped && !r.wake) monitor.wait(maxOf(1, wait))
                     r.wake = false
                 }
             }
@@ -68,6 +77,8 @@ class MeminfoPoller(
         thread = t
         t.start()
     }
+
+    private val startLock = Any()
 
     /** Sets the target without starting the loop (tests drive [pollOnce] themselves). False if the session is unknown. */
     internal fun begin(sessionId: String, processName: String, intervalMs: Long): Boolean {
@@ -89,6 +100,8 @@ class MeminfoPoller(
         synchronized(monitor) {
             if (r.stopped || r.paused == paused) return
             r.paused = paused
+            // a just-resumed app gets [RESUME_QUIET_MS] without dumpsys (the next breakpoint may come any moment)
+            if (!paused) r.dumpsysNotBefore = clock() + RESUME_QUIET_MS
             r.epoch++
             r.intervalMs = r.baseIntervalMs
             r.wake = true
@@ -97,6 +110,16 @@ class MeminfoPoller(
             monitor.notifyAll()
         }
         try { MemTimeline.appendHeld(store, r.sessionId, tMs, paused) } catch (_: Exception) { /* the band is lost, polling goes on */ }
+    }
+
+    /**
+     * A startup recording holds the app under a debugger: while [on], running polls read `smaps_rollup` too and never
+     * run `dumpsys meminfo`, whose in-app heap walk can deadlock with a SUSPEND_ALL breakpoint (Task 9 fix round 2).
+     * Switched off once the recording has detached.
+     */
+    fun setRecording(on: Boolean) {
+        val r = run ?: return
+        synchronized(monitor) { r.recording = on }
     }
 
     /** Stops the loop and abandons a poll in flight; waits briefly for the thread. Idempotent. */
@@ -131,14 +154,17 @@ class MeminfoPoller(
         val token = CancelToken()
         val epoch: Int
         val paused: Boolean
+        val smapsOnly: Boolean
         synchronized(monitor) {
-            epoch = r.epoch
             paused = r.paused
+            smapsOnly = paused || r.recording
+            if (!smapsOnly && clock() < r.dumpsysNotBefore) return false // too soon after a resume: not a failure, no backoff
+            epoch = r.epoch
             r.inFlight = token
         }
         val tMs = clock() - r.createdAtMs
         val sample = try {
-            if (paused) pausedSample(r, session, tMs, token) else runningSample(r, session, tMs, token)
+            if (smapsOnly) smapsSample(r, session, tMs, token, paused) else runningSample(r, session, tMs, token)
         } catch (_: DeviceException) {
             null // timeout, cancelled, device gone, adb died: the next poll tries again
         }
@@ -162,13 +188,14 @@ class MeminfoPoller(
         return MeminfoParser.parse(res.stdout, tMs)
     }
 
-    private fun pausedSample(r: Run, session: SessionMeta, tMs: Long, token: CancelToken): MemSample? {
+    /** Total PSS from `smaps_rollup` (no call into the app); the other fields are carried forward. */
+    private fun smapsSample(r: Run, session: SessionMeta, tMs: Long, token: CancelToken, paused: Boolean): MemSample? {
         val thePid = r.pid ?: adb.processes(session.serial, session.packageName).firstOrNull { it.name == r.processName }?.pid ?: return null
         val res = adb.shell(session.serial, listOf("run-as", session.packageName, "cat", "/proc/$thePid/smaps_rollup"), POLL_TIMEOUT, token)
         val total = (if (res.exitCode == 0) MeminfoParser.parseSmapsPss(res.stdout) else null) ?: return null
         r.pid = thePid
         val prev = r.last
-        return (prev?.copy(tMs = tMs) ?: MemSample(tMs, 0, 0, 0, 0, 0, 0, 0)).copy(totalPssKb = total, paused = true)
+        return (prev?.copy(tMs = tMs) ?: MemSample(tMs, 0, 0, 0, 0, 0, 0, 0)).copy(totalPssKb = total, paused = paused)
     }
 
     private fun append(sessionId: String, sample: MemSample) {
@@ -182,6 +209,7 @@ class MeminfoPoller(
     private companion object {
         val POLL_TIMEOUT = 5.seconds
         const val MAX_INTERVAL_MS = 8000L
+        const val RESUME_QUIET_MS = 500L
         val json = Json { encodeDefaults = true; ignoreUnknownKeys = true }
     }
 }

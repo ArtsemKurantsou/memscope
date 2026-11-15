@@ -71,6 +71,15 @@ interface DebuggerPort {
      */
     fun invokeDump(thread: DebugThread, remotePath: String): String?
 
+    /**
+     * For a failure message when a milestone never came: suspends the VM (the session is failing anyway) and describes
+     * the armed requests and the main thread (suspend count before suspending, status, top frames). Never throws.
+     */
+    fun diagnose(): String = "no diagnosis available"
+
+    /** A cheap round trip (JDWP AllThreads) to tell a quiet VM from a wedged one; blocks if the VM does not answer. */
+    fun ping() {}
+
     /** Deletes all requests, resumes and closes the connection. Idempotent; never throws. */
     fun dispose()
 }

@@ -309,7 +309,7 @@ class RoutesTest {
         for (mode in listOf("ATTACH", "STARTUP")) {
             for (body in listOf(
                 """{"serial":"emulator-5554","packageName":"dev.app;reboot","mode":"$mode"}""",
-                """{"serial":"emulator-5554;reboot","packageName":"dev.app","mode":"$mode"}""",
+                """{"serial":"emulator-5554\nreboot","packageName":"dev.app","mode":"$mode"}""",
             )) {
                 val r = client.postJson("/api/sessions", body)
                 assertEquals(HttpStatusCode.BadRequest, r.status, body)
@@ -321,7 +321,7 @@ class RoutesTest {
         val r = client.postJson("/api/sessions/${s.id}/dump", """{"processName":"dev.app;reboot"}""")
         assertEquals(HttpStatusCode.BadRequest, r.status)
         assertEquals(0, runner.count("shell"), runner.calls.toString())
-        assertEquals(HttpStatusCode.BadRequest, client.get("/api/devices/x;y/apps").status)
+        assertEquals(HttpStatusCode.BadRequest, client.get("/api/devices/x%0Ay/apps").status)
     }
 
     @Test fun startupIsRefusedWith503WhileStaleRecoveryRuns() = server {

@@ -58,8 +58,11 @@ class DebugAppGuard(private val adb: Adb, private val home: Path) {
         if (all.any { it.serial == serial }) write(all.map { if (it.serial == serial) f(it) else it })
     }
 
-    /** `am clear-debug-app`, then removes the marker. Throws (and keeps the marker) if the device cannot be reached. */
-    fun disarm(serial: String) {
+    /**
+     * `am clear-debug-app`, then removes the marker unless [keepMarker] (an app that may still be frozen must be
+     * stopped by [recoverStale] later). Throws (and keeps the marker) if the device cannot be reached.
+     */
+    fun disarm(serial: String, keepMarker: Boolean = false) {
         val result = adb.shell(serial, listOf("am", "clear-debug-app"), 15.seconds)
         if (result.exitCode != 0) {
             throw DeviceException(
@@ -67,7 +70,7 @@ class DebugAppGuard(private val adb: Adb, private val home: Path) {
                 "The app may still be set to wait for a debugger. Run 'adb shell am clear-debug-app' or restart MemScope with the device connected.",
             )
         }
-        synchronized(lock) { write(read().filter { it.serial != serial }) }
+        if (!keepMarker) synchronized(lock) { write(read().filter { it.serial != serial }) }
     }
 
     fun pending(): List<PendingDebugApp> = synchronized(lock) { read() }

@@ -14,9 +14,9 @@ class DeviceArgsTest {
 
     @Test
     fun `serials`() {
-        for (ok in listOf("emulator-5554", "192.168.1.5:5555", "R58M12ABCDE", "adb-XYZ._adb-tls-connect._tcp"))
+        for (ok in listOf("emulator-5554", "192.168.1.5:5555", "R58M12ABCDE", "adb-XYZ._adb-tls-connect._tcp", "adb-R58M12 (2)._adb-tls-connect._tcp"))
             assertDoesNotThrow { DeviceArgs.requireSerial(ok) }
-        for (bad in listOf("", "a b", "x;y", "x\$y", "x/y", "a".repeat(200))) assertThrows<IllegalArgumentException>("'$bad'") { DeviceArgs.requireSerial(bad) }
+        for (bad in listOf("", "a\nb", "a\u0000b", "x\ty", "a".repeat(201))) assertThrows<IllegalArgumentException>("'$bad'") { DeviceArgs.requireSerial(bad) }
     }
 
     @Test

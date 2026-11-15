@@ -55,11 +55,17 @@ class JdiDebuggerPort : DebuggerPort {
         val frames = main.frames()
         val i = frames.indexOfFirst { it.location().method().name() == "handleBindApplication" }
         if (i < 0) return "the main thread is not in ActivityThread.handleBindApplication (top frame: ${frames.firstOrNull()?.location()})"
+        // the call in handleBindApplication must be the one waiting for us; otherwise the app already started (for example
+        // the one-shot debug-app flag was used up) and "process start" would silently be a later point
+        if (frames.take(i).none { it.location().method().name() == "waitForDebugger" }) {
+            return "the app was not waiting for the debugger when it attached (it was already at " +
+                "${frames[i].location().method().name()} @${frames[i].location().codeIndex()}); the process start was missed"
+        }
         val call = frames[i].location()
         val ret = returnLocation(call) ?: return "no code after ${call.method().name()} @${call.codeIndex()}"
         vm.eventRequestManager().createBreakpointRequest(ret).apply {
             addThreadFilter(main)
-            setSuspendPolicy(EventRequest.SUSPEND_ALL)
+            setSuspendPolicy(BREAKPOINT_SUSPEND)
             putProperty(KEY, Milestones.PROCESS_START)
             putProperty(KIND, Kind.WAIT)
             enable()
@@ -93,7 +99,7 @@ class JdiDebuggerPort : DebuggerPort {
         val ret = returnLocation(caller) ?: return "no code after ${caller.method().declaringType().name()}.${caller.method().name()} @${caller.codeIndex()}"
         vm().eventRequestManager().createBreakpointRequest(ret).apply {
             addThreadFilter(t)
-            setSuspendPolicy(EventRequest.SUSPEND_ALL)
+            setSuspendPolicy(BREAKPOINT_SUSPEND)
             putProperty(KEY, key)
             putProperty(KIND, Kind.RETURN)
             enable()
@@ -177,6 +183,7 @@ class JdiDebuggerPort : DebuggerPort {
             path.disableCollection()
             try {
                 debug.invokeMethod(t, method, listOf(path), ClassType.INVOKE_SINGLE_THREADED)
+                collectGarbage(t)
                 return null
             } catch (e: com.sun.jdi.InvocationException) {
                 return describe(e.exception())
@@ -188,6 +195,57 @@ class JdiDebuggerPort : DebuggerPort {
         } catch (e: IncompatibleThreadStateException) {
             throw IllegalStateException("thread ${thread.name} is not stopped at an event", e)
         }
+    }
+
+    /** `Runtime.getRuntime().gc()` on the stopped thread, so no collection is pending when the app resumes. Best effort. */
+    private fun collectGarbage(t: ThreadReference) {
+        runCatching {
+            val runtime = vm().classesByName("java.lang.Runtime").firstOrNull() as? ClassType ?: return
+            val get = runtime.methodsByName("getRuntime", "()Ljava/lang/Runtime;").firstOrNull() ?: return
+            val instance = runtime.invokeMethod(t, get, emptyList(), ClassType.INVOKE_SINGLE_THREADED) as? ObjectReference ?: return
+            val gc = runtime.methodsByName("gc", "()V").firstOrNull() ?: return
+            instance.invokeMethod(t, gc, emptyList(), ObjectReference.INVOKE_SINGLE_THREADED)
+        }
+    }
+
+    override fun ping() { vm().allThreads() }
+
+    override fun diagnose(): String = try {
+        val vm = vm()
+        val main = vm.allThreads().firstOrNull { it.name() == "main" }
+        val suspendBefore = main?.suspendCount()
+        vm.suspend()
+        buildString {
+            val erm = vm.eventRequestManager()
+            append("armed breakpoints: ")
+            append(erm.breakpointRequests().joinToString("; ") { r ->
+                val l = r.location()
+                "${r.getProperty(KEY)}/${r.getProperty(KIND)} ${l.declaringType().name()}.${l.method().name()}@${l.codeIndex()}${if (r.isEnabled) "" else " (disabled)"}"
+            }.ifEmpty { "none" })
+            append("\nclass-prepare requests: ")
+            append(erm.classPrepareRequests().joinToString("; ") { "${it.getProperty(KEY)}" }.ifEmpty { "none" })
+            append("\npending caller returns: ")
+            append(pendingReturns.entries.joinToString("; ") { (k, p) -> "$k on ${p.first.name()} (caller depth ${p.second}, now ${runCatching { p.first.frameCount() }.getOrNull()})" }.ifEmpty { "none" })
+            if (main == null) { append("\nno main thread"); return@buildString }
+            append("\nmain thread: status ${threadStatus(main.status())}, suspend count before diagnosis $suspendBefore, ")
+            append("at breakpoint ${main.isAtBreakpoint}")
+            main.frames().take(14).forEach { f ->
+                val l = f.location()
+                append("\n  at ${l.declaringType().name()}.${l.method().name()} @${l.codeIndex()}")
+            }
+        }
+    } catch (e: Exception) {
+        "diagnosis failed: $e"
+    }
+
+    private fun threadStatus(s: Int) = when (s) {
+        ThreadReference.THREAD_STATUS_RUNNING -> "RUNNING"
+        ThreadReference.THREAD_STATUS_WAIT -> "WAIT"
+        ThreadReference.THREAD_STATUS_MONITOR -> "MONITOR"
+        ThreadReference.THREAD_STATUS_SLEEPING -> "SLEEPING"
+        ThreadReference.THREAD_STATUS_ZOMBIE -> "ZOMBIE"
+        ThreadReference.THREAD_STATUS_NOT_STARTED -> "NOT_STARTED"
+        else -> "UNKNOWN($s)"
     }
 
     /**
@@ -227,7 +285,7 @@ class JdiDebuggerPort : DebuggerPort {
         for (m in methods) {
             val loc = m.location() ?: continue
             erm.createBreakpointRequest(loc).apply {
-                setSuspendPolicy(EventRequest.SUSPEND_ALL)
+                setSuspendPolicy(BREAKPOINT_SUSPEND)
                 putProperty(KEY, key)
                 putProperty(KIND, if (hook.afterReturn) Kind.ENTRY_THEN_RETURN else Kind.ENTRY)
                 enable()
@@ -282,6 +340,11 @@ class JdiDebuggerPort : DebuggerPort {
         const val KIND = "memscope.kind"
         const val HOOK = "memscope.hook"
         const val DISPOSE_WAIT_MS = 3_000L
+        /**
+         * Breakpoints stop the whole VM (FINDINGS A.2/A.3). SUSPEND_EVENT_THREAD was tried in fix round 2 against the
+         * first-activity wedge and did not change its rate (5 of 30 either way), so the verified policy stays.
+         */
+        const val BREAKPOINT_SUSPEND = EventRequest.SUSPEND_ALL
         val RETURN_KINDS = setOf(Kind.WAIT, Kind.RETURN)
     }
 }

@@ -38,6 +38,10 @@ data class StartupTimeouts(
     val attachMs: Long = 20_000,
     val dumpMs: Long = 180_000,
     val pullMs: Long = 300_000,
+    /** Longest wait for any other JDWP reply (JDI has none of its own): a VM that does not answer is wedged. */
+    val jdwpReplyMs: Long = 20_000,
+    /** After this long without a debugger event (app past the wait), ping the VM to tell a slow app from a wedged one. */
+    val pingAfterMs: Long = 10_000,
 )
 
 /**
@@ -48,6 +52,8 @@ data class StartupTimeouts(
 interface StartupListener {
     fun onPid(pid: Int) {}
     fun onHeld(held: Boolean) {}
+    /** The debugger has detached (success or not): from now on the app may be inspected normally. */
+    fun onRecordingDone() {}
 
     companion object { val NONE = object : StartupListener {} }
 }
@@ -115,6 +121,23 @@ class StartupSession(
         /** Custom hooks whose class was not loaded when they were set and has not been prepared since. */
         private val deferred = HashSet<String>()
         private val hadBuiltins = config.milestones.any { it.enabled && !it.custom }
+        /** What each pending milestone waits for, shown in its step while waiting and in a timeout failure. */
+        private val hookState = HashMap<String, String>()
+        /** The last debugger events with times since the first resume, for a timeout failure. */
+        private val trace = ArrayDeque<String>()
+        private var loopStartMs = 0L
+        private var timeoutDiagnosis: String? = null
+        /** Set when a possibly frozen app could not be force-stopped; the marker is kept and the failure hint says so. */
+        private var stopFailedHint: String? = null
+        /** The debugger call that got no reply: the app's VM is wedged and must be stopped. */
+        private var wedgedOp: String? = null
+        /**
+         * The one thread that talks JDWP (and owns the JDI event queue): JDI waits for replies without a timeout, so
+         * every call runs here and the session thread waits for it with [jdwp]'s bound.
+         */
+        private val jdwpThread = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+            Thread(r, "memscope-jdwp").apply { isDaemon = true }
+        }
         private var lastReached = "launch"
         private var timedOutLabel: String? = null
         /** When the app last ran on after a stop; the time to the next milestone is the app running under the debugger. */
@@ -150,11 +173,20 @@ class StartupSession(
                     "The app is still running; adb or the emulator dropped the connection. Retry the recording; snapshots taken before are kept.",
                 )
                 Outcome.TIMED_OUT -> if (failure == null) failure = DeviceException(
-                    DeviceException.Kind.TIMEOUT, "$timedOutLabel was not reached within ${config.milestoneTimeoutSec} s.",
+                    DeviceException.Kind.TIMEOUT,
+                    "$timedOutLabel was not reached within ${config.milestoneTimeoutSec} s." + (timeoutDiagnosis?.let { "\n$it" } ?: ""),
                     "The app may never get there (wrong hook, or a path not taken on this launch), or is slow under the debugger: " +
                         "raise the per-milestone timeout or deselect the milestone. Snapshots taken before are kept.",
                 )
                 else -> {}
+            }
+            stopFailedHint?.let { extra ->
+                val f = failure
+                val d = f as? DeviceException
+                failure = DeviceException(
+                    d?.kind ?: DeviceException.Kind.COMMAND_FAILED, f?.message ?: "The recording could not clean up.",
+                    listOfNotNull(d?.hint, extra).joinToString(" "), f,
+                )
             }
             failure?.let { throw it }
             job.complete(session.id)
@@ -220,37 +252,55 @@ class StartupSession(
                     "Another debugger (for example Android Studio) may be attached to the app: detach it, then retry.", e,
                 )
             }
-            dbg.suspendAll()
+            jdwp("suspending the VM") { dbg.suspendAll() }
             observe { listener.onHeld(true) }
-            val waitError = dbg.armWaitReturn()
+            val waitError = jdwp("arming the waitForDebugger return") { dbg.armWaitReturn() }
             for (m in pending.values.toList()) {
                 if (m.id == Milestones.PROCESS_START) {
                     if (waitError != null) failMilestone(m, "Could not find where the app waits for the debugger: $waitError")
+                    else hookState[m.id] = "breakpoint where waitForDebugger returns armed"
                     continue
                 }
-                when (val status = dbg.setEntryBreakpoints(m.id, m.hook)) {
+                val where = "${m.hook.className.substringAfterLast('.')}.${m.hook.methodName}"
+                when (val status = jdwp("setting the breakpoints of ${m.label}") { dbg.setEntryBreakpoints(m.id, m.hook) }) {
                     is HookStatus.Failed -> failMilestone(m, hookProblem(m, status.reason))
-                    HookStatus.Deferred -> if (m.custom) deferred += m.id
-                    HookStatus.Resolved -> {}
+                    HookStatus.Deferred -> {
+                        if (m.custom) deferred += m.id
+                        hookState[m.id] = "class ${m.hook.className} not loaded yet; entry of $where armed once it loads"
+                    }
+                    HookStatus.Resolved -> hookState[m.id] = "entry breakpoint on $where armed"
                 }
             }
+            loopStartMs = nowMs()
             resumedAtMs = nowMs()
             observe { listener.onHeld(false) }
-            dbg.resume() // from here on the VM must see no JDWP traffic until it reports an event (settle delay, FINDINGS A.2)
+            jdwp("resuming the app") { dbg.resume() } // from here on the VM must see no JDWP traffic until it reports an event (settle delay, FINDINGS A.2)
         }
 
         private fun awaitMilestones(): Outcome {
             val dbg = debugger!!
             var lastProgress = nowMs()
+            var lastNoteMs = 0L
+            var lastPingMs = 0L
             while (pending.isNotEmpty()) {
                 checkCancel()
-                val events = dbg.nextEvents(POLL_MS)
+                val events = jdwp("reading debugger events") { dbg.nextEvents(POLL_MS) }
                 if (events == null) {
                     val waited = nowMs() - lastProgress
                     val limitSec = if (onlyUnloadedCustomsLeft()) config.customGraceSec else config.milestoneTimeoutSec
                     if (waited >= limitSec * 1000L) return timedOut(limitSec)
+                    // the settle rule forbids JDWP traffic only until the app is past waitForDebugger
+                    if (released && waited >= timeouts.pingAfterMs && nowMs() - lastPingMs >= timeouts.pingAfterMs) {
+                        lastPingMs = nowMs()
+                        jdwp("checking the app still answers") { dbg.ping() }
+                    }
+                    if (waited >= NOTE_AFTER_MS && nowMs() - lastNoteMs >= NOTE_EVERY_MS) {
+                        lastNoteMs = nowMs()
+                        pending.values.forEach { job.note(dumpStep(it), "waiting ${waited / 1000} s of $limitSec s · ${hookState[it.id] ?: "?"}") }
+                    }
                     continue
                 }
+                record(events.joinToString(", ", transform = ::describe))
                 observe { listener.onHeld(true) }
                 for (e in events.sortedBy(::order)) {
                     when (e) {
@@ -259,7 +309,10 @@ class StartupSession(
                             markReleased()
                             pending[Milestones.PROCESS_START]?.let { if (reach(it, e.thread)) return vmGone() }
                         }
-                        is DebugEvent.HookResolved -> deferred -= e.key
+                        is DebugEvent.HookResolved -> {
+                            deferred -= e.key
+                            pending[e.key]?.let { hookState[it.id] = "class loaded; entry breakpoint on ${it.hook.methodName} armed" }
+                        }
                         is DebugEvent.HookFailed -> {
                             deferred -= e.key
                             pending[e.key]?.let { failMilestone(it, hookProblem(it, e.reason)) }
@@ -267,13 +320,15 @@ class StartupSession(
                         is DebugEvent.EntryHit -> {
                             markReleased()
                             val m = pending[e.key] ?: continue
-                            dbg.clearHook(m.id)
-                            dbg.armCallerReturn(m.id, e.thread)?.let { failMilestone(m, "Could not stop where ${m.hook.methodName} returns: $it") }
+                            jdwp("clearing the hook of ${m.label}") { dbg.clearHook(m.id) }
+                            val err = jdwp("arming the return of ${m.label}") { dbg.armCallerReturn(m.id, e.thread) }
+                            if (err != null) failMilestone(m, "Could not stop where ${m.hook.methodName} returns: $err")
+                            else hookState[m.id] = "${m.hook.methodName} entered on ${e.thread.name} at +%.1f s; breakpoint where it returns to its caller armed".format((nowMs() - loopStartMs) / 1000.0)
                         }
                         is DebugEvent.Reached -> {
                             markReleased()
                             val m = pending[e.key] ?: continue
-                            dbg.clearHook(m.id)
+                            jdwp("clearing the hook of ${m.label}") { dbg.clearHook(m.id) }
                             if (reach(m, e.thread)) return vmGone()
                         }
                     }
@@ -282,9 +337,71 @@ class StartupSession(
                 if (pending.isEmpty()) break // detach resumes the VM
                 resumedAtMs = nowMs()
                 observe { listener.onHeld(false) }
-                dbg.resume()
+                jdwp("resuming the app") { dbg.resume() }
+                record("resumed")
             }
             return Outcome.ALL_REACHED
+        }
+
+        /**
+         * Runs one debugger call on [jdwpThread] and waits at most [StartupTimeouts.jdwpReplyMs], checking cancel every
+         * [POLL_MS]. No reply in time means the app's VM is wedged (seen on API 37 when a heap walk inside the app, e.g.
+         * from `dumpsys meminfo`, meets a SUSPEND_ALL breakpoint): the debugger is disposed, detach stops the app, and
+         * the failure says what was pending.
+         */
+        private fun <T> jdwp(op: String, block: () -> T): T {
+            val f = jdwpThread.submit(java.util.concurrent.Callable(block))
+            val deadline = nowMs() + timeouts.jdwpReplyMs
+            while (true) {
+                try {
+                    return f.get(POLL_MS, TimeUnit.MILLISECONDS)
+                } catch (_: TimeoutException) {
+                    // keep waiting
+                } catch (e: ExecutionException) {
+                    throw e.cause ?: e
+                }
+                if (job.cancel.isCancelled) { debugger?.dispose(); throw cancelled() }
+                if (nowMs() >= deadline) {
+                    wedgedOp = op
+                    record("no reply while $op")
+                    debugger?.dispose()
+                    throw DeviceException(
+                        DeviceException.Kind.TIMEOUT,
+                        "The app stopped answering the debugger: $op got no reply within ${timeouts.jdwpReplyMs / 1000} s.\n" +
+                            "waiting for: " + pending.values.joinToString("; ") { "${it.label}: ${hookState[it.id] ?: "?"}" }.ifEmpty { "nothing" } +
+                            "\nrecent debugger events:\n" + trace.joinToString("\n").ifEmpty { "none" },
+                        "The app's VM deadlocked while held by the debugger (this can happen when another tool inspects its heap at the " +
+                            "same moment, e.g. 'dumpsys meminfo'). MemScope stopped the app; retry the recording. Snapshots taken before are kept.",
+                    )
+                }
+            }
+        }
+
+        /** [DebuggerPort.diagnose], bounded; a VM that does not answer is reported as such. */
+        private fun diagnoseQuietly(): String {
+            val f = jdwpThread.submit(java.util.concurrent.Callable { debugger?.diagnose() ?: "debugger already closed" })
+            return try {
+                f.get(DIAGNOSE_WAIT_MS, TimeUnit.MILLISECONDS)
+            } catch (_: TimeoutException) {
+                wedgedOp = "the diagnosis" // detach must stop the app
+                "the VM did not answer the diagnosis within ${DIAGNOSE_WAIT_MS / 1000} s (wedged)"
+            } catch (e: Exception) {
+                "diagnosis failed: ${e.cause ?: e}"
+            }
+        }
+
+        private fun record(what: String) {
+            if (trace.size >= TRACE_MAX) trace.removeFirst()
+            trace.addLast("+%.1f s %s".format((nowMs() - loopStartMs) / 1000.0, what))
+        }
+
+        private fun describe(e: DebugEvent) = when (e) {
+            is DebugEvent.WaitReturned -> "waitForDebugger returned"
+            is DebugEvent.EntryHit -> "entered ${e.key}"
+            is DebugEvent.Reached -> "reached ${e.key}"
+            is DebugEvent.HookResolved -> "class loaded for ${e.key}"
+            is DebugEvent.HookFailed -> "hook failed ${e.key}: ${e.reason}"
+            DebugEvent.Disconnected -> "disconnected"
         }
 
         /** Dumps and pulls milestone [m]; true if the debugger connection closed meanwhile. */
@@ -367,14 +484,24 @@ class StartupSession(
             observe { listener.onHeld(false) }
             debugger?.dispose()
             debugger = null
+            jdwpThread.shutdownNow() // a call stuck on a wedged VM is abandoned (daemon thread)
+            observe { listener.onRecordingDone() }
             tracker?.close()
             tracker = null
-            if (launched && !released && !appExited) {
-                // possibly frozen in waitForDebugger (pid known or not): disposing does not release it (FINDINGS A.5)
-                try {
-                    adb.shell(serial, listOf("am", "force-stop", pkg), SHORT)
-                    notes += "stopped the app, which was still waiting for the debugger"
-                } catch (_: DeviceException) { /* the disarm below reports the device problem */ }
+            val wedged = wedgedOp != null && !appExited
+            if ((launched && !released && !appExited) || wedged) {
+                // frozen in waitForDebugger (pid known or not; disposing does not release it, FINDINGS A.5), or deadlocked
+                val stopped = try {
+                    adb.shell(serial, listOf("am", "force-stop", pkg), SHORT).exitCode == 0
+                } catch (_: DeviceException) {
+                    false // the disarm below reports a lost device
+                }
+                if (stopped) {
+                    notes += if (wedged) "stopped the app: it no longer answered the debugger" else "stopped the app, which was still waiting for the debugger"
+                } else {
+                    stopFailedHint = "$pkg may still be frozen and could not be stopped: run " +
+                        "'adb shell am force-stop $pkg', or MemScope stops it at its next start."
+                }
             }
             var firstError: DeviceException? = null
             localPort?.let { port ->
@@ -388,7 +515,7 @@ class StartupSession(
             }
             if (armed) {
                 try {
-                    guard.disarm(serial)
+                    guard.disarm(serial, keepMarker = stopFailedHint != null) // a kept marker lets recoverStale stop it later
                     armed = false
                     notes += "debug app cleared"
                 } catch (e: DeviceException) {
@@ -438,11 +565,13 @@ class StartupSession(
                 if (m.custom && m.id in deferred) {
                     failMilestone(m, "class ${m.hook.className} was never loaded within $limitSec s — check class and method name")
                 } else {
-                    failMilestone(m, "not reached within $limitSec s")
+                    failMilestone(m, "not reached within $limitSec s · ${hookState[m.id] ?: "?"}")
                 }
             }
             val real = missing.firstOrNull { !(it.custom && it.id in deferred) } ?: return Outcome.ALL_REACHED
             timedOutLabel = real.label
+            timeoutDiagnosis = "waiting for: " + missing.joinToString("; ") { "${it.label}: ${hookState[it.id] ?: "?"}" } +
+                "\n" + diagnoseQuietly() + "\nrecent debugger events:\n" + trace.joinToString("\n").ifEmpty { "none" }
             return Outcome.TIMED_OUT
         }
 
@@ -547,6 +676,11 @@ class StartupSession(
         const val DETACH = "Detach"
         private const val POLL_MS = 200L
         private const val ALIVE_RECHECK_MS = 500L
+        /** A pending step shows what it waits for once the wait exceeds this, refreshed this often. */
+        private const val NOTE_AFTER_MS = 2_000L
+        private const val NOTE_EVERY_MS = 1_000L
+        private const val TRACE_MAX = 40
+        private const val DIAGNOSE_WAIT_MS = 5_000L
         private const val MB = 1_048_576.0
         private val SHORT = 15.seconds
         private val COMPONENT = Regex("[A-Za-z0-9_.]+/[A-Za-z0-9_.$]+")

@@ -24,6 +24,9 @@ class FakeDebugger : DebuggerPort {
     /** If set, dumps block until it is counted down (or the port is disposed). */
     @Volatile var dumpGate: CountDownLatch? = null
     var dumpDisconnects = false
+    /** The JDWP reply that never comes (FINDINGS-style deadlock): a call named here blocks until the port is disposed. */
+    @Volatile var hangOn: String? = null
+    private fun maybeHang(op: String) { if (hangOn == op) while (!disposed) Thread.sleep(10) }
     var nextEventsError: Throwable? = null
     /** Runs when the VM goes away (a Disconnected set, or a dump that disconnects): tests let the process die here. */
     var onDisconnected: () -> Unit = {}
@@ -52,7 +55,7 @@ class FakeDebugger : DebuggerPort {
     override fun suspendAll() { calls += "suspendAll" }
     override fun armWaitReturn(): String? { traffic("armWaitReturn"); return waitArmError }
     override fun setEntryBreakpoints(key: String, hook: Hook): HookStatus { traffic("entry:$key"); return hookStatus(key, hook) }
-    override fun armCallerReturn(key: String, thread: DebugThread): String? { traffic("return:$key"); return returnArmError(key) }
+    override fun armCallerReturn(key: String, thread: DebugThread): String? { traffic("return:$key"); maybeHang("armCallerReturn:$key"); return returnArmError(key) }
     override fun clearHook(key: String) { traffic("clear:$key") }
 
     override fun resume() {
@@ -68,6 +71,8 @@ class FakeDebugger : DebuggerPort {
         if (!running) violations += "nextEvents while suspended"
         val set = script.pollFirst()
         if (set == null) { Thread.sleep(minOf(timeoutMs, 20)); return null }
+        // the real stall: an event set arrived, but translating it (ThreadReference.name()) never gets a reply
+        if (hangOn == "events" && set.any { it is DebugEvent.EntryHit && it.key == "first_activity_resumed" }) { maybeHang("events"); return null }
         if (set.any { it is DebugEvent.Disconnected }) onDisconnected()
         calls += "events:" + set.joinToString(",") { it.toString() }
         if (set.any { it !is DebugEvent.Disconnected }) { running = false; pendingSet = true }
@@ -81,6 +86,10 @@ class FakeDebugger : DebuggerPort {
         dumpedPaths += remotePath
         return dumpResult(remotePath)
     }
+
+    override fun diagnose(): String { calls += "diagnose"; maybeHang("ping"); return "diagnosis of the fake VM" }
+
+    override fun ping() { calls += "ping"; maybeHang("ping") }
 
     override fun dispose() { calls += "dispose"; disposed = true }
 }

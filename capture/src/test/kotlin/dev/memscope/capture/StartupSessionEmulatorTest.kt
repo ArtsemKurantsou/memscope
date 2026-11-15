@@ -163,6 +163,34 @@ class StartupSessionEmulatorTest {
         assertDeviceClean(r)
     }
 
+    /**
+     * Fix round 2: `dumpsys meminfo` (an in-app heap walk) racing a SUSPEND_ALL breakpoint can wedge the app's VM so
+     * that a JDWP reply never comes. Forces that timing by hammering dumpsys during the whole recording: whatever the
+     * outcome, it must end within its bounds (never hang), and a wedged app must be stopped and the device left clean.
+     */
+    @Test
+    fun `dumpsys meminfo hammering during a recording never hangs it`() {
+        val stop = java.util.concurrent.atomic.AtomicBoolean(false)
+        val hammer = Thread {
+            while (!stop.get()) runCatching { adb.shell(serial, listOf("dumpsys", "meminfo", pkg), 10.seconds) }
+        }.apply { isDaemon = true; start() }
+        val t0 = System.nanoTime()
+        val r = try {
+            record(StartupConfig(milestoneTimeoutSec = 60))
+        } finally {
+            stop.set(true); hammer.join(15_000)
+        }
+        val secs = (System.nanoTime() - t0) / 1_000_000_000
+        println("hammered recording: ${r.job.state} in $secs s: ${r.error?.message?.lineSequence()?.firstOrNull()}")
+        assertTrue(secs < 90, "bounded: $secs s")
+        if (r.job.state != Job.State.DONE) {
+            val m = r.error?.message ?: ""
+            assertTrue("stopped answering the debugger" in m || "not reached" in m, m)
+        }
+        assertValidHprofs(r)
+        assertDeviceClean(r)
+    }
+
     @Test
     fun `killing the app between milestones two and three ends the session and keeps two dumps`() {
         val r = record(StartupConfig()) { m ->

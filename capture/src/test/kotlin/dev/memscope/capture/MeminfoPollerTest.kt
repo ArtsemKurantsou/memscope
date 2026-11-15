@@ -270,6 +270,50 @@ class MeminfoPollerTest {
         assertEquals(1, samples().size)
     }
 
+    /** Task 9 fix round 2: `dumpsys meminfo` makes the app walk its heap, which deadlocked a SUSPEND_ALL breakpoint. */
+    @Test
+    fun `during a startup recording no dumpsys runs, only smaps_rollup, until the recording is done`() {
+        poller.setRecording(true)
+        now += 1000
+        assertTrue(poller.pollOnce())
+        val s = samples().single()
+        assertFalse(s.paused, "running, just measured without dumpsys")
+        assertEquals(4242, s.totalPssKb)
+        assertTrue(phone.commands.none { "dumpsys" in it }, phone.commands.toString())
+        poller.setRecording(false)
+        now += 1000
+        assertTrue(poller.pollOnce())
+        assertEquals(listOf("shell", "dumpsys", "meminfo", "dev.app"), phone.commands.last())
+    }
+
+    @Test
+    fun `no dumpsys right after a resume, only once the app ran for 500 ms`() {
+        poller.setPaused(true)
+        assertTrue(poller.pollOnce())
+        poller.setPaused(false)
+        now += 100
+        assertFalse(poller.pollOnce(), "too soon after the resume")
+        assertTrue(phone.commands.none { "dumpsys" in it }, phone.commands.toString())
+        assertEquals(1000, poller.currentIntervalMs, "skipping is not a failure: no backoff")
+        now += 400
+        assertTrue(poller.pollOnce())
+        assertEquals(listOf("shell", "dumpsys", "meminfo", "dev.app"), phone.commands.last())
+    }
+
+    @Test
+    fun `overlapping starts leave a single polling thread`() {
+        fun pollerThreads() = Thread.getAllStackTraces().keys.count { it.name == "memscope-meminfo-poller" && it.isAlive }
+        val before = pollerThreads()
+        val p = MeminfoPoller(phone.adb, store)
+        val go = java.util.concurrent.CountDownLatch(1)
+        val starters = (1..8).map { Thread { go.await(); p.start(sid, "dev.app", 50) }.apply { start() } }
+        go.countDown()
+        starters.forEach { it.join(5000) }
+        Thread.sleep(300) // replaced runs notice they were stopped
+        assertEquals(before + 1, pollerThreads())
+        p.stop()
+    }
+
     @Test
     fun `start runs a background loop that stops with the session and with stop()`() {
         val p = MeminfoPoller(phone.adb, store)
