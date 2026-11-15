@@ -40,7 +40,20 @@ private fun openBrowser(url: String) {
     }
 }
 
-private const val USAGE = "Usage: server [--port <n>] [--no-open]"
+/**
+ * A startup recording interrupted by a crash or a lost device can leave a debug app set (and a process frozen in
+ * waitForDebugger): clear it in the background so startup is not delayed by adb.
+ */
+fun recoverStaleDebugApps(deps: ServerDeps): Thread = Thread({
+    try {
+        deps.guard.recoverStale().forEach { ServerLog.error(it) }
+    } catch (e: Exception) {
+        val hint = (e as? dev.memscope.device.DeviceException)?.hint?.let { " $it" } ?: ""
+        ServerLog.error("Could not check for a debug app left by an interrupted startup recording: ${e.message}.$hint")
+    }
+}, "memscope-recover-debug-app").apply { isDaemon = true; start() }
+
+private const val USAGE ="Usage: server [--port <n>] [--no-open]"
 
 private fun usageError(message: String): Nothing {
     System.err.println("$message\n$USAGE")
@@ -71,6 +84,7 @@ fun main(args: Array<String>) {
 
     val adb: Adb by lazy { Adb(AdbLocator.find()) } // not found is reported per request, with its hint
     val deps = ServerDeps(SessionStore(), { adb })
+    deps.staleRecovery = recoverStaleDebugApps(deps)
     val engine = startServer(deps, chosen, wait = false)
     Runtime.getRuntime().addShutdownHook(Thread {
         engine.stop(0, 2000)

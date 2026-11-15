@@ -21,8 +21,11 @@
       <select id="app-select" disabled><option>–</option></select>
     </label>
     <button id="app-refresh" class="btn icon" type="button" title="Refresh the app list" aria-label="Refresh apps">&#8635;</button>
+    <label class="field" id="dump-process-field" hidden title="The app runs in several processes: pick the one to dump">Process
+      <select id="dump-process"></select>
+    </label>
     <button id="dump-btn" class="btn primary" type="button" disabled>Dump now</button>
-    <span class="soon" title="Coming in a later step"><button class="btn" type="button" disabled>Record startup</button></span>
+    <button id="startup-btn" class="btn" type="button" disabled title="Restart the app under a debugger and dump its heap at startup milestones">Record startup</button>
   </header>
 
   <div id="job-panel" class="job-panel" hidden aria-live="polite"></div>

@@ -1,9 +1,12 @@
 package dev.memscope.server
 
 import dev.memscope.analysis.HprofUnreadableException
+import dev.memscope.capture.Milestones
 import dev.memscope.capture.SessionMeta
 import dev.memscope.capture.SessionStore
 import dev.memscope.capture.SnapshotMeta
+import dev.memscope.capture.StartupConfig
+import dev.memscope.device.DeviceException
 import io.ktor.client.HttpClient
 import io.ktor.client.plugins.DefaultRequest
 import io.ktor.client.request.get
@@ -52,7 +55,7 @@ class RoutesTest {
 
     private fun server(block: suspend ApplicationTestBuilder.() -> Unit) {
         store = SessionStore(home)
-        deps = ServerDeps(store, { runner.adb }, opener, clock = { now }, previousAnalysisTimeoutMs = waitTimeoutMs)
+        deps = ServerDeps(store, { runner.adb }, opener, clock = { now }, previousAnalysisTimeoutMs = waitTimeoutMs, startupRunner = startupRunner)
         ServerLog.sink = { logs += it }
         try {
             testApplication {
@@ -163,12 +166,132 @@ class RoutesTest {
         assertTrue(store.list().isEmpty())
     }
 
-    @Test fun startupModeIsNotAvailableYet() = server {
-        val r = client.postJson("/api/sessions", """{"serial":"emulator-5554","packageName":"dev.app","mode":"STARTUP"}""")
-        assertEquals(HttpStatusCode.NotImplemented, r.status)
-        assertEquals("startup recording not available yet", str(r.obj(), "error"))
+    // ---------------------------------------------------------------- startup recording
+
+    private val startupRuns = java.util.concurrent.CopyOnWriteArrayList<Pair<String, StartupConfig>>()
+    /** Fake recording: records its input; blocks until cancelled while [startupGate] is set, else completes. */
+    @Volatile private var startupGate: CountDownLatch? = null
+    private var startupRunner = StartupRunner { _, sessionId, config, job ->
+        startupRuns += sessionId to config
+        startupGate?.let { gate ->
+            while (!job.cancel.isCancelled && !gate.await(10, TimeUnit.MILLISECONDS)) { /* wait */ }
+            if (job.cancel.isCancelled) {
+                val e = DeviceException(DeviceException.Kind.CANCELLED, "Startup recording was cancelled", "The operation was cancelled.")
+                job.fail(e)
+                throw e
+            }
+        }
+        job.complete(sessionId)
+    }
+
+    private val startupBody = """{"serial":"emulator-5554","packageName":"dev.app","mode":"STARTUP"}"""
+
+    @Test fun startupModeCreatesTheSessionAndRunsTheRecordingAsAJob() = server {
+        val other = store.newAttachSession()
+        val body = """{"serial":"emulator-5554","packageName":"dev.app","mode":"STARTUP","startup":{
+            "processName":"dev.app:remote","launch":"-n dev.app/.Main --es actions x","milestoneTimeoutSec":30,
+            "milestones":[{"id":"custom:a.b.C#m","label":"C#m","hook":{"className":"a.b.C","methodName":"m"},"custom":true}]}}"""
+        val r = client.postJson("/api/sessions", body)
+        assertEquals(HttpStatusCode.OK, r.status, r.bodyAsText())
+        val o = r.obj()
+        val session = o["session"]!!.jsonObject
+        assertEquals("STARTUP", str(session, "mode"))
+        val job = client.waitJob(str(o, "jobId"))
+        assertEquals("DONE", str(job, "state"))
+        assertEquals(str(session, "id"), str(job, "resultRef"))
+        assertEquals(listOf("Prepare", "Launch app", "Attach debugger", "Dump: C#m", "Detach"), job["steps"]!!.jsonArray.map { str(it.jsonObject, "name") })
+        val (sid, config) = startupRuns.single()
+        assertEquals(str(session, "id"), sid)
+        assertEquals(StartupConfig(listOf(Milestones.parseCustom("a.b.C#m")), "dev.app:remote", "-n dev.app/.Main --es actions x", 30), config)
+        assertEquals(SessionMeta.State.ENDED, store.get(other.id)!!.state, "one active session at a time")
+    }
+
+    @Test fun startupWithoutConfigUsesTheDefaults() = server {
+        val r = client.postJson("/api/sessions", startupBody)
+        assertEquals(HttpStatusCode.OK, r.status, r.bodyAsText())
+        client.waitJob(str(r.obj(), "jobId"))
+        assertEquals(StartupConfig(), startupRuns.single().second)
+    }
+
+    @Test fun invalidStartupConfigIs400BeforeAnyDeviceCommand() = server {
+        for (startup in listOf(
+            """{"launch":"dev.app/.Main; reboot"}""",
+            """{"processName":"com.other"}""",
+            """{"milestones":[]}""",
+            """{"milestoneTimeoutSec":0}""",
+            """{"milestones":[{"id":"x","label":"x","hook":{"className":"nodots","methodName":"m"}}]}""",
+        )) {
+            val r = client.postJson("/api/sessions", """{"serial":"emulator-5554","packageName":"dev.app","mode":"STARTUP","startup":$startup}""")
+            assertEquals(HttpStatusCode.BadRequest, r.status, startup)
+            assertEquals("BAD_REQUEST", str(r.obj(), "kind"))
+        }
         assertTrue(store.list().isEmpty())
+        assertTrue(startupRuns.isEmpty())
         assertEquals(0, runner.count("shell", "run-as"), "nothing is checked or changed on the device")
+    }
+
+    @Test fun startupOfANonDebuggableAppIsRefusedWithoutASession() = server {
+        val r = client.postJson("/api/sessions", """{"serial":"emulator-5554","packageName":"dev.other","mode":"STARTUP"}""")
+        assertEquals(HttpStatusCode.BadGateway, r.status)
+        assertEquals("NOT_DEBUGGABLE", str(r.obj(), "kind"))
+        assertTrue(store.list().isEmpty())
+        assertTrue(startupRuns.isEmpty())
+    }
+
+    @Test fun whileARecordingRunsOtherSessionsAndDumpsAreRefusedAndCancelEndsIt() = server {
+        startupGate = CountDownLatch(1)
+        val o = client.postJson("/api/sessions", startupBody).obj()
+        val sid = str(o["session"]!!.jsonObject, "id")
+        val jobId = str(o, "jobId")
+        for (body in listOf(startupBody, """{"serial":"emulator-5554","packageName":"dev.app","mode":"ATTACH"}""")) {
+            val r = client.postJson("/api/sessions", body)
+            assertEquals(HttpStatusCode.Conflict, r.status)
+            assertEquals("STARTUP_RUNNING", str(r.obj(), "kind"))
+        }
+        val dump = client.postJson("/api/sessions/$sid/dump")
+        assertEquals(HttpStatusCode.Conflict, dump.status)
+        assertEquals("STARTUP_RUNNING", str(dump.obj(), "kind"))
+        assertEquals(1, store.list().size)
+
+        client.postJson("/api/jobs/$jobId/cancel")
+        assertEquals("CANCELLED", str(client.waitJob(jobId), "state"))
+        assertEquals(HttpStatusCode.OK, client.postJson("/api/sessions", startupBody).status, "a new recording may start once it ended")
+    }
+
+    @Test fun endingTheSessionCancelsItsRecording() = server {
+        startupGate = CountDownLatch(1)
+        val o = client.postJson("/api/sessions", startupBody).obj()
+        client.postJson("/api/sessions/${str(o["session"]!!.jsonObject, "id")}/end")
+        assertEquals("CANCELLED", str(client.waitJob(str(o, "jobId")), "state"))
+    }
+
+    @Test fun launcherComponentForTheDialogPlaceholder() = server {
+        val r = client.get("/api/devices/emulator-5554/apps/dev.app/launcher")
+        assertEquals(HttpStatusCode.OK, r.status, r.bodyAsText())
+        assertEquals("dev.app/.Main", str(r.obj(), "component"))
+        assertEquals(HttpStatusCode.BadRequest, client.get("/api/devices/emulator-5554/apps/x;y/launcher").status)
+    }
+
+    @Test fun defaultMilestonesAreServedForTheDialog() = server {
+        val r = client.get("/api/milestones/defaults")
+        assertEquals(HttpStatusCode.OK, r.status)
+        val list = r.array().map { it.jsonObject }
+        assertEquals(Milestones.defaults.map { it.id }, list.map { str(it, "id") })
+        assertEquals("Before Application.onCreate", str(list[1], "label"))
+        assertEquals("android.app.Instrumentation", str(list[1]["hook"]!!.jsonObject, "className"))
+    }
+
+    @Test fun recoverStaleAtStartClearsAMarkerLeftByACrash() {
+        store = SessionStore(home)
+        java.nio.file.Files.writeString(
+            home.resolve("pending-debug-app.json"),
+            """[{"serial":"emulator-5554","packageName":"dev.app","processName":"dev.app","released":true}]""",
+        )
+        val d = ServerDeps(store, { runner.adb }, opener)
+        recoverStaleDebugApps(d).join(10_000)
+        assertEquals(1, runner.count("shell", "am", "clear-debug-app"))
+        assertFalse(java.nio.file.Files.exists(home.resolve("pending-debug-app.json")))
+        d.close()
     }
 
     @Test fun malformedSessionRequestIs400() = server {

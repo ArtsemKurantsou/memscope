@@ -55,6 +55,7 @@ class FakeAdbRunner : ProcessRunner {
                 ProcessResult(0, "PID NAME\n" + processes.filter { it.endsWith(name) || it.contains("$name:") }.joinToString("\n"), "")
             }
             c[0] == "shell" && c[1] == "stat" -> ProcessResult(0, "$hprofSize\n", "")
+            c[0] == "shell" && c[1] == "cmd" && c.last() == "dev.app" -> ProcessResult(0, "priority=0\ndev.app/.Main\n", "")
             c[0] == "pull" -> {
                 val head = "JAVA PROFILE 1.0.3\u0000".toByteArray()
                 Files.write(Path.of(c[2]), head + ByteArray(hprofSize - head.size))

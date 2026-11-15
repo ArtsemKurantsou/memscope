@@ -1,6 +1,7 @@
 // Capture bar: device / app pickers, "Dump now", job stepper, snapshot selector.
 import * as api from './api.js';
 import { el, formatBytes, formatTime } from './util.js';
+import { askStartupConfig } from './startup.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -8,6 +9,9 @@ export function createCapture({ onSnapshot, onNoSnapshot, onEmptyState }) {
   const deviceSel = $('device-select');
   const appSel = $('app-select');
   const dumpBtn = $('dump-btn');
+  const startupBtn = $('startup-btn');
+  const procField = $('dump-process-field');
+  const procSel = $('dump-process');
   const jobPanel = $('job-panel');
   const snapSel = $('snapshot-select');
 
@@ -80,12 +84,31 @@ export function createCapture({ onSnapshot, onNoSnapshot, onEmptyState }) {
     setSelect(appSel, apps.map((a) => ({ value: a.packageName, label: `${a.packageName}${a.running ? '  ● running' : '  (not running)'}` })), '');
     if (apps.some((a) => a.packageName === prev)) appSel.value = prev;
     onEmptyState('ready');
+    renderProcesses();
     updateButtons();
   }
 
   function updateButtons() {
     dumpBtn.disabled = busy || !deviceSel.value || !appSel.value || deviceSel.disabled || appSel.disabled;
     dumpBtn.textContent = busy ? 'Working…' : 'Dump now';
+    startupBtn.disabled = dumpBtn.disabled;
+    procSel.disabled = busy;
+  }
+
+  /** Process names of the selected app (running ones from the app list), the package itself first. */
+  function processNames() {
+    const pkg = appSel.value;
+    const app = apps.find((a) => a.packageName === pkg);
+    return [...new Set([pkg, ...(app ? app.processes.map((p) => p.name) : [])])].filter(Boolean);
+  }
+
+  /** The process picker next to "Dump now" is shown only when the app has more than one process. */
+  function renderProcesses() {
+    const names = processNames();
+    const keep = procSel.value;
+    procField.hidden = names.length < 2;
+    procSel.replaceChildren(...names.map((n) => el('option', { value: n }, n)));
+    if (names.includes(keep)) procSel.value = keep;
   }
 
   // ------------------------------------------------------------ snapshots
@@ -163,13 +186,14 @@ export function createCapture({ onSnapshot, onNoSnapshot, onEmptyState }) {
     constructor(message, hint) { super(message); this.hint = hint; }
   }
 
-  /** Polls a job while rendering `groups` (earlier groups first); returns the final JobView. */
-  async function runJob(jobId, title, doneGroups) {
+  /** Polls a job while rendering `groups` (earlier groups first); returns the final JobView. `onJob` sees every update. */
+  async function runJob(jobId, title, doneGroups, onJob) {
     const cancel = async () => { try { await api.cancelJob(jobId); } catch { /* the next poll shows the outcome */ } };
     let latest = null;
     const j = await api.pollJob(jobId, (job) => {
       latest = job;
       renderPanel([...doneGroups, { title, job }], { cancel: job.state === 'RUNNING' ? cancel : null });
+      if (onJob) onJob(job);
     }, () => renderPanel([...doneGroups, { title, job: latest, pending: 'Waiting for the server\u2026' }],
       { cancel, note: 'Connection to MemScope lost, retrying\u2026 (the job keeps running on the server)' }));
     return j;
@@ -211,10 +235,62 @@ export function createCapture({ onSnapshot, onNoSnapshot, onEmptyState }) {
   const dumpNow = () => guarded(async (ctl) => {
     const serial = deviceSel.value;
     const pkg = appSel.value;
+    const process = procField.hidden ? pkg : (procSel.value || pkg);
     session = await ensureSession(serial, pkg);
-    const { jobId } = await api.dump(session.id);
-    await dumpFrom(jobId, pkg, ctl);
+    const { jobId } = await api.dump(session.id, process === pkg ? {} : { processName: process });
+    await dumpFrom(jobId, process, ctl);
   }, dumpNow);
+
+  // ------------------------------------------------------------ startup recording
+
+  const recordStartup = () => guarded(async (ctl) => {
+    const serial = deviceSel.value;
+    const pkg = appSel.value;
+    renderPanel([{ title: 'Record startup', job: null, pending: 'Loading the milestones…' }]);
+    const defaults = await api.milestoneDefaults();
+    hidePanel();
+    const config = await askStartupConfig({
+      pkg, processes: processNames(), defaults, launcher: api.launcher(serial, pkg).then((r) => r.component),
+    });
+    if (!config) return;
+    const title = `Record startup of ${config.processName || pkg}`;
+    renderPanel([{ title, job: null, pending: 'Starting the app under the debugger…' }]);
+    const started = await api.createStartupSession(serial, pkg, config);
+    session = started.session;
+    renderSnapshots();
+    await startupFrom(started.jobId, title, ctl);
+  }, recordStartup);
+
+  /** Every pulled milestone dump shows up in the snapshot selector at once; the newest one is opened at the end. */
+  async function startupFrom(jobId, title, ctl) {
+    ctl.retry = recordStartup;
+    const sid = session.id;
+    let pulled = 0;
+    const refresh = async () => {
+      try {
+        const s = await api.session(sid);
+        if (!session || session.id !== sid) return;
+        const keep = snapSel.value;
+        session = s;
+        renderSnapshots(s.snapshots.some((x) => x.id === keep) ? keep : lastOk(s)?.id);
+      } catch { /* the final refresh below reports problems */ }
+    };
+    const job = await runJob(jobId, title, [], (j) => {
+      const n = j.steps.filter((st) => st.name.startsWith('Dump: ') && st.state === 'DONE').length;
+      if (n !== pulled) { pulled = n; refresh(); }
+    });
+    session = await api.session(sid);
+    const last = lastOk(session);
+    renderSnapshots(last?.id);
+    const failure = job.state === 'DONE' ? null : failJob(job, 'Startup recording');
+    if (last) {
+      ctl.retry = failure ? recordStartup : () => retryOpen(last.id);
+      await analyse(sid, last.id, [{ title, job }]);
+    } else if (!failure) {
+      throw new PipelineError('The recording finished without a snapshot', 'Every milestone failed; see the steps above for the reasons.');
+    }
+    if (failure) { ctl.retry = recordStartup; throw failure; }
+  }
 
   const resumeDump = (jobId, pkg) => guarded((ctl) => dumpFrom(jobId, pkg, ctl), () => resumeDump(jobId, pkg));
 
@@ -268,6 +344,7 @@ export function createCapture({ onSnapshot, onNoSnapshot, onEmptyState }) {
 
   deviceSel.addEventListener('change', () => { session = null; renderSnapshots(); loadApps(false).catch(reportLoad); });
   appSel.addEventListener('change', async () => {
+    renderProcesses();
     updateButtons();
     // Switching app: show the active session's snapshots if it is for this app.
     let all;
@@ -278,6 +355,7 @@ export function createCapture({ onSnapshot, onNoSnapshot, onEmptyState }) {
   $('device-refresh').addEventListener('click', () => loadDevices().catch(reportLoad));
   $('app-refresh').addEventListener('click', () => loadApps(true).catch(reportLoad));
   dumpBtn.addEventListener('click', dumpNow);
+  startupBtn.addEventListener('click', recordStartup);
   snapSel.addEventListener('change', async () => {
     const meta = selectedSnapshotMeta();
     if (meta) await onSnapshot(session.id, meta);

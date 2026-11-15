@@ -183,3 +183,23 @@ table.fields td:first-child { word-break: normal; overflow-wrap: anywhere; min-w
 .search-list li.search-error { display: block; cursor: default; color: var(--err-ink); background: var(--err-bg); }
 .search-list li.search-error:hover { background: var(--err-bg); }
 .search-list li.search-error .btn { margin-top: 4px; }
+
+/* Record startup dialog (startup.js) */
+.dialog { width: min(640px, calc(100vw - 32px)); max-height: calc(100vh - 32px); overflow: auto; padding: 16px 20px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); color: var(--text); box-shadow: 0 12px 40px rgba(0,0,0,.35); }
+.dialog::backdrop { background: rgba(0,0,0,.35); }
+.dialog h2 { margin: 0 0 4px; font-size: 16px; }
+.dialog fieldset { border: 1px solid var(--border); border-radius: 6px; margin: 10px 0; padding: 6px 10px 8px; min-width: 0; }
+.dialog legend { color: var(--muted); font-size: 12px; padding: 0 4px; }
+.dialog input[type=text], .dialog input[type=number] { background: var(--panel); border: 1px solid var(--border); border-radius: 5px; padding: 4px 6px; min-width: 0; width: 100%; }
+.dialog input[type=number] { width: 90px; }
+.dialog .small { font-size: 11px; }
+.dlg-row { display: flex; gap: 8px; padding: 2px 0; white-space: normal; }
+.dlg-row .muted { margin-left: auto; }
+.dlg-inline { display: flex; gap: 6px; align-items: center; margin-top: 4px; }
+.dlg-list { list-style: none; margin: 0; padding: 0; }
+.dlg-list li { display: flex; gap: 8px; align-items: center; justify-content: space-between; padding: 2px 0; overflow-wrap: anywhere; }
+.dlg-grid { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 8px 12px; align-items: baseline; margin: 10px 0; }
+.dlg-grid > label { color: var(--muted); font-size: 12px; }
+.dlg-note { background: var(--info-bg); border-radius: 6px; padding: 8px 10px; margin: 10px 0; }
+.dlg-actions { justify-content: flex-end; }
+.jstep .jname { overflow-wrap: anywhere; }

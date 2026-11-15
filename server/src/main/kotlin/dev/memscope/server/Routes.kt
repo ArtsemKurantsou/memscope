@@ -2,9 +2,12 @@ package dev.memscope.server
 
 import dev.memscope.analysis.HprofUnreadableException
 import dev.memscope.capture.Job
+import dev.memscope.capture.Milestones
 import dev.memscope.capture.OnDemandDumper
 import dev.memscope.capture.SessionMeta
 import dev.memscope.capture.SnapshotMeta
+import dev.memscope.capture.StartupConfig
+import dev.memscope.capture.StartupSession
 import dev.memscope.device.DeviceException
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
@@ -93,6 +96,7 @@ fun Application.memscopeModule(deps: ServerDeps, allowedHosts: Set<String>) {
             }
             deviceRoutes(deps)
             sessionRoutes(deps)
+            milestoneRoutes()
             jobRoutes(deps)
             snapshotRoutes(deps)
         }
@@ -139,30 +143,78 @@ private fun Route.deviceRoutes(deps: ServerDeps) {
         val refresh = call.request.queryParameters["refresh"] == "1"
         call.respond(io { deps.apps(serial, refresh) })
     }
+    get("/devices/{serial}/apps/{pkg}/launcher") {
+        val serial = call.parameters["serial"]!!
+        val pkg = call.parameters["pkg"]!!
+        require(PACKAGE.matches(pkg)) { "invalid package name: $pkg" }
+        call.respond(LauncherDto(io { deps.adb.launcherComponent(serial, pkg) }))
+    }
 }
+
+private val PACKAGE = Regex("[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z0-9_]+)+")
 
 private val sessionLock = Any()
 
+/** A device has one debug app and the recorded app is held by the debugger: one recording at a time, no other session meanwhile. */
+private fun requireNoStartupRunning(deps: ServerDeps) {
+    val running = deps.runningStartup() ?: return
+    throw ApiException(
+        HttpStatusCode.Conflict, "A startup recording is still running (job ${running.job.id})",
+        "Wait until it has finished, or cancel it, then retry.", "STARTUP_RUNNING",
+    )
+}
+
+private fun Route.milestoneRoutes() {
+    get("/milestones/defaults") { call.respond(Milestones.defaults) }
+}
+
 private fun Route.sessionRoutes(deps: ServerDeps) {
     val store = deps.store
+
+    /** Ends the other ACTIVE sessions and creates this one; caller holds [sessionLock]. */
+    fun createExclusive(req: CreateSessionRequest): SessionMeta {
+        store.list().filter { it.state == SessionMeta.State.ACTIVE }.forEach { other ->
+            store.update(other.id) { it.copy(state = SessionMeta.State.ENDED) }
+        }
+        val created = store.create(req.serial, req.packageName, req.mode)
+        return req.appPackagePrefixes?.takeIf { it.isNotEmpty() }
+            ?.let { prefixes -> store.update(created.id) { it.copy(appPackagePrefixes = prefixes) } }
+            ?: created
+    }
+
+    /** STARTUP mode: answers `{session, jobId}`; the recording runs as a job on the worker pool. */
+    suspend fun ApplicationCall.startStartup(req: CreateSessionRequest) {
+        val config = req.startup ?: StartupConfig()
+        StartupSession.validate(config, req.packageName) // 400 before anything is checked or changed on the device
+        val started = io {
+            synchronized(sessionLock) { requireNoStartupRunning(deps) }
+            deps.awaitStaleRecovery()
+            deps.adb.requireDebuggable(req.serial, req.packageName) // before anything changes
+            synchronized(sessionLock) {
+                requireNoStartupRunning(deps)
+                val session = createExclusive(req)
+                val job = deps.jobs.create("Record startup of ${config.processName ?: req.packageName}", StartupSession.stepNames(config))
+                deps.setRunningStartup(ServerDeps.RunningStartup(session.id, job))
+                deps.jobs.submit(job) { deps.startupRunner.run(deps, session.id, config, job) }
+                StartupStarted(session, job.id)
+            }
+        }
+        respond(started)
+    }
 
     post("/sessions") {
         requireJson(call)
         val req = call.receive<CreateSessionRequest>()
         require(req.serial.isNotBlank() && req.packageName.isNotBlank()) { "serial and packageName are required" }
         if (req.mode == SessionMeta.Mode.STARTUP) {
-            throw ApiException(HttpStatusCode.NotImplemented, "startup recording not available yet", "Use ATTACH mode for now.", "NOT_IMPLEMENTED")
+            call.startStartup(req)
+            return@post
         }
         val session = io {
             deps.adb.requireDebuggable(req.serial, req.packageName) // before anything changes
             synchronized(sessionLock) {
-                store.list().filter { it.state == SessionMeta.State.ACTIVE }.forEach { other ->
-                    store.update(other.id) { it.copy(state = SessionMeta.State.ENDED) }
-                }
-                val created = store.create(req.serial, req.packageName, req.mode)
-                req.appPackagePrefixes?.takeIf { it.isNotEmpty() }
-                    ?.let { prefixes -> store.update(created.id) { it.copy(appPackagePrefixes = prefixes) } }
-                    ?: created
+                requireNoStartupRunning(deps)
+                createExclusive(req)
             }
         }
         call.respond(session)
@@ -173,6 +225,7 @@ private fun Route.sessionRoutes(deps: ServerDeps) {
     }
     post("/sessions/{id}/end") {
         val id = call.parameters["id"]!!
+        deps.runningStartup()?.takeIf { it.sessionId == id }?.job?.cancel?.cancel() // the recording detaches and cleans up
         call.respond(io { store.update(id) { it.copy(state = SessionMeta.State.ENDED) } })
     }
     post("/sessions/{id}/dump") {
@@ -183,6 +236,12 @@ private fun Route.sessionRoutes(deps: ServerDeps) {
         val session = io { store.get(id) } ?: throw notFound("Session")
         if (session.state != SessionMeta.State.ACTIVE) {
             throw ApiException(HttpStatusCode.Conflict, "Session ${session.id} has ended", "Start a new session to capture more snapshots.", "SESSION_ENDED")
+        }
+        if (deps.runningStartup()?.sessionId == id) {
+            throw ApiException(
+                HttpStatusCode.Conflict, "The startup recording of this session is still running",
+                "Wait until it has finished (or cancel it), then dump.", "STARTUP_RUNNING",
+            )
         }
         val process = req.processName?.takeIf { it.isNotBlank() } ?: session.packageName
         val label = req.label?.takeIf { it.isNotBlank() } ?: "Snapshot ${session.snapshots.size + 1}"
