@@ -18,6 +18,20 @@ class SessionStoreTest {
     private fun snap(id: String) = SnapshotMeta(id, "label $id", null, "dev.app", 1L, "$id.hprof", 10, SnapshotMeta.Status.OK)
 
     @Test
+    fun `screen size is optional and survives a round trip`() {
+        val store = SessionStore(tmp)
+        val s = store.create("emulator-5554", "dev.app", SessionMeta.Mode.ATTACH)
+        assertNull(s.screenWidthPx)
+        store.update(s.id) { it.copy(screenWidthPx = 1080, screenHeightPx = 2400) }
+        assertEquals(1080 to 2400, SessionStore(tmp).get(s.id)!!.let { it.screenWidthPx to it.screenHeightPx })
+        // a session.json written before the fields existed still loads
+        val dir = store.dir(s.id)
+        val old = Files.readString(dir.resolve("session.json")).lines().filterNot { "screen" in it }.joinToString("\n").replace(Regex(",(\\s*)\\}\\s*\$"), "$1}")
+        Files.writeString(dir.resolve("session.json"), old)
+        assertNull(SessionStore(tmp).get(s.id)!!.screenWidthPx)
+    }
+
+    @Test
     fun `session round-trips through disk`() {
         val store = SessionStore(tmp)
         val s = store.create("emulator-5554", "dev.app", SessionMeta.Mode.ATTACH)

@@ -39,3 +39,13 @@ tasks.register<JavaExec>("perfSnapshot") {
     val hprof = providers.gradleProperty("hprof")
     doFirst { args(hprof.orNull ?: throw GradleException("pass -Phprof=<heap dump>")) }
 }
+
+// Writes a demo MEMSCOPE_HOME with synthetic snapshots for browser checks: ./gradlew :analysis:demoHome -PdemoHome=<dir>
+tasks.register<JavaExec>("demoHome") {
+    group = "verification"
+    description = "Writes a session of synthetic snapshots into -PdemoHome=<dir>."
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("dev.memscope.analysis.findings.FindingsDemoMainKt")
+    val home = providers.gradleProperty("demoHome")
+    doFirst { args(home.orNull ?: throw GradleException("pass -PdemoHome=<dir>")) }
+}

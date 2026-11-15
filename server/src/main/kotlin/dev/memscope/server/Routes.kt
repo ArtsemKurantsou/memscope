@@ -53,9 +53,9 @@ import java.nio.file.Files
 /** An error with a fixed HTTP status, rendered as `{error, hint, kind}`. */
 class ApiException(val status: HttpStatusCode, message: String, val hint: String, val kind: String) : Exception(message)
 
-private fun notFound(what: String) = ApiException(HttpStatusCode.NotFound, "$what not found", "Check the id; sessions and jobs from an earlier run may be gone.", "NOT_FOUND")
+internal fun notFound(what: String) = ApiException(HttpStatusCode.NotFound, "$what not found", "Check the id; sessions and jobs from an earlier run may be gone.", "NOT_FOUND")
 
-private fun unreadable(message: String) = ApiException(
+internal fun unreadable(message: String) = ApiException(
     HttpStatusCode.UnprocessableEntity, message,
     "The heap dump is truncated or corrupt. Capture a new snapshot and open that instead.", "UNREADABLE",
 )
@@ -111,6 +111,7 @@ fun Application.memscopeModule(deps: ServerDeps, allowedHosts: Set<String>) {
             milestoneRoutes()
             jobRoutes(deps)
             snapshotRoutes(deps)
+            findingsRoutes(deps)
         }
         staticResources("/", "ui")
     }
@@ -186,7 +187,10 @@ private fun Route.sessionRoutes(deps: ServerDeps) {
             store.update(other.id) { it.copy(state = SessionMeta.State.ENDED) }
             deps.stopPolling(other.id)
         }
-        val created = store.create(req.serial, req.packageName, req.mode)
+        var created = store.create(req.serial, req.packageName, req.mode)
+        // The screen size is what the oversized-bitmap rule compares against; best effort, the rule falls back to 1080x2400.
+        val screen = try { deps.adb.screenSize(req.serial) } catch (e: Exception) { null }
+        if (screen != null) created = store.update(created.id) { it.copy(screenWidthPx = screen.width, screenHeightPx = screen.height) }
         return req.appPackagePrefixes?.takeIf { it.isNotEmpty() }
             ?.let { prefixes -> store.update(created.id) { it.copy(appPackagePrefixes = prefixes) } }
             ?: created
@@ -388,6 +392,8 @@ private fun Route.snapshotRoutes(deps: ServerDeps) {
                             started = true // runAnalysis starts its thread at once; that thread completes `mine`
                             val view = runAnalysis(created, mine) { progress -> deps.opener.open(file.toFile(), session.appPackagePrefixes, progress) }
                             deps.snapshots.put(key, view)
+                            // The session rules read this summary instead of opening the snapshot.
+                            try { deps.snapshots.use(key) { it.snapshotSummary() } } catch (e: Exception) { ServerLog.error("could not summarise $key: ${e.message}") }
                             created.complete(key)
                             deps.jobs.background { warmUp(deps, key) }
                         } catch (e: HprofUnreadableException) {

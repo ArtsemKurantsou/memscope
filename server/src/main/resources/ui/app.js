@@ -8,6 +8,7 @@ import { createSearch } from './search.js';
 import { createTimeline } from './timeline.js';
 import { createClasses } from './classes.js';
 import { createCompare } from './compare.js';
+import { createFindings } from './findings.js';
 import { el, formatBytes, formatInt, formatDeltaBytes, indexDiff, prefs } from './util.js';
 
 const $ = (id) => document.getElementById(id);
@@ -22,6 +23,7 @@ const state = {
   query: null,     // class name of the active search, or null
   loadToken: 0,
   tab: 'tree',
+  session: null,   // SessionMeta of the session on screen
   base: null,      // SnapshotMeta compared against, or null
   diff: null,      // indexed DiffResult of (open snapshot, base), or null
   diffKey: null,   // "snap|base" of the diff loaded or loading
@@ -153,6 +155,39 @@ const classesView = createClasses({
 
 const compare = createCompare({ box: $('compare-on'), select: $('compare-select'), onChange: (meta) => applyBase(meta) });
 
+/** "Show in tree" of a finding: switch to its snapshot if needed, then reveal the object. */
+async function showInTree(ref, snapshotId) {
+  if (snapshotId && state.snap && snapshotId !== state.snap.snap) await capture.selectSnapshot(snapshotId);
+  setTab('tree');
+  await revealRef(ref);
+}
+
+/** Opens (analyses) each snapshot in turn so its summary exists for the cross-snapshot rules. */
+async function analyseAll(ids, onProgress) {
+  for (let i = 0; i < ids.length; i++) {
+    onProgress(i + 1, ids.length);
+    const { jobId } = await api.openSnapshot(state.session.id, ids[i]);
+    const j = await api.pollJob(jobId, () => {});
+    if (j.state !== 'DONE') throw new api.ApiError(500, { error: j.errorMessage || `Analysing ${ids[i]} failed`, hint: j.errorHint || '', kind: 'JOB_FAILED' });
+  }
+}
+
+function setFindingsBadge(counts) {
+  const b = $('findings-badge');
+  b.hidden = !counts;
+  if (!counts) return;
+  b.replaceChildren(String(counts.total), counts.high ? el('b', { class: 'badge-high' }, ` \u00b7 ${counts.high} high`) : null);
+  b.title = counts.total ? `${counts.total} finding${counts.total === 1 ? '' : 's'}, ${counts.high} high severity` : 'No findings';
+}
+
+const findingsView = createFindings({
+  container: $('findings'),
+  getSession: () => state.session,
+  onShow: showInTree,
+  onBadge: setFindingsBadge,
+  onAnalyseAll: analyseAll,
+});
+
 function setHideSystem(on) {
   state.hideSystem = on;
   hideBox.checked = on;
@@ -174,20 +209,23 @@ myCodeBox.addEventListener('change', () => {
 
 function setTab(name) {
   state.tab = name;
-  const classes = name === 'classes';
-  $('tab-tree').classList.toggle('active', !classes);
-  $('tab-tree').setAttribute('aria-selected', String(!classes));
-  $('tab-classes').classList.toggle('active', classes);
-  $('tab-classes').setAttribute('aria-selected', String(classes));
-  $('tree').hidden = classes;
-  $('classes').hidden = !classes;
-  $('search-banner').hidden = classes || !state.query;
-  document.querySelector('.search').hidden = classes;
-  document.querySelector('.main').classList.toggle('classes-mode', classes);
-  if (classes) loadClassesView();
+  for (const t of ['tree', 'classes', 'findings']) {
+    $('tab-' + t).classList.toggle('active', t === name);
+    $('tab-' + t).setAttribute('aria-selected', String(t === name));
+  }
+  const wide = name !== 'tree';
+  $('tree').hidden = wide;
+  $('classes').hidden = name !== 'classes';
+  $('findings').hidden = name !== 'findings';
+  $('search-banner').hidden = wide || !state.query;
+  document.querySelector('.search').hidden = wide;
+  document.querySelector('.main').classList.toggle('classes-mode', wide);
+  if (name === 'classes') loadClassesView();
+  if (name === 'findings') findingsView.show();
 }
 $('tab-tree').addEventListener('click', () => setTab('tree'));
 $('tab-classes').addEventListener('click', () => setTab('classes'));
+$('tab-findings').addEventListener('click', () => setTab('findings'));
 
 /** Fills the Classes tab with the open snapshot's classes (once per snapshot). */
 async function loadClassesView() {
@@ -286,6 +324,8 @@ async function openSnapshot(sid, meta) {
   state.diffLoading = false;
   state.diffError = null;
   state.diffToken++;
+  findingsView.setSnapshot(state.snap);
+  if (state.tab === 'findings') findingsView.show();
   state.query = null;
   $('search').value = '';
   $('search').disabled = false;
@@ -370,7 +410,7 @@ const timeline = createTimeline({ container: $('timeline'), onSelectSnapshot: (i
 
 const capture = createCapture({
   onSnapshot: openSnapshot,
-  onSession: (s) => { timeline.setSession(s); compare.setSession(s); },
+  onSession: (s) => { state.session = s; timeline.setSession(s); compare.setSession(s); },
   onNoSnapshot: () => {},
   onEmptyState,
 });

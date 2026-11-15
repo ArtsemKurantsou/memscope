@@ -6,6 +6,7 @@ import { shareInFlight, formatBytes, formatPercent, splitClassName, refKind, has
 import { downsample, niceStep, timeStep, heldBands, capSamples, nearestIndex } from './timeline.js';
 import { buildRows, sortAndFilter } from "./classes.js";
 import { formatDeltaBytes, formatDeltaInt, indexDiff, rootDelta, rootLabelOf } from "./util.js";
+import { groupBySeverity, badgeCounts, runningStepText } from "./findings.js";
 const out = document.getElementById('out');
 let fails = 0;
 function eq(name, got, want) {
@@ -99,6 +100,14 @@ eq('nearestIndex', [nearestIndex([smp(0, 1), smp(1000, 1), smp(2000, 1)], 1400),
   eq("deeper rows have no root label", rootLabelOf({ kind: "OBJECT", label: "x.Y" }), null);
   eq("indexDiff fills omitted zeros", indexDiff({ classes: [{ className: "a.B", countAfter: 2 }], roots: [{ label: "x", retainedAfter: 5 }] }).classByName.get("a.B"), { isAppCode: false, countBefore: 0, countAfter: 2, shallowBefore: 0, shallowAfter: 0, retainedBefore: 0, retainedAfter: 0, appCountBefore: 0, appCountAfter: 0, appShallowBefore: 0, appShallowAfter: 0, appRetainedBefore: 0, appRetainedAfter: 0, className: "a.B" });
   eq("root delta app / all", [rootDelta(diff, "Static fields", true), rootDelta(diff, "Static fields", false), rootDelta(diff, "nope", true)], [5, 40, null]);
+}
+{
+  const fs = [{ severity: "LOW", title: "c" }, { severity: "HIGH", title: "a" }, { severity: "MEDIUM", title: "b" }, { severity: "HIGH", title: "d" }];
+  eq("findings grouped high to low, empty groups omitted", groupBySeverity(fs).map((g) => [g.key, g.items.map((f) => f.title)]), [["HIGH", ["a", "d"]], ["MEDIUM", ["b"]], ["LOW", ["c"]]]);
+  eq("only-low findings give one group", groupBySeverity([fs[0]]).map((g) => g.key), ["LOW"]);
+  eq("badge counts", badgeCounts(fs), { total: 4, high: 2 });
+  eq("running step text", runningStepText({ steps: [{ name: "x", state: "DONE" }, { name: "duplicate-strings", state: "PENDING", detail: "running" }] }), "Scanning the heap dump for duplicate strings");
+  eq("no running step", runningStepText({ steps: [] }), "Starting");
 }
 out.textContent += fails ? '\n' + fails + ' FAILED' : '\nALL PASSED';
 document.title = fails ? 'selftest FAIL' : 'selftest OK';

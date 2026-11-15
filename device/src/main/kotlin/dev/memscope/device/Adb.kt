@@ -175,6 +175,12 @@ class Adb(val adbPath: Path, val runner: ProcessRunner = RealProcessRunner()) {
         return result.stdout.lineSequence().map { it.trim() }.lastOrNull { it.contains('/') && !it.contains(' ') }
     }
 
+    /** The device screen size from `wm size`, or null if it cannot be read (never throws for a failed command). */
+    fun screenSize(serial: String): ScreenPx? {
+        val result = shell(serial, listOf("wm", "size"))
+        return if (result.exitCode == 0) parseWmSize(result.stdout) else null
+    }
+
     // -- internals --
 
     private fun adbRun(

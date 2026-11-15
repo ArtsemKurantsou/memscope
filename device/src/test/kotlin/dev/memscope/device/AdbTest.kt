@@ -222,3 +222,19 @@ class AdbTest {
         assertEquals(listOf(adbPath.toString(), "-s", "s", "track-jdwp"), fake.calls[0])
     }
 }
+
+class WmSizeTest {
+    @Test
+    fun `physical size`() = assertEquals(ScreenPx(1080, 2400), parseWmSize("Physical size: 1080x2400\n"))
+
+    @Test
+    fun `override size wins`() =
+        assertEquals(ScreenPx(720, 1600), parseWmSize("Physical size: 1080x2400\nOverride size: 720x1600\r\n"))
+
+    @Test
+    fun `garbage gives null`() {
+        assertNull(parseWmSize(""))
+        assertNull(parseWmSize("Physical size: unknown\n"))
+        assertNull(parseWmSize("Physical size: 0x0\n"))
+    }
+}

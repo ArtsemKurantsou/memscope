@@ -66,6 +66,8 @@ export const launcher = (serial, pkg) => get(`/api/devices/${encodeURIComponent(
 export const job = (id) => get(`/api/jobs/${id}`);
 export const cancelJob = (id) => post(`/api/jobs/${id}/cancel`);
 export const openSnapshot = (sid, snap) => post(`/api/snapshots/${sid}/${snap}/open`);
+/** Findings of the session rules over the per-snapshot summaries: { findings, pending }. */
+export const sessionFindings = (id) => get(`/api/sessions/${id}/findings`);
 
 /** Polls a job every 500 ms, calling onUpdate with each JobView, until it leaves RUNNING. onLost(n) is called while the server is unreachable. */
 export async function pollJob(jobId, onUpdate, onLost) {
@@ -141,6 +143,8 @@ export function snapshotApi(sid, snap) {
     reveal: (ref) => call('/reveal' + q({ ref })),
     indexInParent: (parent, child) => call('/indexInParent' + q({ parent, child })),
     classes: () => call('/classes'),
+    /** { findings } once computed, else { jobId } of the job computing them (poll it, then ask again). */
+    findings: () => call('/findings'),
     instances: (cls, offset = 0, limit = 25) => call('/instances' + q({ class: cls, offset, limit })),
     diff: (baseId, isCurrent) => diff(sid, snap, baseId, isCurrent),
   };

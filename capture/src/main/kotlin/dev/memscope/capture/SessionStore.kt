@@ -44,6 +44,9 @@ data class SessionMeta(
     val snapshots: List<SnapshotMeta>,
     val state: State,
     val note: String? = null,
+    /** Device screen in pixels (`wm size`) when the session was created; null if it could not be read. */
+    val screenWidthPx: Int? = null,
+    val screenHeightPx: Int? = null,
 ) {
     enum class Mode { ATTACH, STARTUP }
     enum class State { ACTIVE, ENDED }

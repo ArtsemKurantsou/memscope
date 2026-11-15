@@ -6,6 +6,7 @@
 #   name actions  -> analysis/build/test-dumps/<name>.hprof after launching with --es actions <actions>
 #   diff          -> fixture-before.hprof (plain launch) and fixture-after.hprof (the same process after a
 #                    broadcast of grow x5 and static_cache), for the snapshot diff tests
+#   grow          -> fixture-grow-1/2/3.hprof of one process after 1, 3 and 5 `grow` broadcasts (Growth.list 1, 3, 5 MB)
 # Env: MEMSCOPE_SERIAL (default emulator-5554), READY_TIMEOUT seconds (default 120).
 #
 # The fixture app must already be installed (fixture-app/build-and-install.sh emulator-5554).
@@ -22,7 +23,7 @@ pkg="dev.memscope.fixture"
 mode="single"
 name="fixture-basic"
 actions="leak_activity,dup_strings,dup_bitmaps,big_bitmap,sparse_list,static_cache,shared"
-if [ "${1:-}" = "diff" ]; then mode="diff"; elif [ $# -ge 2 ]; then name="$1"; actions="$2"; fi
+if [ "${1:-}" = "diff" ]; then mode="diff"; elif [ "${1:-}" = "grow" ]; then mode="grow"; elif [ $# -ge 2 ]; then name="$1"; actions="$2"; fi
 
 adb=""
 for sdk in "$HOME/Library/Android/sdk" "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}"; do
@@ -69,7 +70,19 @@ dump() {
 
 a shell am force-stop "$pkg"
 a logcat -c
-if [ "$mode" = "diff" ]; then
+if [ "$mode" = "grow" ]; then
+  a shell am start -n "$pkg/.MainActivity" >/dev/null
+  wait_ready
+  n=1
+  for count in 1 2 2; do
+    a logcat -c
+    broadcast_actions="grow"; i=1; while [ $i -lt $count ]; do broadcast_actions="$broadcast_actions,grow"; i=$((i+1)); done
+    a shell am broadcast -a dev.memscope.fixture.ACTION --es actions "$broadcast_actions" -p "$pkg" >/dev/null
+    wait_ready
+    dump "fixture-grow-$n"
+    n=$((n+1))
+  done
+elif [ "$mode" = "diff" ]; then
   a shell am start -n "$pkg/.MainActivity" >/dev/null
   wait_ready
   dump fixture-before

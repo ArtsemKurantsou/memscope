@@ -312,3 +312,31 @@ table.fields td:first-child { word-break: normal; overflow-wrap: anywhere; min-w
 .main.classes-mode .treepane { border-right: 0; }
 @media (max-width: 1000px) { .main.classes-mode { grid-template-rows: minmax(260px, 1fr); } .compare select { max-width: 200px; } }
 .tree:not(.diff) .tree-head .c-dl { display: none; }
+
+/* findings tab */
+.badge { display: inline-block; min-width: 18px; padding: 0 6px; border-radius: 9px; background: var(--panel2); border: 1px solid var(--border); font-size: 11px; line-height: 16px; text-align: center; margin-left: 4px; }
+.badge-high { color: var(--hot); font-weight: 700; }
+.findings { flex: 1; min-height: 0; overflow: auto; padding: 12px 14px 24px; background: var(--bg); }
+.findings[hidden] { display: none; }
+.fsection > h2, .findings .empty h2 { font-size: 15px; margin: 6px 0 8px; }
+.fgroup-title { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 14px 0 6px; }
+.fcard { background: var(--panel); border: 1px solid var(--border); border-left: 4px solid var(--cool); border-radius: 6px; padding: 10px 12px; margin: 0 0 10px; max-width: 980px; }
+.fcard.sev-high { border-left-color: var(--hot); }
+.fcard.sev-medium { border-left-color: var(--warm); }
+.fhead { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.ftitle { font-size: 14px; margin: 0; flex: 1 1 320px; min-width: 0; overflow-wrap: anywhere; }
+.fsize { color: var(--muted); white-space: nowrap; }
+.chip { flex: none; font-size: 11px; font-weight: 700; letter-spacing: .05em; border-radius: 3px; padding: 1px 6px; border: 1px solid currentColor; }
+.chip.sev-high { color: var(--hot); }
+.chip.sev-medium { color: var(--warm); }
+.chip.sev-low { color: var(--muted); }
+.fsnap { font-size: 12px; margin-top: 2px; }
+.ev-label { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin-top: 8px; }
+.ev-details { margin-top: 8px; }
+.ev-details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+.evidence { margin: 4px 0 0; padding: 8px; background: var(--panel2); border: 1px solid var(--border); border-radius: 4px; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 260px; overflow: auto; }
+.fsuggest { margin: 8px 0 0; }
+.factions { margin-top: 8px; display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.ferr { color: var(--err-ink); font-size: 12px; }
+.fpending { background: var(--info-bg); border: 1px solid var(--border); border-radius: 5px; padding: 8px 10px; margin: 0 0 10px; max-width: 980px; }
+@media (max-width: 1000px) { .findings { padding: 10px 8px 20px; } }

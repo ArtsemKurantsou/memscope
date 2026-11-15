@@ -46,7 +46,7 @@
     <div class="tabs" role="tablist">
       <button class="tab active" role="tab" aria-selected="true" id="tab-tree" type="button">Tree</button>
       <button class="tab" role="tab" aria-selected="false" id="tab-classes" type="button">Classes</button>
-      <span class="soon" title="Coming in a later step"><button class="tab" role="tab" aria-disabled="true" disabled type="button">Findings</button></span>
+      <button class="tab" role="tab" aria-selected="false" id="tab-findings" type="button">Findings <span id="findings-badge" class="badge" hidden></span></button>
     </div>
     <div class="controls">
       <div class="search">
@@ -65,6 +65,7 @@
       <div id="search-banner" class="search-banner" hidden></div>
       <div id="tree" class="tree"></div>
       <div id="classes" class="classes" hidden></div>
+      <div id="findings" class="findings" hidden></div>
     </section>
     <aside id="details" class="details" aria-label="Details"></aside>
   </main>
