@@ -21,6 +21,10 @@ data class PendingDebugApp(
     val forwardPort: Int? = null,
     /** True once the process got past `waitForDebugger`; a process that never did is frozen and must be stopped. */
     val released: Boolean = false,
+    /** True from just before `am start`: from then on a process may wait for the debugger even before its pid is known. */
+    val launched: Boolean = false,
+    /** A dump file on the device that has not been removed yet. */
+    val pendingDump: String? = null,
 )
 
 /**
@@ -34,6 +38,9 @@ class DebugAppGuard(private val adb: Adb, private val home: Path) {
 
     /** Writes the marker, then `am set-debug-app -w <processName>` (one-shot: only that process waits). Throws if adb fails; the marker stays. */
     fun arm(serial: String, packageName: String, processName: String = packageName) {
+        DeviceArgs.requireSerial(serial)
+        DeviceArgs.requirePackage(packageName)
+        DeviceArgs.requireProcessName(processName)
         synchronized(lock) { write(read().filter { it.serial != serial } + PendingDebugApp(serial, packageName, processName)) }
         val result = adb.shell(serial, listOf("am", "set-debug-app", "-w", processName), 15.seconds)
         if (result.exitCode != 0) {
@@ -97,19 +104,41 @@ class DebugAppGuard(private val adb: Adb, private val home: Path) {
 
     private fun recover(entry: PendingDebugApp, log: MutableList<String>) {
         val serial = entry.serial
+        if (runCatching { DeviceArgs.requirePackage(entry.packageName); DeviceArgs.requireProcessName(entry.processName) }.isFailure) {
+            log += "Ignored a malformed debug-app marker for $serial (${entry.packageName} / ${entry.processName}); clearing the debug app only."
+            disarm(serial)
+            return
+        }
         entry.forwardPort?.let { port ->
             try { adb.removeForward(serial, port) } catch (_: DeviceException) { /* already gone */ }
         }
-        val pid = entry.pid
-        if (pid != null && !entry.released) {
-            val cmdline = adb.shell(serial, listOf("cat", "/proc/$pid/cmdline"), 10.seconds)
-            if (cmdline.exitCode == 0 && cmdline.stdout.substringBefore('\u0000').trim() == entry.processName) {
-                adb.shell(serial, listOf("am", "force-stop", entry.packageName), 15.seconds)
-                log += "Stopped ${entry.packageName} on $serial: it was still waiting for a debugger after an interrupted startup recording."
+        if ((entry.launched || entry.pid != null) && !entry.released && frozenProcessAlive(entry)) {
+            adb.shell(serial, listOf("am", "force-stop", entry.packageName), 15.seconds)
+            log += "Stopped ${entry.packageName} on $serial: it was still waiting for a debugger after an interrupted startup recording."
+        }
+        entry.pendingDump?.let { path ->
+            if (dumpPath(entry.packageName).matches(path)) {
+                adb.shell(serial, listOf("run-as", entry.packageName, "rm", "-f", path), 15.seconds)
+                log += "Removed the heap dump $path left on $serial by an interrupted startup recording."
+            } else {
+                log += "Ignored pending dump '$path' in the marker: it is not a MemScope dump path."
             }
         }
         disarm(serial)
         log += "Debug app ${entry.processName} on $serial cleared after an interrupted startup recording."
+    }
+
+    /**
+     * Whether the profiled process of [entry] still runs: by its recorded pid (name must match, so a reused pid is not
+     * stopped), or, when the pid was never learned, by its name in the process list.
+     */
+    private fun frozenProcessAlive(entry: PendingDebugApp): Boolean {
+        val pid = entry.pid
+        if (pid != null) {
+            val cmdline = adb.shell(entry.serial, listOf("cat", "/proc/$pid/cmdline"), 10.seconds)
+            return cmdline.exitCode == 0 && cmdline.stdout.substringBefore('\u0000').trim() == entry.processName
+        }
+        return adb.processes(entry.serial, entry.packageName).any { it.name == entry.processName }
     }
 
     private fun output(stderr: String, stdout: String) = stderr.trim().ifEmpty { stdout.trim() }.take(300)
@@ -137,6 +166,8 @@ class DebugAppGuard(private val adb: Adb, private val home: Path) {
 
     private companion object {
         const val MARKER = "pending-debug-app.json"
+        /** The only remote path a marker may name for removal (it is read back from a file and goes to `adb shell`). */
+        fun dumpPath(pkg: String) = Regex("/data/data/${Regex.escape(pkg)}/cache/memscope-[A-Za-z0-9_-]+\\.hprof")
         val json = Json { prettyPrint = true; ignoreUnknownKeys = true; encodeDefaults = true }
     }
 }

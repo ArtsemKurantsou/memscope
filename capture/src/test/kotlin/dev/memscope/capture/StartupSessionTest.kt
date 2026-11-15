@@ -32,6 +32,7 @@ class StartupSessionTest {
         store = SessionStore(tmp)
         guard = DebugAppGuard(device.adb, tmp)
         session = store.create(device.serial, device.pkg, SessionMeta.Mode.STARTUP)
+        vm.onDisconnected = { device.pidAlive = false } // by default a lost VM means the process died
     }
 
     private fun startup(timeouts: StartupTimeouts = fast, onDone: (Milestone) -> Unit = {}) =
@@ -150,6 +151,7 @@ class StartupSessionTest {
             StartupConfig(processName = "dev.app:remote x"),
             StartupConfig(milestones = Milestones.defaults.map { it.copy(enabled = false) }),
             StartupConfig(milestoneTimeoutSec = 0),
+            StartupConfig(customGraceSec = 0),
         )) {
             device.calls.clear()
             val job = newJob(bad)
@@ -202,6 +204,33 @@ class StartupSessionTest {
         if (where != "mkdir") assertCleanDevice() else assertEquals(0, device.count("shell am set-debug-app"))
         assertEquals(Job.StepState.DONE, step(job, StartupSession.DETACH).state)
         assertTrue(stored().snapshots.isEmpty())
+        if (where in setOf("no-pid", "am-start-error", "forward", "attach", "events", "wait-arm")) {
+            // launched but never past waitForDebugger: the app would stay frozen, pid known or not
+            assertEquals(2, device.count("shell am force-stop dev.app"), "$where: ${device.allCommands()}")
+        }
+    }
+
+    @Test
+    fun `cancel while waiting for the pid force-stops the launched app`() {
+        device.targetName = "dev.app:never"
+        val job = newJob()
+        device.onShell["am start"] = { job.cancel.cancel() }
+        runFailing(job = job)
+        assertEquals(Job.State.CANCELLED, job.snapshot().state)
+        assertEquals(2, device.count("shell am force-stop dev.app"), device.allCommands().toString())
+        assertCleanDevice()
+    }
+
+    @Test
+    fun `the marker records launch before am start and the dump path while a dump is on the device`() {
+        vm.defaultScript()
+        var launchedAtStart = false
+        device.onShell["am start"] = { launchedAtStart = guard.pending().single().launched }
+        val seen = mutableListOf<String?>()
+        vm.dumpResult = { _ -> seen += guard.pending().single().pendingDump; null }
+        runOk()
+        assertTrue(launchedAtStart)
+        assertEquals((1..5).map { "/data/data/dev.app/cache/memscope-${session.id}-s$it.hprof" }, seen)
     }
 
     @Test
@@ -357,6 +386,75 @@ class StartupSessionTest {
         guard.recoverStale()
         assertTrue(guard.pending().isEmpty())
         assertEquals(1, device.count("shell am clear-debug-app"))
+        assertEquals(1, device.count("shell run-as dev.app rm -f /data/data/dev.app/cache/memscope-${session.id}-s1.hprof"), "the orphan dump is removed")
+    }
+
+    @Test
+    fun `lost debugger connection while the app lives is not an app exit`() {
+        vm.onDisconnected = {} // the process survives
+        vm.script += listOf(DebugEvent.WaitReturned(vm.main))
+        vm.script += listOf(DebugEvent.Disconnected)
+        val job = newJob()
+        val e = runFailing(job = job) as DeviceException
+        assertTrue("connection" in e.message!!.lowercase(), e.message)
+        assertTrue(e.hint.isNotBlank())
+        assertEquals(SessionMeta.State.ACTIVE, stored().state)
+        assertNull(stored().note)
+        assertEquals(1, stored().snapshots.size)
+        assertTrue("connection" in step(job, "Dump: Before Application.onCreate").detail!!)
+        assertEquals(1, device.count("shell am force-stop dev.app"), "released: the app runs normally, leave it")
+        assertCleanDevice()
+    }
+
+    @Test
+    fun `lost debugger connection before the app was released force-stops the frozen app`() {
+        vm.onDisconnected = {}
+        vm.script += listOf(DebugEvent.Disconnected)
+        runFailing()
+        assertEquals(SessionMeta.State.ACTIVE, stored().state)
+        assertEquals(2, device.count("shell am force-stop dev.app"), device.allCommands().toString())
+        assertCleanDevice()
+    }
+
+    @Test
+    fun `a custom hook whose class never loads gets a hint after a short grace and does not fail the session`() {
+        vm.defaultScript()
+        vm.hookStatus = { key, _ -> if (key.startsWith("custom:")) HookStatus.Deferred else HookStatus.Resolved }
+        val typo = Milestones.parseCustom("dev.app.LeakyActivty#onCreate")
+        val config = StartupConfig(Milestones.defaults + typo, milestoneTimeoutSec = 60, customGraceSec = 1)
+        val t0 = System.nanoTime()
+        val job = runOk(config)
+        assertTrue((System.nanoTime() - t0) / 1_000_000 < 5_000, "the grace period, not the 60 s timeout")
+        assertEquals(Job.State.DONE, job.snapshot().state)
+        assertEquals(session.id, job.snapshot().resultRef)
+        val s = step(job, "Dump: LeakyActivty#onCreate")
+        assertEquals(Job.StepState.FAILED, s.state)
+        assertTrue("dev.app.LeakyActivty was never loaded" in s.detail!! && "check class and method name" in s.detail!!, s.detail)
+        assertEquals(5, stored().snapshots.size)
+        assertCleanDevice()
+    }
+
+    @Test
+    fun `a loaded custom hook that is not hit still gets the full milestone timeout and fails`() {
+        vm.defaultScript()
+        val custom = Milestones.parseCustom("dev.app.Foo#bar") // Resolved: its class is loaded
+        val config = StartupConfig(Milestones.defaults + custom, milestoneTimeoutSec = 2, customGraceSec = 1)
+        val job = newJob(config)
+        val t0 = System.nanoTime()
+        val e = runFailing(config, job) as DeviceException
+        assertTrue((System.nanoTime() - t0) / 1_000_000 >= 2_000, "full timeout, not the grace")
+        assertEquals(DeviceException.Kind.TIMEOUT, e.kind)
+        assertEquals("not reached within 2 s", step(job, "Dump: Foo#bar").detail)
+    }
+
+    @Test
+    fun `a package name with shell characters is refused before any device command`() {
+        session = store.create(device.serial, "dev.app;reboot", SessionMeta.Mode.STARTUP)
+        assertThrows<IllegalArgumentException> { startup().run(session.id, StartupConfig(), newJob()) }
+        assertTrue(device.calls.isEmpty(), device.allCommands().toString())
+        session = store.create("emulator-5554;reboot", "dev.app", SessionMeta.Mode.STARTUP)
+        assertThrows<IllegalArgumentException> { startup().run(session.id, StartupConfig(), newJob()) }
+        assertTrue(device.calls.isEmpty(), device.allCommands().toString())
     }
 
     @Test

@@ -86,6 +86,43 @@ class DebugAppGuardTest {
     }
 
     @Test
+    fun `recoverStale stops a launched app whose pid was never learned, if it is running`() {
+        val guard = DebugAppGuard(device.adb, tmp)
+        guard.arm(device.serial, "dev.app")
+        guard.update(device.serial) { it.copy(launched = true) }
+        device.calls.clear()
+        guard.recoverStale()
+        assertTrue("shell am force-stop dev.app" in device.allCommands(), device.allCommands().toString())
+        assertTrue(guard.pending().isEmpty())
+
+        guard.arm(device.serial, "dev.app")
+        guard.update(device.serial) { it.copy(launched = true) }
+        device.pidAlive = false // nothing of the package runs
+        device.calls.clear()
+        guard.recoverStale()
+        assertFalse(device.allCommands().any { it.startsWith("shell am force-stop") }, device.allCommands().toString())
+    }
+
+    @Test
+    fun `recoverStale removes a dump left on the device, but only a well-formed MemScope path`() {
+        val guard = DebugAppGuard(device.adb, tmp)
+        val path = "/data/data/dev.app/cache/memscope-20261114-101010-abcd-s3.hprof"
+        guard.arm(device.serial, "dev.app")
+        guard.update(device.serial) { it.copy(pendingDump = path, released = true) }
+        device.calls.clear()
+        guard.recoverStale()
+        assertTrue("shell run-as dev.app rm -f $path" in device.allCommands(), device.allCommands().toString())
+
+        guard.arm(device.serial, "dev.app")
+        guard.update(device.serial) { it.copy(pendingDump = "/data/data/dev.app/cache/x;reboot", released = true) }
+        device.calls.clear()
+        val log = guard.recoverStale()
+        assertFalse(device.allCommands().any { "rm" in it }, device.allCommands().toString())
+        assertTrue(log.any { "not a MemScope dump" in it }, log.toString())
+        assertTrue(guard.pending().isEmpty())
+    }
+
+    @Test
     fun `recoverStale keeps the marker of a device that is not connected`() {
         val guard = DebugAppGuard(device.adb, tmp)
         guard.arm(device.serial, "dev.app")

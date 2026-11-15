@@ -177,12 +177,14 @@ class StartupSessionEmulatorTest {
     }
 
     @Test
-    fun `an unknown custom class is reported as not reached without hanging`() {
+    fun `an unknown custom class gets a hint after the grace period and does not fail the recording`() {
         val bogus = Milestones.parseCustom("dev.memscope.fixture.NoSuchClass#onCreate")
-        val r = record(StartupConfig(listOf(Milestones.defaults[0], bogus), milestoneTimeoutSec = 10))
-        assertEquals(Job.State.FAILED, r.job.state)
+        val r = record(StartupConfig(listOf(Milestones.defaults[0], bogus), milestoneTimeoutSec = 120, customGraceSec = 5))
+        assertEquals(Job.State.DONE, r.job.state, "${r.error}")
+        assertTrue(r.job.elapsedMs < 30_000, "the grace period, not the 120 s timeout: ${r.job.elapsedMs} ms")
         assertEquals(listOf("process_start"), r.session.snapshots.map { it.milestoneId })
-        assertTrue("not reached" in r.job.steps.single { it.name == "Dump: NoSuchClass#onCreate" }.detail!!)
+        val detail = r.job.steps.single { it.name == "Dump: NoSuchClass#onCreate" }.detail!!
+        assertTrue("was never loaded" in detail && "check class and method name" in detail, detail)
         assertDeviceClean(r)
         waitForResumed(".MainActivity")
     }

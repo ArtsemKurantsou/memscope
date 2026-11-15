@@ -24,6 +24,11 @@ data class StartupConfig(
     /** A component (`pkg/.Activity`) or raw `am start` arguments; default the launcher activity. */
     val launch: String? = null,
     val milestoneTimeoutSec: Int = 120,
+    /**
+     * Once every enabled built-in milestone was reached, how long to wait for custom hooks whose class has not been
+     * loaded yet (likely a typo) instead of the full [milestoneTimeoutSec].
+     */
+    val customGraceSec: Int = 10,
 )
 
 /** Every blocking wait of a startup session, in milliseconds. */
@@ -66,14 +71,17 @@ class StartupSession(
     /**
      * Steps: "Prepare", "Launch app", "Attach debugger", one "Dump: <label>" per enabled milestone, "Detach". Returns
      * when all enabled milestones were reached (job DONE, result = session id, session stays ACTIVE). Otherwise the job
-     * is failed and the exception rethrown: app exited (session ENDED with note `app exited at <label>`), a milestone
-     * timed out (remaining steps FAILED "not reached"), cancelled, or a device error. A failed dump or an unresolvable
-     * hook fails only its own step. Always detaches, removes its forward and clears the debug app it set; snapshots
-     * already pulled are kept.
+     * is failed and the exception rethrown: app exited (session ENDED with note `app exited at <label>`), debugger
+     * connection lost while the app lives (session stays ACTIVE), a milestone timed out (remaining steps FAILED "not
+     * reached"), cancelled, or a device error. A failed dump, an unresolvable hook, or a custom hook whose class never
+     * loaded (waited for only [StartupConfig.customGraceSec] once the built-in milestones are done) fails only its own
+     * step. Always detaches, removes its forward, clears the debug app it set, and stops an app it launched that never
+     * got past waitForDebugger; snapshots already pulled are kept.
      */
     fun run(sessionId: String, config: StartupConfig, job: Job) {
         try {
             val session = store.get(sessionId) ?: throw NoSuchElementException("no such session: $sessionId")
+            DeviceArgs.requireSerial(session.serial)
             validate(config, session.packageName)
             Run(session, config, job).execute()
         } catch (t: Throwable) {
@@ -82,13 +90,13 @@ class StartupSession(
         }
     }
 
-    private enum class Outcome { ALL_REACHED, APP_EXITED, TIMED_OUT }
+    private enum class Outcome { ALL_REACHED, APP_EXITED, CONNECTION_LOST, TIMED_OUT }
 
     /** Ends this milestone only; the session goes on. */
     private class MilestoneFailed(message: String) : Exception(message)
 
-    /** The debugged VM is gone while the device is still there. */
-    private class AppExited : Exception("the app exited")
+    /** The JDWP connection closed during a dump: the app exited, or only the connection dropped (decided by [Run.vmGone]). */
+    private class VmGone : Exception("the debugger connection closed")
 
     private inner class Run(private val session: SessionMeta, private val config: StartupConfig, private val job: Job) {
         private val serial = session.serial
@@ -101,7 +109,12 @@ class StartupSession(
         private var localPort: Int? = null
         private var debugger: DebuggerPort? = null
         private var released = false
+        /** Set just before `am start`: from then on a process may sit frozen in waitForDebugger, pid known or not. */
+        private var launched = false
         private var appExited = false
+        /** Custom hooks whose class was not loaded when they were set and has not been prepared since. */
+        private val deferred = HashSet<String>()
+        private val hadBuiltins = config.milestones.any { it.enabled && !it.custom }
         private var lastReached = "launch"
         private var timedOutLabel: String? = null
         /** When the app last ran on after a stop; the time to the next milestone is the app running under the debugger. */
@@ -132,6 +145,10 @@ class StartupSession(
                         "The app crashed or was stopped during the recording (check logcat). Snapshots taken before are kept.",
                     )
                 }
+                Outcome.CONNECTION_LOST -> if (failure == null) failure = DeviceException(
+                    DeviceException.Kind.COMMAND_FAILED, "The debugger connection to $processName was lost (at $lastReached).",
+                    "The app is still running; adb or the emulator dropped the connection. Retry the recording; snapshots taken before are kept.",
+                )
                 Outcome.TIMED_OUT -> if (failure == null) failure = DeviceException(
                     DeviceException.Kind.TIMEOUT, "$timedOutLabel was not reached within ${config.milestoneTimeoutSec} s.",
                     "The app may never get there (wrong hook, or a path not taken on this launch), or is slow under the debugger: " +
@@ -169,6 +186,8 @@ class StartupSession(
         private fun launch(launchArgs: List<String>) {
             val t = JdwpConnector(adb).track(serial, timeouts.baselineMs.milliseconds, job.cancel)
             tracker = t
+            launched = true // before the marker update: if that throws, detach still stops the app
+            guard.update(serial) { it.copy(launched = true) }
             val r = adb.shell(serial, listOf("am", "start") + launchArgs, 30.seconds, job.cancel)
             val text = (r.stdout + "\n" + r.stderr).trim()
             if (r.exitCode != 0 || text.lineSequence().any { it.trimStart().startsWith("Error") }) {
@@ -209,8 +228,11 @@ class StartupSession(
                     if (waitError != null) failMilestone(m, "Could not find where the app waits for the debugger: $waitError")
                     continue
                 }
-                val status = dbg.setEntryBreakpoints(m.id, m.hook)
-                if (status is HookStatus.Failed) failMilestone(m, hookProblem(m, status.reason))
+                when (val status = dbg.setEntryBreakpoints(m.id, m.hook)) {
+                    is HookStatus.Failed -> failMilestone(m, hookProblem(m, status.reason))
+                    HookStatus.Deferred -> if (m.custom) deferred += m.id
+                    HookStatus.Resolved -> {}
+                }
             }
             resumedAtMs = nowMs()
             observe { listener.onHeld(false) }
@@ -219,25 +241,29 @@ class StartupSession(
 
         private fun awaitMilestones(): Outcome {
             val dbg = debugger!!
-            val timeoutMs = config.milestoneTimeoutSec * 1000L
             var lastProgress = nowMs()
             while (pending.isNotEmpty()) {
                 checkCancel()
                 val events = dbg.nextEvents(POLL_MS)
                 if (events == null) {
-                    if (nowMs() - lastProgress >= timeoutMs) return timedOut()
+                    val waited = nowMs() - lastProgress
+                    val limitSec = if (onlyUnloadedCustomsLeft()) config.customGraceSec else config.milestoneTimeoutSec
+                    if (waited >= limitSec * 1000L) return timedOut(limitSec)
                     continue
                 }
                 observe { listener.onHeld(true) }
                 for (e in events.sortedBy(::order)) {
                     when (e) {
-                        is DebugEvent.Disconnected -> return appExit()
+                        is DebugEvent.Disconnected -> return vmGone()
                         is DebugEvent.WaitReturned -> {
                             markReleased()
-                            pending[Milestones.PROCESS_START]?.let { if (reach(it, e.thread)) return appExit() }
+                            pending[Milestones.PROCESS_START]?.let { if (reach(it, e.thread)) return vmGone() }
                         }
-                        is DebugEvent.HookResolved -> {}
-                        is DebugEvent.HookFailed -> pending[e.key]?.let { failMilestone(it, hookProblem(it, e.reason)) }
+                        is DebugEvent.HookResolved -> deferred -= e.key
+                        is DebugEvent.HookFailed -> {
+                            deferred -= e.key
+                            pending[e.key]?.let { failMilestone(it, hookProblem(it, e.reason)) }
+                        }
                         is DebugEvent.EntryHit -> {
                             markReleased()
                             val m = pending[e.key] ?: continue
@@ -248,7 +274,7 @@ class StartupSession(
                             markReleased()
                             val m = pending[e.key] ?: continue
                             dbg.clearHook(m.id)
-                            if (reach(m, e.thread)) return appExit()
+                            if (reach(m, e.thread)) return vmGone()
                         }
                     }
                 }
@@ -261,7 +287,7 @@ class StartupSession(
             return Outcome.ALL_REACHED
         }
 
-        /** Dumps and pulls milestone [m]; true if the app exited meanwhile. */
+        /** Dumps and pulls milestone [m]; true if the debugger connection closed meanwhile. */
         private fun reach(m: Milestone, thread: DebugThread): Boolean {
             pending.remove(m.id)
             lastReached = m.label
@@ -269,7 +295,7 @@ class StartupSession(
                 job.step(dumpStep(m)) { d -> dumpAndPull(m, thread, d) }
             } catch (_: MilestoneFailed) {
                 // only this milestone failed; its step carries the reason
-            } catch (_: AppExited) {
+            } catch (_: VmGone) {
                 return true
             }
             onMilestoneDone(m)
@@ -288,12 +314,12 @@ class StartupSession(
             var ok = false
             try {
                 val t0 = nowMs()
+                guard.update(serial) { it.copy(pendingDump = remote) } // recoverStale removes it if this run dies
                 val error = try {
                     bounded("The heap dump", timeouts.dumpMs, onAbort = { debugger?.dispose() }) { debugger!!.invokeDump(thread, remote) }
                 } catch (_: DebuggerDisconnected) {
-                    appExited = true
-                    d("the app exited during the dump")
-                    throw AppExited()
+                    d("the debugger connection closed during the dump")
+                    throw VmGone()
                 }
                 if (error != null) throw MilestoneFailed("Debug.dumpHprofData failed in the app: $error")
                 facts += "dump %.1f s".format((nowMs() - t0) / 1000.0)
@@ -326,11 +352,15 @@ class StartupSession(
                 deleteQuietly(gz)
                 deleteQuietly(part)
                 if (!ok) deleteQuietly(local)
-                removeRemote(remote)
+                if (removeRemote(remote)) runCatching { guard.update(serial) { it.copy(pendingDump = null) } }
             }
         }
 
-        /** Never throws: cleanup must not mask the error being reported. */
+        /**
+         * Tries every cleanup action (dispose, stop a frozen app, remove the forward, clear the debug app) even when one
+         * fails, then throws the first device error, so the Detach step shows FAILED and a kept marker lets
+         * `recoverStale` finish the job later.
+         */
         private fun detach(d: (String) -> Unit) {
             val notes = ArrayList<String>()
             observe { listener.onHeld(false) }
@@ -338,45 +368,80 @@ class StartupSession(
             debugger = null
             tracker?.close()
             tracker = null
-            if (pid != null && !released && !appExited) {
-                // still frozen in waitForDebugger: disposing does not release it (FINDINGS A.5)
+            if (launched && !released && !appExited) {
+                // possibly frozen in waitForDebugger (pid known or not): disposing does not release it (FINDINGS A.5)
                 try {
                     adb.shell(serial, listOf("am", "force-stop", pkg), SHORT)
                     notes += "stopped the app, which was still waiting for the debugger"
                 } catch (_: DeviceException) { /* the disarm below reports the device problem */ }
             }
-            var forwardError: DeviceException? = null
+            var firstError: DeviceException? = null
             localPort?.let { port ->
                 try {
                     adb.removeForward(serial, port)
                     localPort = null
                     guard.update(serial) { it.copy(forwardPort = null) }
                 } catch (e: DeviceException) {
-                    forwardError = e
+                    firstError = e
                 }
             }
             if (armed) {
-                guard.disarm(serial)
-                armed = false
-                notes += "debug app cleared"
+                try {
+                    guard.disarm(serial)
+                    armed = false
+                    notes += "debug app cleared"
+                } catch (e: DeviceException) {
+                    if (firstError == null) firstError = e
+                }
             }
-            forwardError?.let { throw it }
+            firstError?.let { throw it }
             if (notes.isNotEmpty()) d(notes.joinToString(" · "))
         }
 
         // -- helpers --
 
-        private fun appExit(): Outcome {
-            appExited = true
+        /**
+         * The JDWP connection closed. A lost device throws (device failure); a process that still lives means only the
+         * connection dropped (the session stays ACTIVE; detach stops the app if it never got past the wait); otherwise
+         * the app exited.
+         */
+        private fun vmGone(): Outcome {
             adb.shell(serial, listOf("true"), SHORT) // throws if the device itself is gone: that is a device failure, not an exit
+            if (processAlive()) {
+                pending.values.toList().forEach { failMilestone(it, "not reached: the debugger connection was lost") }
+                return Outcome.CONNECTION_LOST
+            }
+            appExited = true
             pending.values.toList().forEach { failMilestone(it, "not reached: the app exited") }
             return Outcome.APP_EXITED
         }
 
-        private fun timedOut(): Outcome {
+        /** The profiled pid still runs under its name; checked twice so a dying process is not mistaken for a live one. */
+        private fun processAlive(): Boolean {
+            val p = pid ?: return false
+            for (attempt in 0..1) {
+                if (attempt > 0) Thread.sleep(ALIVE_RECHECK_MS)
+                val r = adb.shell(serial, listOf("cat", "/proc/$p/cmdline"), SHORT)
+                if (r.exitCode != 0 || r.stdout.substringBefore('\u0000').trim() != processName) return false
+            }
+            return true
+        }
+
+        /** Every built-in milestone is done and the custom hooks left wait for a class that was never loaded. */
+        private fun onlyUnloadedCustomsLeft() = hadBuiltins && pending.values.all { it.custom && it.id in deferred }
+
+        /** Fails what is left; a custom hook whose class never loaded gets the hint and does not fail the session. */
+        private fun timedOut(limitSec: Int): Outcome {
             val missing = pending.values.toList()
-            timedOutLabel = missing.first().label
-            missing.forEach { failMilestone(it, "not reached within ${config.milestoneTimeoutSec} s") }
+            for (m in missing) {
+                if (m.custom && m.id in deferred) {
+                    failMilestone(m, "class ${m.hook.className} was never loaded within $limitSec s — check class and method name")
+                } else {
+                    failMilestone(m, "not reached within $limitSec s")
+                }
+            }
+            val real = missing.firstOrNull { !(it.custom && it.id in deferred) } ?: return Outcome.ALL_REACHED
+            timedOutLabel = real.label
             return Outcome.TIMED_OUT
         }
 
@@ -403,10 +468,11 @@ class StartupSession(
             null // informational only; a lost device shows up in the next step
         }
 
-        private fun removeRemote(remote: String) {
-            try {
-                adb.shell(serial, listOf("run-as", pkg, "rm", "-f", remote), SHORT)
-            } catch (_: DeviceException) { /* best effort */ }
+        /** Best effort; true if the file is gone from the device. */
+        private fun removeRemote(remote: String): Boolean = try {
+            adb.shell(serial, listOf("run-as", pkg, "rm", "-f", remote), SHORT).exitCode == 0
+        } catch (_: DeviceException) {
+            false
         }
 
         private fun incomplete(problem: String): Nothing = throw MilestoneFailed(
@@ -476,6 +542,7 @@ class StartupSession(
         const val ATTACH = "Attach debugger"
         const val DETACH = "Detach"
         private const val POLL_MS = 200L
+        private const val ALIVE_RECHECK_MS = 500L
         private const val MB = 1_048_576.0
         private val SHORT = 15.seconds
         private val COMPONENT = Regex("[A-Za-z0-9_.]+/[A-Za-z0-9_.$]+")
@@ -489,8 +556,10 @@ class StartupSession(
 
         /** Throws [IllegalArgumentException] naming the problem; nothing on the device is touched. */
         fun validate(config: StartupConfig, packageName: String) {
+            DeviceArgs.requirePackage(packageName)
             Milestones.validate(config.milestones)
             require(config.milestoneTimeoutSec in 1..3600) { "The per-milestone timeout must be between 1 and 3600 seconds." }
+            require(config.customGraceSec in 1..3600) { "The grace period for custom milestones must be between 1 and 3600 seconds." }
             val process = config.processName ?: packageName
             require(process == packageName || (process.startsWith("$packageName:") && PROCESS_SUFFIX.matches(process.substringAfter(':')))) {
                 "Process '$process' is not a process of $packageName: use $packageName or $packageName:<name>."

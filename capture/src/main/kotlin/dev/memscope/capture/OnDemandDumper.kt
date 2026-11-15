@@ -18,6 +18,14 @@ class OnDemandDumper(private val adb: Adb, private val store: SessionStore) {
      */
     fun dump(sessionId: String, processName: String, label: String, job: Job): SnapshotMeta {
         val session = store.get(sessionId) ?: throw NoSuchElementException("no such session: $sessionId")
+        try {
+            DeviceArgs.requireSerial(session.serial)
+            DeviceArgs.requirePackage(session.packageName)
+            DeviceArgs.requireProcessName(processName)
+        } catch (e: IllegalArgumentException) {
+            job.fail(e)
+            throw e
+        }
         val serial = session.serial
         val snapshotId = store.nextSnapshotId(sessionId)
         val remote = "/data/local/tmp/memscope-$sessionId-$snapshotId.hprof"

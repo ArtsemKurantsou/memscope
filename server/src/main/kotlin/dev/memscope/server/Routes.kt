@@ -1,6 +1,7 @@
 package dev.memscope.server
 
 import dev.memscope.analysis.HprofUnreadableException
+import dev.memscope.capture.DeviceArgs
 import dev.memscope.capture.Job
 import dev.memscope.capture.MemTimeline
 import dev.memscope.capture.Milestones
@@ -140,19 +141,16 @@ private fun Route.deviceRoutes(deps: ServerDeps) {
         call.respond(io { deps.adb.devices().map { it.toDto() } })
     }
     get("/devices/{serial}/apps") {
-        val serial = call.parameters["serial"]!!
+        val serial = call.parameters["serial"]!!.also(DeviceArgs::requireSerial)
         val refresh = call.request.queryParameters["refresh"] == "1"
         call.respond(io { deps.apps(serial, refresh) })
     }
     get("/devices/{serial}/apps/{pkg}/launcher") {
-        val serial = call.parameters["serial"]!!
-        val pkg = call.parameters["pkg"]!!
-        require(PACKAGE.matches(pkg)) { "invalid package name: $pkg" }
+        val serial = call.parameters["serial"]!!.also(DeviceArgs::requireSerial)
+        val pkg = call.parameters["pkg"]!!.also(DeviceArgs::requirePackage)
         call.respond(LauncherDto(io { deps.adb.launcherComponent(serial, pkg) }))
     }
 }
-
-private val PACKAGE = Regex("[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z0-9_]+)+")
 
 private val sessionLock = Any()
 
@@ -188,9 +186,14 @@ private fun Route.sessionRoutes(deps: ServerDeps) {
     suspend fun ApplicationCall.startStartup(req: CreateSessionRequest) {
         val config = req.startup ?: StartupConfig()
         StartupSession.validate(config, req.packageName) // 400 before anything is checked or changed on the device
+        if (deps.staleRecoveryRunning()) {
+            throw ApiException(
+                HttpStatusCode.ServiceUnavailable, "MemScope is still cleaning up a previous recording",
+                "It clears a debug app left by an interrupted run; try again in a moment.", "RECOVERING",
+            )
+        }
         val started = io {
             synchronized(sessionLock) { requireNoStartupRunning(deps) }
-            deps.awaitStaleRecovery()
             deps.adb.requireDebuggable(req.serial, req.packageName) // before anything changes
             synchronized(sessionLock) {
                 requireNoStartupRunning(deps)
@@ -208,6 +211,8 @@ private fun Route.sessionRoutes(deps: ServerDeps) {
         requireJson(call)
         val req = call.receive<CreateSessionRequest>()
         require(req.serial.isNotBlank() && req.packageName.isNotBlank()) { "serial and packageName are required" }
+        DeviceArgs.requireSerial(req.serial) // both reach `adb shell` command lines
+        DeviceArgs.requirePackage(req.packageName)
         if (req.mode == SessionMeta.Mode.STARTUP) {
             call.startStartup(req)
             return@post
@@ -253,6 +258,7 @@ private fun Route.sessionRoutes(deps: ServerDeps) {
             )
         }
         val process = req.processName?.takeIf { it.isNotBlank() } ?: session.packageName
+        DeviceArgs.requireProcessName(process)
         val label = req.label?.takeIf { it.isNotBlank() } ?: "Snapshot ${session.snapshots.size + 1}"
         val job = deps.jobs.create("Dump $process", OnDemandDumper.STEP_NAMES)
         deps.jobs.submit(job) { deps.dumper.dump(id, process, label, job) }

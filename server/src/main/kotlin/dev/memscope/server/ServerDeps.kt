@@ -38,8 +38,11 @@ class ServerDeps(
 ) : AutoCloseable {
     val adb: Adb get() = adbProvider()
     val dumper: OnDemandDumper get() = OnDemandDumper(adb, store)
-    /** Pending-debug-app markers live next to the sessions (`MEMSCOPE_HOME`). */
-    val guard: DebugAppGuard get() = DebugAppGuard(adb, store.home)
+    /**
+     * The one guard of this server (its lock serialises marker updates); markers live next to the sessions
+     * (`MEMSCOPE_HOME`). Lazy because adb may be missing: a failed lookup is retried on the next access.
+     */
+    val guard: DebugAppGuard by lazy { DebugAppGuard(adb, store.home) }
 
     /** The startup recording in progress (at most one: a device has one debug app), or null. */
     data class RunningStartup(val sessionId: String, val job: Job)
@@ -85,10 +88,13 @@ class ServerDeps(
         override fun onHeld(held: Boolean) { synchronized(pollerLock) { if (polledSession == sessionId) poller?.setPaused(held) } }
     }
 
-    /** The start-up clean-up of debug apps left by a crashed run; a new recording waits for it (it clears the debug app). */
+    /**
+     * The start-up clean-up of debug apps left by a crashed run. While it runs no recording may start: it clears the
+     * debug app and would clear the new recording's too.
+     */
     @Volatile var staleRecovery: Thread? = null
 
-    fun awaitStaleRecovery() { staleRecovery?.join(STALE_RECOVERY_WAIT_MS) }
+    fun staleRecoveryRunning(): Boolean = staleRecovery?.isAlive == true
 
     /** Per-serial cache of the debuggable-app listing (one `run-as` per package is slow). */
     private val appsCache = HashMap<String, Pair<Long, List<AppDto>>>()
@@ -106,8 +112,16 @@ class ServerDeps(
     }
 
     override fun close() {
-        // A running startup recording must detach and clear the debug app before the JVM exits.
-        runningStartup()?.job?.cancel?.cancel()
+        // A running startup recording must detach and clear the debug app before the JVM exits: cancel it and wait
+        // (bounded) for its cleanup, before shutdownNow() interrupts the worker.
+        runningStartup()?.job?.let { job ->
+            job.cancel.cancel()
+            val deadline = System.nanoTime() + STARTUP_CLEANUP_WAIT_MS * 1_000_000
+            while (job.snapshot().state == Job.State.RUNNING && System.nanoTime() < deadline) Thread.sleep(50)
+            if (job.snapshot().state == Job.State.RUNNING) {
+                ServerLog.error("The startup recording ${job.id} did not finish cleaning up within ${STARTUP_CLEANUP_WAIT_MS / 1000} s; the next start clears the debug app.")
+            }
+        }
         synchronized(pollerLock) { poller?.stop(); polledSession = null }
         jobs.close()
         snapshots.close()
@@ -115,6 +129,6 @@ class ServerDeps(
 
     private companion object {
         const val APPS_TTL_MS = 30_000L
-        const val STALE_RECOVERY_WAIT_MS = 30_000L
+        const val STARTUP_CLEANUP_WAIT_MS = 10_000L
     }
 }

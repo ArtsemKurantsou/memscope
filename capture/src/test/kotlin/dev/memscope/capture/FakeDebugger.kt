@@ -25,6 +25,8 @@ class FakeDebugger : DebuggerPort {
     @Volatile var dumpGate: CountDownLatch? = null
     var dumpDisconnects = false
     var nextEventsError: Throwable? = null
+    /** Runs when the VM goes away (a Disconnected set, or a dump that disconnects): tests let the process die here. */
+    var onDisconnected: () -> Unit = {}
     val dumpedPaths = CopyOnWriteArrayList<String>()
     @Volatile var disposed = false
     @Volatile private var running = false
@@ -66,6 +68,7 @@ class FakeDebugger : DebuggerPort {
         if (!running) violations += "nextEvents while suspended"
         val set = script.pollFirst()
         if (set == null) { Thread.sleep(minOf(timeoutMs, 20)); return null }
+        if (set.any { it is DebugEvent.Disconnected }) onDisconnected()
         calls += "events:" + set.joinToString(",") { it.toString() }
         if (set.any { it !is DebugEvent.Disconnected }) { running = false; pendingSet = true }
         return set
@@ -74,7 +77,7 @@ class FakeDebugger : DebuggerPort {
     override fun invokeDump(thread: DebugThread, remotePath: String): String? {
         traffic("dump:$remotePath")
         dumpGate?.let { gate -> while (!gate.await(20, TimeUnit.MILLISECONDS)) if (disposed) throw DebuggerDisconnected("disposed") }
-        if (dumpDisconnects) throw DebuggerDisconnected("VM disconnected during invoke")
+        if (dumpDisconnects) { onDisconnected(); throw DebuggerDisconnected("VM disconnected during invoke") }
         dumpedPaths += remotePath
         return dumpResult(remotePath)
     }

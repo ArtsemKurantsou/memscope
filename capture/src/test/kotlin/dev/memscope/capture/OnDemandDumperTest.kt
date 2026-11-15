@@ -85,6 +85,16 @@ class OnDemandDumperTest {
     }
 
     @Test
+    fun `shell characters in the process or package name are refused before any device command`() {
+        val job = newJob()
+        assertThrows<IllegalArgumentException> { dumper.dump(session.id, "dev.app;reboot", "x", job) }
+        assertEquals(Job.State.FAILED, job.snapshot().state)
+        val bad = store.create(device.serial, "dev.app;reboot", SessionMeta.Mode.ATTACH)
+        assertThrows<IllegalArgumentException> { dumper.dump(bad.id, "dev.app", "x", newJob()) }
+        assertTrue(device.calls.isEmpty(), device.calls.toString())
+    }
+
+    @Test
     fun `process name outside the package is rejected`() {
         val e = assertThrows<DeviceException> { dumper.dump(session.id, "com.other.app", "x", newJob()) }
         assertEquals(DeviceException.Kind.COMMAND_FAILED, e.kind)

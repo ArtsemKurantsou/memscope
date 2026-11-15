@@ -77,6 +77,7 @@ class FakeStartupDevice(val serial: String = "emulator-5554", val pkg: String = 
             c[0] == "shell" && c[1] == "cmd" && c[2] == "package" ->
                 launcher?.let { ProcessResult(0, "priority=0\n$it\n", "") } ?: ProcessResult(0, "No activity found\n", "")
             c[0] == "shell" && c[1] == "am" && c[2] == "start" -> { launched = true; ProcessResult(0, amStartOutput, "") }
+            c[0] == "shell" && c[1] == "ps" -> ProcessResult(0, "PID NAME\n" + (if (pidAlive) "$targetPid $targetName\n" else ""), "")
             c[0] == "shell" && c[1] == "cat" && c[2].startsWith("/proc/") -> cmdline(c[2].removePrefix("/proc/").substringBefore('/').toInt())
             else -> ProcessResult(0, "", "")
         }

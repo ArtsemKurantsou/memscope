@@ -208,6 +208,10 @@ class JdiDebuggerPort : DebuggerPort {
             runCatching { v.dispose() }
         }, "memscope-jdi-dispose").apply { isDaemon = true; start() }
         worker.join(DISPOSE_WAIT_MS)
+        if (worker.isAlive) {
+            // capture has no logger; the server prints stderr to its terminal
+            System.err.println("memscope: the JDI connection did not close within ${DISPOSE_WAIT_MS / 1000} s; abandoning it (the app is released when the forward is removed)")
+        }
     }
 
     // -- internals --
@@ -294,7 +298,12 @@ internal fun dexInvokeUnits(bytecodes: ByteArray, codeIndex: Long): Int? {
     }
 }
 
-/** JDI prints `Ignoring cmd <id>/199/1 from the VM` to stderr for ART's DDM packets (FINDINGS A.1); drop those lines. */
+/**
+ * JDI's `TargetVM` prints `Ignoring cmd <id>/199/1 from the VM` to stderr for every ART DDM packet (FINDINGS A.1).
+ * On the first attach this replaces `System.err` process-wide with a PrintStream that drops exactly those
+ * `println(String)` lines (starting with "Ignoring cmd " and ending with " from the VM") and passes everything else
+ * through to the previous stream. It is installed once and never restored.
+ */
 private object JdiNoise {
     private val installed = AtomicBoolean(false)
 

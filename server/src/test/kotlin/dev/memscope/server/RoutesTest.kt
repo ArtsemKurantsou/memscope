@@ -1,6 +1,7 @@
 package dev.memscope.server
 
 import dev.memscope.analysis.HprofUnreadableException
+import dev.memscope.capture.Job
 import dev.memscope.capture.Milestones
 import dev.memscope.capture.SessionMeta
 import dev.memscope.capture.SessionStore
@@ -172,11 +173,14 @@ class RoutesTest {
     private val startupRuns = java.util.concurrent.CopyOnWriteArrayList<Pair<String, StartupConfig>>()
     /** Fake recording: records its input; blocks until cancelled while [startupGate] is set, else completes. */
     @Volatile private var startupGate: CountDownLatch? = null
+    @Volatile private var startupCleanedUp = false
     private var startupRunner = StartupRunner { _, sessionId, config, job ->
         startupRuns += sessionId to config
         startupGate?.let { gate ->
             while (!job.cancel.isCancelled && !gate.await(10, TimeUnit.MILLISECONDS)) { /* wait */ }
             if (job.cancel.isCancelled) {
+                Thread.sleep(300) // detach: dispose, remove forward, clear the debug app
+                startupCleanedUp = true
                 val e = DeviceException(DeviceException.Kind.CANCELLED, "Startup recording was cancelled", "The operation was cancelled.")
                 job.fail(e)
                 throw e
@@ -289,10 +293,62 @@ class RoutesTest {
             """[{"serial":"emulator-5554","packageName":"dev.app","processName":"dev.app","released":true}]""",
         )
         val d = ServerDeps(store, { runner.adb }, opener)
-        recoverStaleDebugApps(d).join(10_000)
+        ServerLog.sink = { logs += it }
+        try {
+            recoverStaleDebugApps(d).join(10_000)
+        } finally {
+            ServerLog.sink = { System.err.println(it) }
+        }
         assertEquals(1, runner.count("shell", "am", "clear-debug-app"))
         assertFalse(java.nio.file.Files.exists(home.resolve("pending-debug-app.json")))
+        assertTrue(logs.any { "cleared" in it }, logs.toString())
         d.close()
+    }
+
+    @Test fun shellCharactersInPackageSerialOrProcessAre400BeforeAnyDeviceCommand() = server {
+        for (mode in listOf("ATTACH", "STARTUP")) {
+            for (body in listOf(
+                """{"serial":"emulator-5554","packageName":"dev.app;reboot","mode":"$mode"}""",
+                """{"serial":"emulator-5554;reboot","packageName":"dev.app","mode":"$mode"}""",
+            )) {
+                val r = client.postJson("/api/sessions", body)
+                assertEquals(HttpStatusCode.BadRequest, r.status, body)
+            }
+        }
+        assertTrue(store.list().isEmpty())
+        assertEquals(0, runner.count("shell"), runner.calls.toString())
+        val s = store.newAttachSession()
+        val r = client.postJson("/api/sessions/${s.id}/dump", """{"processName":"dev.app;reboot"}""")
+        assertEquals(HttpStatusCode.BadRequest, r.status)
+        assertEquals(0, runner.count("shell"), runner.calls.toString())
+        assertEquals(HttpStatusCode.BadRequest, client.get("/api/devices/x;y/apps").status)
+    }
+
+    @Test fun startupIsRefusedWith503WhileStaleRecoveryRuns() = server {
+        val release = CountDownLatch(1)
+        val recovery = Thread { release.await() }.apply { isDaemon = true; start() }
+        deps.staleRecovery = recovery
+        val r = client.postJson("/api/sessions", startupBody)
+        assertEquals(HttpStatusCode.ServiceUnavailable, r.status)
+        assertEquals("RECOVERING", str(r.obj(), "kind"))
+        assertTrue("try again" in str(r.obj(), "hint"))
+        assertTrue(store.list().isEmpty())
+        release.countDown(); recovery.join(5_000)
+        assertEquals(HttpStatusCode.OK, client.postJson("/api/sessions", startupBody).status)
+    }
+
+    @Test fun theGuardIsOneSharedInstance() = server {
+        assertTrue(deps.guard === deps.guard)
+    }
+
+    @Test fun closeWaitsForARunningRecordingToCleanUp() = server {
+        startupGate = CountDownLatch(1)
+        val o = client.postJson("/api/sessions", startupBody).obj()
+        val jobId = str(o, "jobId")
+        while (startupRuns.isEmpty()) Thread.sleep(10)
+        deps.close()
+        assertTrue(startupCleanedUp, "close() returned before the recording detached")
+        assertEquals(Job.State.CANCELLED, deps.jobs.get(jobId)!!.snapshot().state)
     }
 
     @Test fun malformedSessionRequestIs400() = server {
