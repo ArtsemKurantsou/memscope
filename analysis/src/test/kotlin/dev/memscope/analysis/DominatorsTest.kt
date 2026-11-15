@@ -137,14 +137,88 @@ class DominatorsTest {
         val rnd = Random(42)
         repeat(200) { iter ->
             val n = 30
-            val edgeCount = 10 + rnd.nextInt(80)
-            val edges = List(edgeCount) { rnd.nextInt(n) to rnd.nextInt(n) }
             val roots = IntArray(1 + rnd.nextInt(3)) { rnd.nextInt(n) }
+            // Bias toward reachability: a random spanning forest hanging off the roots, plus extra random
+            // edges (forward, back, self-loops, duplicates).
+            val edges = ArrayList<Pair<Int, Int>>()
+            val order = (0 until n).shuffled(rnd)
+            val placed = mutableListOf<Int>()
+            for (r in roots.distinct()) placed.add(r)
+            for (v in order) {
+                if (v in placed) continue
+                if (rnd.nextInt(10) == 0) continue // occasionally leave a node unreachable
+                edges.add(placed[rnd.nextInt(placed.size)] to v)
+                placed.add(v)
+            }
+            repeat(10 + rnd.nextInt(60)) { edges.add(rnd.nextInt(n) to rnd.nextInt(n)) }
             val g = graph(n, edges, roots)
             val expected = bruteForceIdom(n, edges, roots)
             val actual = Dominators.immediateDominators(g)
             assertArrayEquals(expected, actual, "graph #$iter edges=$edges roots=${roots.toList()}")
         }
+    }
+
+    @Test
+    fun largeIrregularGraph() {
+        val n = 5_000_000
+        val m = 20_000_000
+        val rnd = Random(7)
+        val src = IntArray(m)
+        val dst = IntArray(m)
+        val rootCount = 5
+        var e = 0
+        // Spanning tree: each node hangs off an earlier node, 30% of the time its immediate predecessor (deep paths).
+        for (v in rootCount until n) {
+            src[e] = if (rnd.nextInt(10) < 3) v - 1 else rnd.nextInt(v)
+            dst[e++] = v
+        }
+        val hubs = IntArray(20) { rnd.nextInt(n) }
+        while (e < m) {
+            val r = rnd.nextInt(10)
+            when {
+                r < 2 -> { src[e] = rnd.nextInt(n); dst[e++] = hubs[rnd.nextInt(hubs.size)] } // many refs to hubs
+                else -> { src[e] = rnd.nextInt(n); dst[e++] = rnd.nextInt(n) } // forward and back edges
+            }
+        }
+        val offsets = IntArray(n + 1)
+        for (i in 0 until m) offsets[src[i] + 1]++
+        for (i in 0 until n) offsets[i + 1] += offsets[i]
+        val cur = offsets.copyOf(n)
+        val targets = IntArray(m)
+        for (i in 0 until m) targets[cur[src[i]]++] = dst[i]
+        val g = Graph(n, offsets, targets, IntArray(rootCount) { it })
+        val shallow = IntArray(n) { 1 + (it and 15) }
+
+        fun <T> timed(name: String, log: StringBuilder, f: () -> T): T {
+            val t0 = System.nanoTime()
+            val r = f()
+            log.append("$name: ${(System.nanoTime() - t0) / 1_000_000} ms\n")
+            return r
+        }
+        val log = StringBuilder()
+        val total0 = System.nanoTime()
+        val idom = timed("immediateDominators", log) { Dominators.immediateDominators(g) }
+        log.append("chkPasses: ${Dominators.lastChkPasses}\n")
+        val retained = timed("retainedSizes", log) { Dominators.retainedSizes(idom, shallow, n) }
+        val (offs, children) = timed("childrenCsr", log) { Dominators.childrenCsr(idom, retained, n) }
+        val bfs = timed("bfsParents", log) { Dominators.bfsParents(g) }
+        val totalMs = (System.nanoTime() - total0) / 1_000_000
+        val peak = java.lang.management.ManagementFactory.getMemoryPoolMXBeans()
+            .filter { it.type == java.lang.management.MemoryType.HEAP }.sumOf { it.peakUsage.used } shr 20
+        log.append("totalMs: $totalMs\npeakHeapMb(sum of pool peaks, incl. test graph): $peak\n")
+        java.io.File("build").mkdirs()
+        java.io.File("build/dominators-large.txt").writeText(log.toString())
+
+        assertTrue(totalMs < 60_000, "took $totalMs ms")
+        var reachableShallow = 0L
+        var reachableCount = 0
+        for (v in 0 until n) if (idom[v] != Dominators.UNREACHABLE) { reachableShallow += shallow[v]; reachableCount++ }
+        assertTrue(reachableCount > n / 2, "graph should be mostly reachable: $reachableCount")
+        var rootSum = 0L
+        for (k in offs[n] until offs[n + 1]) rootSum += retained[children[k]]
+        assertEquals(reachableShallow, rootSum)
+        assertEquals(reachableCount, children.size)
+        for (v in 0 until n) assertEquals(idom[v] == Dominators.UNREACHABLE, bfs[v] == Dominators.UNREACHABLE)
     }
 
     /** Naive oracle: X dominates v iff v is reachable but stops being reachable once X is removed. */

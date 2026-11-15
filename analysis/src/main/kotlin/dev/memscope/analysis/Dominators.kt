@@ -10,6 +10,9 @@ class Graph(val nodeCount: Int, val edgeOffsets: IntArray /* size n+1 */, val ed
 object Dominators {
     const val UNREACHABLE = -1
 
+    /** Number of CHK sweeps in the most recent immediateDominators call (diagnostic; not thread-safe). */
+    @Volatile internal var lastChkPasses = 0
+
     /**
      * idom[i] in 0..n (n = super-root, the idom of every root) or UNREACHABLE.
      * Iterative Cooper-Harvey-Kennedy over a reverse-postorder numbering of the graph plus super-root.
@@ -52,29 +55,38 @@ object Dominators {
 
         // Predecessor CSR, indexed by postorder number; self-loops are irrelevant to dominance and skipped.
         val predOffsets = IntArray(reachable + 1)
-        fun forEachEdge(action: (Int, Int) -> Unit) {
+        var predCursor = IntArray(0)
+        var preds = IntArray(0)
+        // Two passes (count, then fill) written out directly: no lambdas, so no boxing per edge.
+        for (pass in 0..1) {
             for (i in 0 until reachable) {
                 val u = order[i]
-                if (u == n) {
-                    for (v in roots) action(i, post[v])
-                } else {
-                    for (e in offsets[u] until offsets[u + 1]) action(i, post[targets[e]])
+                val from = i
+                val begin = if (u == n) 0 else offsets[u]
+                val end = if (u == n) roots.size else offsets[u + 1]
+                for (e in begin until end) {
+                    val to = post[if (u == n) roots[e] else targets[e]]
+                    if (from == to) continue
+                    if (pass == 0) predOffsets[to + 1]++ else preds[predCursor[to]++] = from
                 }
             }
+            if (pass == 0) {
+                for (i in 0 until reachable) predOffsets[i + 1] += predOffsets[i]
+                predCursor = predOffsets.copyOf(reachable)
+                preds = IntArray(predOffsets[reachable])
+            }
         }
-        forEachEdge { from, to -> if (from != to) predOffsets[to + 1]++ }
-        for (i in 0 until reachable) predOffsets[i + 1] += predOffsets[i]
-        val predCursor = predOffsets.copyOf(reachable)
-        val preds = IntArray(predOffsets[reachable])
-        forEachEdge { from, to -> if (from != to) preds[predCursor[to]++] = from }
+
 
         // CHK on postorder numbers: the super-root has the highest number, `reachable - 1`.
         val rootPo = reachable - 1
         val doms = IntArray(reachable) { -1 }
         doms[rootPo] = rootPo
         var changed = true
+        var passes = 0
         while (changed) {
             changed = false
+            passes++
             for (b in rootPo - 1 downTo 0) {
                 var newIdom = -1
                 for (k in predOffsets[b] until predOffsets[b + 1]) {
@@ -89,6 +101,7 @@ object Dominators {
             }
         }
 
+        lastChkPasses = passes
         val idom = IntArray(n) { UNREACHABLE }
         for (po in 0 until rootPo) idom[order[po]] = order[doms[po]]
         return idom

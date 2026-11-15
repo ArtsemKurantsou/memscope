@@ -9,6 +9,6 @@ dependencies {
 }
 
 tasks.named<Test>("test") {
-    // The 2,000,000-node deep-chain dominator test needs more than the default heap headroom.
-    maxHeapSize = "2g"
+    // DominatorsTest.largeIrregularGraph (5M nodes, 20M edges) needs ~1 GB; leave headroom.
+    maxHeapSize = "4g"
 }
