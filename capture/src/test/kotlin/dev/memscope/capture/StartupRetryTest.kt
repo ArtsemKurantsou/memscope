@@ -100,6 +100,50 @@ class StartupRetryTest {
     }
 
     @Test
+    fun `a not-waiting app is not retried when a different failure came first`() {
+        // process start disabled: not waiting only skips nothing, the attempt goes on and then fails for another reason
+        val notWaiting = "$APP_NOT_WAITING_REASON (it was already at handleBindApplication @870)"
+        setup = { _, vm -> vm.defaultScript(); vm.waitArmError = notWaiting; vm.nextEventsError = IllegalStateException("event queue broke") }
+        val job = job()
+        assertThrows<Throwable> { retry().run(session.id, config, job) }
+        assertEquals(1, vms.size, "no retry: the not-waiting abort was not the failure")
+        assertEquals(Job.State.FAILED, job.snapshot().state)
+        assertTrue(store.get(session.id)!!.snapshots.isEmpty())
+    }
+
+    @Test
+    fun `the retry note is shown from the start of the second attempt and survives its failing Prepare`() {
+        setup = { n, vm -> if (n == 0) wedgeBeforeAnySnapshot(vm) else vm.defaultScript() }
+        var prepareDetailAtSecondStart: String? = "unset"
+        val job = job()
+        beforeAttempt = { n ->
+            if (n == 1) {
+                prepareDetailAtSecondStart = job.snapshot().steps.single { it.name == StartupSession.PREPARE }.detail
+                device.launcher = null // the second Prepare fails: no launcher activity
+            }
+        }
+        assertThrows<DeviceException> { retry().run(session.id, config, job) }
+        assertEquals(2, vms.size, "two attempts were constructed")
+        assertTrue(prepareDetailAtSecondStart?.contains("retrying once") == true, "visible before the second attempt runs: $prepareDetailAtSecondStart")
+        val prepare = job.snapshot().steps.single { it.name == StartupSession.PREPARE }
+        assertEquals(Job.StepState.FAILED, prepare.state)
+        assertTrue(prepare.detail?.contains("retrying once") == true, "kept after the second Prepare failed: ${prepare.detail}")
+        assertEquals(Job.State.FAILED, job.snapshot().state)
+    }
+
+    @Test
+    fun `a bookkeeping error between attempts never replaces the original failure`() {
+        setup = { _, vm -> wedgeBeforeAnySnapshot(vm) }
+        beforeAttempt = { n -> if (n == 1) throw IllegalStateException("could not build the second attempt") }
+        val job = job()
+        val e = assertThrows<DeviceException> { retry().run(session.id, config, job) }
+        assertTrue("stopped answering the debugger" in e.message!!, e.message)
+        val v = job.snapshot()
+        assertEquals(Job.State.FAILED, v.state)
+        assertTrue("stopped answering the debugger" in v.errorMessage!!, v.errorMessage)
+    }
+
+    @Test
     fun `cancel between attempts ends the job cancelled without a second attempt`() {
         setup = { n, vm -> if (n == 0) wedgeBeforeAnySnapshot(vm) else vm.defaultScript() }
         val job = job()

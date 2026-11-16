@@ -151,6 +151,8 @@ class StartupSession(
         private var wedgedOp: String? = null
         /** The app was past its debugger wait at attach time (see [APP_NOT_WAITING_REASON]). */
         private var notWaiting = false
+        /** This attempt was aborted because the app was past its debugger wait (the only APP_NOT_WAITING failure). */
+        private var abortedNotWaiting = false
         /**
          * The one thread that talks JDWP (and owns the JDI event queue): JDI waits for replies without a timeout, so
          * every call runs here and the session thread waits for it with [jdwp]'s bound.
@@ -209,11 +211,11 @@ class StartupSession(
                 )
             }
             retryable = if (failure == null || appExited || stopFailedHint != null || (failure as? DeviceException)?.kind == DeviceException.Kind.CANCELLED || store.get(session.id)?.snapshots?.isNotEmpty() == true) null else when {
-                notWaiting && abortIfNotWaiting -> RetryableFailure.APP_NOT_WAITING
+                abortedNotWaiting -> RetryableFailure.APP_NOT_WAITING
                 wedgedOp != null -> RetryableFailure.VM_WEDGED
                 else -> null
             }
-                        failure?.let { throw it }
+            failure?.let { throw it }
             job.complete(session.id)
         }
 
@@ -282,10 +284,13 @@ class StartupSession(
             val waitError = jdwp("arming the waitForDebugger return") { dbg.armWaitReturn() }
             if (waitError != null && waitError.startsWith(APP_NOT_WAITING_REASON)) {
                 notWaiting = true
-                if (abortIfNotWaiting && Milestones.PROCESS_START in pending) throw DeviceException(
-                    DeviceException.Kind.COMMAND_FAILED, "The app was already past its debugger wait when MemScope attached, so the process start was missed.",
-                    "MemScope stopped the app; press Record again.",
-                )
+                if (abortIfNotWaiting && Milestones.PROCESS_START in pending) {
+                    abortedNotWaiting = true
+                    throw DeviceException(
+                        DeviceException.Kind.COMMAND_FAILED, "The app was already past its debugger wait when MemScope attached, so the process start was missed.",
+                        "MemScope stopped the app; press Record again.",
+                    )
+                }
             }
             for (m in pending.values.toList()) {
                 if (m.id == Milestones.PROCESS_START) {
@@ -710,6 +715,7 @@ class StartupSession(
         }
 
         private fun <T> timed(d: (String) -> Unit, lead: String? = null, block: () -> T): T {
+            lead?.let(d) // shown while the step runs, and kept if it fails
             val t0 = nowMs()
             val r = block()
             d(listOfNotNull(lead, (r as? String), "%.1f s".format((nowMs() - t0) / 1000.0)).joinToString(" · "))
