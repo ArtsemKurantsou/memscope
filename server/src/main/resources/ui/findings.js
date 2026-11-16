@@ -65,6 +65,9 @@ export function createFindings({ container, getSession, onShow, onBadge, onAnaly
       class: 'btn small', type: 'button', title: `Open the tree at this object${f.snapshotId ? ' in ' + labelOf(f.snapshotId) : ''}`,
       onclick: (e) => show(e.currentTarget, ref, f.snapshotId),
     }, f.refs.length > 1 ? `Show in tree (${i + 1})` : 'Show in tree'));
+    if (f.ruleId === 'leaked-component' && f.severity === 'LOW') {
+      buttons.push(el('button', { class: 'btn small primary', type: 'button', title: 'Run only the slow leak analysis again', onclick: () => load(true) }, 'Run leak analysis again'));
+    }
     return el('article', { class: 'fcard sev-' + f.severity.toLowerCase() },
       el('header', { class: 'fhead' }, chip(f.severity), el('h3', { class: 'ftitle' }, f.title),
         f.bytes > 0 ? el('span', { class: 'fsize num', title: 'Bytes this finding is about' }, formatBytes(f.bytes)) : null),
@@ -101,18 +104,21 @@ export function createFindings({ container, getSession, onShow, onBadge, onAnaly
           session.pending.map(labelOf).join(', '), ' ', el('button', { class: 'btn small', type: 'button', onclick: analyseAll }, 'Analyse all snapshots'))
         : null;
       if (session.findings.length || intro) parts.push(section('Across snapshots', session.findings, intro));
+      else parts.push(el('div', { class: 'fsection muted' }, 'Across snapshots: nothing found. Growth needs at least 3 analysed snapshots of one session; startup intervals need a startup recording.'));
     }
     container.replaceChildren(...parts);
   }
 
   async function analyseAll(e) {
     const btn = e.currentTarget;
+    const my = token; // a snapshot switch while analysing must not draw into the new snapshot view
     btn.disabled = true;
     try { await onAnalyseAll(session.pending, (i, n) => { btn.textContent = `Analysing ${i} of ${n}…`; }); } catch (err) {
       btn.after(el('span', { class: 'ferr', role: 'alert' }, ` ${err.message || err}${err.hint ? ' ' + err.hint : ''}`));
     }
-    await refreshSession();
-    render(snap ? results.get(snap.snap) || null : null);
+    if (my !== token) return;
+    await refreshSession(my);
+    if (my === token) render(snap ? results.get(snap.snap) || null : null);
   }
 
   function message(...nodes) { container.replaceChildren(el('div', { class: 'empty' }, ...nodes)); }
@@ -122,23 +128,26 @@ export function createFindings({ container, getSession, onShow, onBadge, onAnaly
       e.hint ? el('p', null, e.hint) : null, el('button', { class: 'btn primary small', type: 'button', onclick: () => load() }, 'Retry')));
   }
 
-  async function refreshSession() {
+  async function refreshSession(my = token) {
     const s = getSession();
-    session = null;
+    if (my === token) session = null;
     if (!s) return;
-    try { session = await api.sessionFindings(s.id); } catch { session = null; }
+    let fresh = null;
+    try { fresh = await api.sessionFindings(s.id); } catch { fresh = null; }
+    if (my === token) session = fresh;
   }
 
   /** Computes (or reuses) the findings of the open snapshot and draws them. */
-  async function load() {
+  async function load(rerun = false) {
     if (!snap) { message('No snapshot open.'); return; }
     const my = ++token;
     const mine = snap;
+    if (rerun) results.delete(mine.snap);
     const cached = results.get(mine.snap);
-    if (cached) { await refreshSession(); if (my === token) render(cached); return; }
+    if (cached) { await refreshSession(my); if (my === token) render(cached); return; }
     message(el('span', { class: 'spinner' }), ' Computing findings… ', el('span', { class: 'muted', id: 'findings-step' }, 'Starting'));
     try {
-      let r = await mine.findings();
+      let r = await mine.findings(rerun);
       if (r.jobId) {
         const j = await api.pollJob(r.jobId, (job) => {
           const t = document.getElementById('findings-step');
@@ -149,7 +158,7 @@ export function createFindings({ container, getSession, onShow, onBadge, onAnaly
       }
       results.set(mine.snap, r.findings);
       if (snap === mine) onBadge(badgeCounts(r.findings));
-      await refreshSession();
+      await refreshSession(my);
       if (my === token) render(r.findings);
     } catch (e) {
       if (my === token) errorPanel(e);

@@ -157,8 +157,16 @@ const compare = createCompare({ box: $('compare-on'), select: $('compare-select'
 
 /** "Show in tree" of a finding: switch to its snapshot if needed, then reveal the object. */
 async function showInTree(ref, snapshotId) {
-  if (snapshotId && state.snap && snapshotId !== state.snap.snap) await capture.selectSnapshot(snapshotId);
+  // Leave the Findings tab first: opening the target snapshot while it is shown would start a findings computation nobody asked for.
   setTab('tree');
+  if (snapshotId && (!state.snap || snapshotId !== state.snap.snap)) {
+    await capture.selectSnapshot(snapshotId);
+    if (!state.snap || state.snap.snap !== snapshotId) { // selectSnapshot returns silently when busy, not OK or unknown
+      setTab('findings');
+      showBanner({ message: 'Could not switch to that snapshot.', hint: 'It may be busy (a dump or analysis is running) or unreadable; wait for the current operation to finish and try again.' });
+      return;
+    }
+  }
   await revealRef(ref);
 }
 
