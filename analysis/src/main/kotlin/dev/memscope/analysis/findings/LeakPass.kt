@@ -1,69 +1,81 @@
 package dev.memscope.analysis.findings
 
-import dev.memscope.analysis.Snapshot
-import shark.AndroidObjectInspectors
-import shark.AndroidReferenceMatchers
-import shark.FilteringLeakingObjectFinder
-import shark.HeapAnalysisFailure
-import shark.HeapAnalysisSuccess
-import shark.HeapAnalyzer
-import shark.HeapGraph
-import shark.LeakTrace
-import shark.LeakingObjectFinder
-import shark.MetadataExtractor
-import shark.OnAnalysisProgressListener
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
 import java.io.File
+import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
+
+/** One leak as the child JVM reports it: the leaking object's hprof id and a compact rendering of Shark's trace. */
+@Serializable
+class LeakTraceDto(
+    val objectId: Long,
+    val className: String,
+    val reason: String,
+    /** "GC root: ..." first, one line per reference (the suspect marked), the leaking object last. */
+    val lines: List<String>,
+    /** The suspect reference as `Owner.field`, or "its GC root". */
+    val holder: String,
+)
+
+@Serializable
+class LeakResultDto(val traces: List<LeakTraceDto>)
 
 /** Result of Shark's own leak analysis of an hprof. */
 internal sealed interface LeakPassResult {
-    class Done(val traces: List<LeakTrace>, val leakingIds: Set<Long>) : LeakPassResult
+    class Done(val traces: List<LeakTraceDto>) : LeakPassResult
     object TimedOut : LeakPassResult
+    object OutOfMemory : LeakPassResult
     class Failed(val message: String) : LeakPassResult
 }
 
+/** Starts the child process that writes its [LeakResultDto] JSON to [out]; a seam so tests need no real dump. */
+internal fun interface LeakChildLauncher {
+    fun start(hprof: File, out: File, stderr: File): Process
+}
+
 /**
- * Shark's leak analysis (destroyed Activities, Fragments, Views, Services ... still strongly reachable) as a
- * separate pass over the hprof, bounded by [timeoutMs]. Shark has no cancel: the analysis runs on a daemon
- * thread, and after the deadline its progress listener and leaking-object filter throw to stop it at the next step.
+ * Shark's leak analysis in a CHILD JVM (`LeakPassMain`): its memory (a second Shark graph) never counts against the
+ * server's heap, an out-of-memory only kills the child, and on timeout the process is destroyed (a real bound).
+ * One pass at a time (global semaphore). `MEMSCOPE_LEAK_XMX` (default 4g) sizes the child heap.
  */
 internal object LeakPass {
-    private class Deadline(val atNanos: Long, val expired: AtomicBoolean = AtomicBoolean(false)) {
-        fun check() { if (expired.get() || System.nanoTime() > atNanos) { expired.set(true); throw LeakTimeout() } }
-    }
-    private class LeakTimeout : RuntimeException("leak analysis deadline passed")
+    const val CHILD_OOM_EXIT = 3
+    private val gate = Semaphore(1)
 
-    fun run(hprof: File, timeoutMs: Long): LeakPassResult {
-        val deadline = Deadline(System.nanoTime() + timeoutMs * 1_000_000)
-        val ids = HashSet<Long>()
-        val finder = LeakingObjectFinder { graph: HeapGraph ->
-            deadline.check()
-            FilteringLeakingObjectFinder(AndroidObjectInspectors.appLeakingObjectFilters).findLeakingObjectIds(graph).also { ids += it }
-        }
-        var outcome: LeakPassResult = LeakPassResult.Failed("leak analysis did not finish")
-        val thread = Thread({
-            outcome = try {
-                val analysis = HeapAnalyzer(OnAnalysisProgressListener { deadline.check() }).analyze(
-                    heapDumpFile = hprof, leakingObjectFinder = finder,
-                    referenceMatchers = AndroidReferenceMatchers.appDefaults, computeRetainedHeapSize = false,
-                    objectInspectors = AndroidObjectInspectors.appDefaults, metadataExtractor = MetadataExtractor.NO_OP,
-                )
-                when (analysis) {
-                    is HeapAnalysisSuccess -> LeakPassResult.Done(analysis.applicationLeaks.flatMap { it.leakTraces }, ids.toSet())
-                    is HeapAnalysisFailure -> LeakPassResult.Failed(analysis.exception.let { ex -> (ex.cause ?: ex).let { c -> (c.message ?: c.javaClass.simpleName) + (c.stackTrace.take(3).joinToString(prefix = " at ", separator = " < ")) } })
-                }
-            } catch (_: LeakTimeout) {
-                LeakPassResult.TimedOut
-            } catch (e: Throwable) {
-                if (e.cause is LeakTimeout) LeakPassResult.TimedOut else LeakPassResult.Failed((e.message ?: e.javaClass.simpleName) + (e.stackTrace.firstOrNull()?.let { " at $it" } ?: ""))
+    fun xmx(): String = System.getenv("MEMSCOPE_LEAK_XMX")?.takeIf { it.isNotBlank() } ?: "4g"
+
+    val realLauncher = LeakChildLauncher { hprof, out, stderr ->
+        val java = ProcessHandle.current().info().command().orElse("java")
+        ProcessBuilder(
+            java, "-Xmx${xmx()}", "-XX:+ExitOnOutOfMemoryError", "-cp", System.getProperty("java.class.path"),
+            "dev.memscope.analysis.findings.LeakPassMainKt", hprof.absolutePath, out.absolutePath,
+        ).redirectErrorStream(false).redirectError(stderr).redirectOutput(ProcessBuilder.Redirect.DISCARD).start()
+    }
+
+    fun run(hprof: File, timeoutMs: Long, launcher: LeakChildLauncher = realLauncher): LeakPassResult {
+        val deadline = System.nanoTime() + timeoutMs * 1_000_000
+        if (!gate.tryAcquire(timeoutMs, TimeUnit.MILLISECONDS)) return LeakPassResult.TimedOut
+        val out = File.createTempFile("memscope-leaks", ".json")
+        val err = File.createTempFile("memscope-leaks", ".err")
+        var process: Process? = null
+        try {
+            process = launcher.start(hprof, out, err)
+            val left = (deadline - System.nanoTime()) / 1_000_000
+            if (left <= 0 || !process.waitFor(left, TimeUnit.MILLISECONDS)) {
+                process.destroyForcibly().waitFor(10, TimeUnit.SECONDS)
+                return LeakPassResult.TimedOut
             }
-        }, "memscope-leak-pass").apply { isDaemon = true; start() }
-        thread.join(TimeUnit.MILLISECONDS.toMillis(timeoutMs))
-        if (thread.isAlive) {
-            deadline.expired.set(true) // stops at the next Shark step
-            return LeakPassResult.TimedOut
+            val code = process.exitValue()
+            if (code == CHILD_OOM_EXIT || err.readText().contains("OutOfMemoryError")) return LeakPassResult.OutOfMemory
+            if (code != 0) return LeakPassResult.Failed("exit code $code: " + err.readText().lines().firstOrNull { it.isNotBlank() }.orEmpty().take(200))
+            return LeakPassResult.Done(Json { ignoreUnknownKeys = true }.decodeFromString(LeakResultDto.serializer(), out.readText()).traces)
+        } catch (e: Exception) {
+            return LeakPassResult.Failed(e.message ?: e.javaClass.simpleName)
+        } finally {
+            process?.takeIf { it.isAlive }?.destroyForcibly()
+            out.delete(); err.delete()
+            gate.release()
         }
-        return outcome
     }
 }

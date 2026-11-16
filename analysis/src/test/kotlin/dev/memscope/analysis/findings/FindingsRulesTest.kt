@@ -90,12 +90,6 @@ class FindingsRulesTest {
         }
     }
 
-    @Test fun leakPassPastItsDeadlineGivesALowSkippedFinding() {
-        val f = LeakedComponentRule().evaluate(RuleContext(snap, hprof, screen, leakTimeoutMs = 0)).single()
-        assertEquals(Severity.LOW, f.severity)
-        assertTrue(f.title.startsWith("leak analysis skipped: took too long"), f.title)
-    }
-
     @Test fun forSnapshotSortsBySeverityThenBytesAndRunsEveryRule() {
         val ran = ArrayList<String>()
         val all = Findings.forSnapshot(snap, hprof, screen, progress = { ran += it })

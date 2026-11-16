@@ -39,6 +39,14 @@ object Findings {
                 rule.evaluate(ctx)
             } catch (e: HprofUnreadableException) {
                 throw e
+            } catch (e: OutOfMemoryError) {
+                listOf(
+                    Finding(
+                        rule.id, Severity.LOW, "Rule ${rule.id} ran out of memory",
+                        "The JVM ran out of heap while this rule worked on a large dump; the other findings are unaffected.",
+                        "Restart MemScope with a larger heap (java -Xmx) and open the Findings tab again.", 0, emptyList(),
+                    ),
+                )
             } catch (e: Exception) {
                 listOf(
                     Finding(

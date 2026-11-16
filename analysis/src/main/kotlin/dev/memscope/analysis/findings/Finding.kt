@@ -65,7 +65,8 @@ object Thresholds {
     const val KB = 1024L
     const val MB = 1024L * 1024L
 
-    const val LEAK_ANALYSIS_TIMEOUT_MS = 120_000L
+    /** `MEMSCOPE_LEAK_TIMEOUT_SEC` (default 120). */
+    val LEAK_ANALYSIS_TIMEOUT_MS: Long get() = System.getenv("MEMSCOPE_LEAK_TIMEOUT_SEC")?.toLongOrNull()?.takeIf { it > 0 }?.times(1000) ?: 120_000L
     /** oversized-bitmap: pixels above this multiple of the screen's pixels. */
     const val OVERSIZED_BITMAP_SCREEN_FACTOR = 2L
     const val DUPLICATE_BITMAP_MIN_COUNT = 5
