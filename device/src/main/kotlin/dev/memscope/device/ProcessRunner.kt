@@ -15,8 +15,24 @@ data class ProcessResult(val exitCode: Int, val stdout: String, val stderr: Stri
 /** Cooperative cancellation flag shared between a job and the process runs it starts. */
 class CancelToken {
     @Volatile private var cancelled = false
-    fun cancel() { cancelled = true }
+    private val listeners = ArrayList<() -> Unit>()
+
+    fun cancel() {
+        val run = synchronized(listeners) {
+            if (cancelled) return
+            cancelled = true
+            listeners.toList().also { listeners.clear() }
+        }
+        run.forEach { it() }
+    }
+
     val isCancelled: Boolean get() = cancelled
+
+    /** Runs [listener] once when the token is cancelled (at once, on this thread, if it already is). */
+    fun onCancel(listener: () -> Unit) {
+        val now = synchronized(listeners) { if (cancelled) true else { listeners += listener; false } }
+        if (now) listener()
+    }
 
     companion object {
         /** A token that is never cancelled. */

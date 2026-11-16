@@ -220,7 +220,11 @@ private fun Route.sessionRoutes(deps: ServerDeps) {
                 val session = createExclusive(req)
                 val job = deps.jobs.create("Record startup of ${config.processName ?: req.packageName}", StartupSession.stepNames(config))
                 deps.setRunningStartup(ServerDeps.RunningStartup(session.id, job))
-                deps.jobs.submit(job) { deps.startupRunner.run(deps, session.id, config, job) }
+                deps.jobs.submit(
+                    job, JobRegistry.Lane.DEVICE,
+                    // cancelled while queued behind a dump: nothing happened on the device, the empty session just ends
+                    onSkipped = { store.update(session.id) { it.copy(state = SessionMeta.State.ENDED, note = "recording cancelled before it started") } },
+                ) { deps.startupRunner.run(deps, session.id, config, job) }
                 StartupStarted(session, job.id)
             }
         }
@@ -281,7 +285,7 @@ private fun Route.sessionRoutes(deps: ServerDeps) {
         DeviceArgs.requireProcessName(process)
         val label = req.label?.takeIf { it.isNotBlank() } ?: "Snapshot ${session.snapshots.size + 1}"
         val job = deps.jobs.create("Dump $process", OnDemandDumper.STEP_NAMES)
-        deps.jobs.submit(job) { deps.dumper.dump(id, process, label, job) }
+        deps.jobs.submit(job, JobRegistry.Lane.DEVICE) { deps.dumper.dump(id, process, label, job) }
         call.respond(JobRef(job.id))
     }
 }

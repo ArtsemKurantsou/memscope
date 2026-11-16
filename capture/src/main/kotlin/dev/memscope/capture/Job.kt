@@ -71,6 +71,11 @@ class Job(
     /** Sets the detail text of step [name] without changing its state (e.g. what a pending step is waiting for). */
     fun note(name: String, detail: String) = synchronized(lock) { replace(name) { it.copy(detail = detail) } }
 
+    /** Removes the detail of step [name] if it is still exactly [detail] and the step has not started. */
+    fun clearNote(name: String, detail: String) = synchronized(lock) {
+        replace(name) { if (it.state == StepState.PENDING && it.detail == detail) it.copy(detail = null) else it }
+    }
+
     /** Sets every step back to PENDING (a retry of the whole operation inside the same job). */
     fun resetSteps() = synchronized(lock) {
         if (state != State.RUNNING) return
