@@ -91,7 +91,11 @@ elif [ "$mode" = "diff" ]; then
   wait_ready
   dump fixture-after
 else
-  a shell am start -n "$pkg/.MainActivity" --es actions "$actions" >/dev/null
+  if [ -n "$actions" ]; then # adb drops an empty argument, so a plain launch passes no extra at all
+    a shell am start -n "$pkg/.MainActivity" --es actions "$actions" >/dev/null
+  else
+    a shell am start -n "$pkg/.MainActivity" >/dev/null
+  fi
   wait_ready
   dump "$name"
 fi

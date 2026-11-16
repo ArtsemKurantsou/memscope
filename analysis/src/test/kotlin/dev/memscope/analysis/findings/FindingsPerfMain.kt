@@ -20,7 +20,7 @@ fun main(args: Array<String>) {
     val out = Findings.forSnapshot(s, progress = { id -> lap("(before $id)") })
     lap("last rule")
     println("findings: ${out.size}")
-    out.forEach { println("  [${it.severity}] ${it.ruleId}: ${it.title}") }
+    out.forEach { println("  [${it.severity}] ${it.ruleId}: ${it.title}\n      evidence: ${it.evidence.replace("\n", "\n                ")}\n      suggestion: ${it.suggestion}") }
     println("rules: $rules; hprof ${file.length() / (1024 * 1024)} MB; peak heap ${peakMb()} MB")
     SnapshotSummaries.compute(s); lap("summary sidecar")
     s.close()
