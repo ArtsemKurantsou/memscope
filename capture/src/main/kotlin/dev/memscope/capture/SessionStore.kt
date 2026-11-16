@@ -126,6 +126,71 @@ class SessionStore(val home: Path = memscopeHome()) {
         return dir(sessionId).resolve("$snapshotId.hprof")
     }
 
+    /** Bytes of the regular files directly in the session directory (hprofs, analysis sidecars, timeline); 0 if it is gone. */
+    fun diskBytes(id: String): Long = synchronized(lock) { filesIn(dir(id)).sumOf { sizeOf(it) } }
+
+    /** Bytes of snapshot [snapshotId]'s hprof and its sidecars. */
+    fun snapshotBytes(sessionId: String, snapshotId: String): Long = synchronized(lock) {
+        snapshotFiles(sessionId, snapshotId).sumOf { sizeOf(it) }
+    }
+
+    /**
+     * Removes snapshot [snapshotId] from session.json, then deletes `<id>.hprof` and every `<id>.hprof.*` file next to it
+     * (index, summary and findings sidecars, temp and partial files). Throws [NoSuchElementException] for an unknown
+     * session or snapshot.
+     */
+    fun deleteSnapshot(sessionId: String, snapshotId: String): SessionMeta = synchronized(lock) {
+        val files = snapshotFiles(sessionId, snapshotId)
+        val current = read(sessionId) ?: throw NoSuchElementException("no such session: $sessionId")
+        if (current.snapshots.none { it.id == snapshotId }) throw NoSuchElementException("no such snapshot: $sessionId/$snapshotId")
+        val next = current.copy(snapshots = current.snapshots.filter { it.id != snapshotId })
+        write(next)
+        files.forEach { Files.deleteIfExists(it) }
+        next
+    }
+
+    /**
+     * Deletes the session directory and everything in it. A symbolic link inside is removed itself, its target never
+     * touched. False if the session did not exist.
+     */
+    fun deleteSession(id: String): Boolean = synchronized(lock) {
+        val dir = dir(id)
+        if (!Files.exists(dir, java.nio.file.LinkOption.NOFOLLOW_LINKS)) return false
+        if (Files.isSymbolicLink(dir)) { Files.delete(dir); return true }
+        Files.walkFileTree(dir, object : java.nio.file.SimpleFileVisitor<Path>() { // does not follow links
+            override fun visitFile(file: Path, attrs: java.nio.file.attribute.BasicFileAttributes): java.nio.file.FileVisitResult {
+                Files.delete(file)
+                return java.nio.file.FileVisitResult.CONTINUE
+            }
+
+            override fun postVisitDirectory(d: Path, exc: java.io.IOException?): java.nio.file.FileVisitResult {
+                if (exc != null) throw exc
+                Files.delete(d)
+                return java.nio.file.FileVisitResult.CONTINUE
+            }
+        })
+        reservedSnapshotNumbers.remove(id)
+        true
+    }
+
+    private fun snapshotFiles(sessionId: String, snapshotId: String): List<Path> {
+        val hprof = snapshotFile(sessionId, snapshotId).fileName.toString()
+        return filesIn(dir(sessionId)).filter { val n = it.fileName.toString(); n == hprof || n.startsWith("$hprof.") }
+    }
+
+    /** Files and symbolic links (never followed) directly in [dir]. */
+    private fun filesIn(dir: Path): List<Path> {
+        if (!Files.isDirectory(dir, java.nio.file.LinkOption.NOFOLLOW_LINKS)) return emptyList()
+        return Files.list(dir).use { s -> s.filter { !Files.isDirectory(it, java.nio.file.LinkOption.NOFOLLOW_LINKS) }.toList() }
+    }
+
+    /** Size of [p] itself (a link's own size, not its target's). */
+    private fun sizeOf(p: Path): Long = try {
+        Files.readAttributes(p, java.nio.file.attribute.BasicFileAttributes::class.java, java.nio.file.LinkOption.NOFOLLOW_LINKS).size()
+    } catch (_: java.io.IOException) {
+        0L
+    }
+
     private fun read(id: String): SessionMeta? {
         val file = dir(id).resolve(SESSION_FILE)
         if (!Files.isRegularFile(file)) return null

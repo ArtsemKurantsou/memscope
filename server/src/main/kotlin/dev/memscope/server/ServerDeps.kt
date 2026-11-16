@@ -40,6 +40,8 @@ class ServerDeps(
     val snapshots: SnapshotRegistry = SnapshotRegistry(capacity = 2),
     /** Finished snapshot diffs; they outlive the snapshots they were computed from. */
     val diffs: DiffCache = DiffCache(),
+    /** Computed findings per snapshot key (`<sid>/<snap>`); a snapshot file never changes. */
+    val findingsCache: java.util.concurrent.ConcurrentHashMap<String, List<dev.memscope.analysis.findings.Finding>> = java.util.concurrent.ConcurrentHashMap(),
     val startupRunner: StartupRunner = StartupRunner.real,
     /** False in tests that must not see background `dumpsys meminfo` traffic. */
     private val memoryPolling: Boolean = true,

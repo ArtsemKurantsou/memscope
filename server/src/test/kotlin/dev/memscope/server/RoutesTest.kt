@@ -10,6 +10,7 @@ import dev.memscope.capture.StartupConfig
 import dev.memscope.device.DeviceException
 import io.ktor.client.HttpClient
 import io.ktor.client.plugins.DefaultRequest
+import io.ktor.client.request.delete
 import io.ktor.client.request.get
 import io.ktor.client.request.header
 import io.ktor.client.request.post
@@ -933,6 +934,115 @@ class RoutesTest {
         waitUntil { logs.any { it.contains("failed") } }
         val line = logs.first { it.contains("failed") }
         assertTrue(line.contains("kind=") && line.contains("message=") && line.contains("hint="), line)
+    }
+
+    // ---------------------------------------------------------------- deleting
+
+    private suspend fun HttpClient.deleteReq(url: String, origin: String? = null) =
+        delete(url) { if (origin != null) header(HttpHeaders.Origin, origin) }
+
+    private fun sidecars(sid: String, snap: String): List<File> {
+        val hprof = store.snapshotFile(sid, snap).toFile()
+        return listOf(".idx", ".summary.json", ".findings.json", ".idx.42.tmp").map { File(hprof.path + it).also { f -> f.writeBytes(ByteArray(300)) } }
+    }
+
+    @Test fun sessionsListTheirSizeOnDisk() = server {
+        val s = store.newAttachSession()
+        val snap = store.addFakeSnapshot(s.id, bytes = 5000)
+        sidecars(s.id, snap)
+        val row = client.get("/api/sessions").array().single().jsonObject
+        assertEquals(s.id, str(row, "id"))
+        assertTrue(row["diskBytes"]!!.jsonPrimitive.content.toLong() >= 5000 + 4 * 300, row.toString())
+        assertEquals(1, row["snapshots"]!!.jsonArray.size, "the session fields are unchanged")
+    }
+
+    @Test fun deletingASnapshotRemovesItsFilesEntryViewAndCachedResults() = server {
+        val s = store.newAttachSession()
+        val (a, b) = (1..2).map { store.addFakeSnapshot(s.id) }
+        val mine = sidecars(s.id, a) + store.snapshotFile(s.id, a).toFile()
+        val theirs = sidecars(s.id, b) + store.snapshotFile(s.id, b).toFile()
+        client.openSnapshot(s.id, a)
+        client.openSnapshot(s.id, b)
+        assertEquals(HttpStatusCode.OK, client.get("/api/snapshots/${s.id}/$b/diff?base=$a").status)
+        val r = client.deleteReq("/api/snapshots/${s.id}/$a")
+        assertEquals(HttpStatusCode.OK, r.status, r.bodyAsText())
+        assertEquals("${s.id}/$a", str(r.obj(), "deleted"))
+        assertEquals(2048L + 4 * 300, r.obj()["freedBytes"]!!.jsonPrimitive.content.toLong())
+        mine.forEach { assertFalse(it.exists(), "${it.name} is gone") }
+        theirs.forEach { assertTrue(it.exists(), "${it.name} is kept") }
+        assertEquals(listOf(b), store.get(s.id)!!.snapshots.map { it.id })
+        assertTrue(opener.opened.first { it.name == "$a.hprof" }.closed, "the open snapshot is closed")
+        assertEquals(HttpStatusCode.NotFound, client.get("/api/snapshots/${s.id}/$b/diff?base=$a").status, "no stale cached diff")
+        assertEquals(HttpStatusCode.NotFound, client.deleteReq("/api/snapshots/${s.id}/$a").status)
+        assertEquals(HttpStatusCode.OK, client.get("/api/snapshots/${s.id}/$b/summary").status)
+    }
+
+    @Test fun deletingASessionRemovesItsDirectoryAndClosesItsSnapshots() = server {
+        memoryPolling = false
+        val other = store.newAttachSession()
+        val otherSnap = store.addFakeSnapshot(other.id)
+        val s = store.newAttachSession()
+        val snap = store.addFakeSnapshot(s.id)
+        sidecars(s.id, snap)
+        client.openSnapshot(s.id, snap)
+        val dir = store.dir(s.id).toFile()
+        val r = client.deleteReq("/api/sessions/${s.id}")
+        assertEquals(HttpStatusCode.OK, r.status, r.bodyAsText())
+        assertTrue(r.obj()["freedBytes"]!!.jsonPrimitive.content.toLong() >= 2048)
+        assertFalse(dir.exists())
+        assertTrue(opener.opened.single().closed)
+        assertEquals(listOf(other.id), client.get("/api/sessions").array().map { str(it.jsonObject, "id") })
+        assertTrue(store.snapshotFile(other.id, otherSnap).toFile().exists())
+        assertEquals(HttpStatusCode.NotFound, client.deleteReq("/api/sessions/${s.id}").status)
+        assertEquals(HttpStatusCode.NotFound, client.get("/api/snapshots/${s.id}/$snap/summary").status)
+    }
+
+    @Test fun deletingIsRefusedWhileAJobOfItRuns() = server {
+        val s = store.newAttachSession()
+        val (a, b) = (1..2).map { store.addFakeSnapshot(s.id) }
+        val gate = CountDownLatch(1)
+        opener.gate = gate
+        val job = str(client.postJson("/api/snapshots/${s.id}/$a/open").obj(), "jobId")
+        for (url in listOf("/api/snapshots/${s.id}/$a", "/api/sessions/${s.id}")) {
+            val r = client.deleteReq(url)
+            assertEquals(HttpStatusCode.Conflict, r.status, url)
+            assertEquals("BUSY", str(r.obj(), "kind"))
+            assertTrue(str(r.obj(), "error").contains("analysis") && str(r.obj(), "hint").contains("cancel"), r.bodyAsText())
+        }
+        assertEquals(HttpStatusCode.OK, client.deleteReq("/api/snapshots/${s.id}/$b").status, "another snapshot of the session is free")
+        gate.countDown()
+        assertEquals("DONE", str(client.waitJob(job), "state"))
+        assertEquals(HttpStatusCode.OK, client.deleteReq("/api/sessions/${s.id}").status)
+    }
+
+    @Test fun deletingARecordingSessionIsRefusedUntilItEnds() = server {
+        startupGate = CountDownLatch(1)
+        val o = client.postJson("/api/sessions", startupBody).obj()
+        val sid = str(o["session"]!!.jsonObject, "id")
+        val r = client.deleteReq("/api/sessions/$sid")
+        assertEquals(HttpStatusCode.Conflict, r.status)
+        assertTrue(str(r.obj(), "error").contains("startup recording"), r.bodyAsText())
+        client.postJson("/api/jobs/${str(o, "jobId")}/cancel")
+        client.waitJob(str(o, "jobId"))
+        assertEquals(HttpStatusCode.OK, client.deleteReq("/api/sessions/$sid").status)
+    }
+
+    @Test fun deletingNeverReachesOutsideTheSessionDirectory() = server {
+        val s = store.newAttachSession()
+        val outside = home.resolve("outside.txt").toFile().also { it.writeText("keep") }
+        java.nio.file.Files.createSymbolicLink(store.dir(s.id).resolve("s1.hprof.idx"), outside.toPath())
+        store.addFakeSnapshot(s.id) // s1
+        for (url in listOf("/api/sessions/..%2F..", "/api/sessions/..", "/api/snapshots/${s.id}/..%2Fx", "/api/snapshots/..%2F../s1")) {
+            val status = client.deleteReq(url).status
+            assertTrue(status == HttpStatusCode.BadRequest || status == HttpStatusCode.NotFound, "$url was $status")
+        }
+        assertEquals(HttpStatusCode.Forbidden, client.deleteReq("/api/sessions/${s.id}", origin = "http://evil.example").status)
+        assertTrue(store.dir(s.id).toFile().exists())
+        assertEquals(HttpStatusCode.OK, client.deleteReq("/api/snapshots/${s.id}/s1").status)
+        assertEquals("keep", outside.readText(), "a link is removed, never its target")
+        assertEquals(HttpStatusCode.OK, client.deleteReq("/api/sessions/${s.id}").status)
+        assertEquals("keep", outside.readText())
+        assertTrue(home.resolve("sessions").toFile().exists())
     }
 
     @Test fun crossSiteOriginIsRefusedOnStateChangingRequests() = server {

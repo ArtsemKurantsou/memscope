@@ -9,10 +9,11 @@
 import * as api from './api.js';
 import { el, formatBytes, formatTime } from './util.js';
 import { askStartupConfig } from './startup.js';
+import { confirmDialog, openSessionsDialog } from './sessions.js';
 
 const $ = (id) => document.getElementById(id);
 
-export function createCapture({ onSnapshot, onNoSnapshot, onEmptyState, onSession = () => {} }) {
+export function createCapture({ onSnapshot: showSnapshot, onNoSnapshot, onEmptyState, onSession = () => {}, onCleared = () => {} }) {
   const deviceSel = $('device-select');
   const appSel = $('app-select');
   const dumpBtn = $('dump-btn');
@@ -21,6 +22,8 @@ export function createCapture({ onSnapshot, onNoSnapshot, onEmptyState, onSessio
   const procSel = $('dump-process');
   const jobPanel = $('job-panel');
   const snapSel = $('snapshot-select');
+  const snapDelBtn = $('snapshot-delete');
+  const sessionsBtn = $('sessions-btn');
 
   let devices = [];
   let apps = [];
@@ -29,6 +32,13 @@ export function createCapture({ onSnapshot, onNoSnapshot, onEmptyState, onSessio
   let stepClock = new Map(); // "jobId/stepName" -> { start, end }
   let hideTimer = null;
   let appsToken = 0;        // guards loadApps against out-of-order responses
+  let shown = null;         // { sid, id } of the snapshot handed to the views, or null
+
+  /** Hands a snapshot to the views and remembers which one is shown (a delete must know). */
+  async function onSnapshot(sid, meta) {
+    shown = { sid, id: meta.id };
+    await showSnapshot(sid, meta);
+  }
 
   // ------------------------------------------------------------ pickers
 
@@ -100,6 +110,8 @@ export function createCapture({ onSnapshot, onNoSnapshot, onEmptyState, onSessio
     dumpBtn.textContent = busy ? 'Working…' : 'Dump now';
     startupBtn.disabled = dumpBtn.disabled;
     procSel.disabled = busy;
+    snapDelBtn.disabled = busy || !session || !snapSel.value;
+    sessionsBtn.disabled = busy;
   }
 
   /** Process names of the selected app (running ones from the app list), the package itself first. */
@@ -123,12 +135,63 @@ export function createCapture({ onSnapshot, onNoSnapshot, onEmptyState, onSessio
   function renderSnapshots(selectId) {
     onSession(session);
     const snaps = session ? session.snapshots : [];
-    if (!snaps.length) { setSelect(snapSel, [], 'No snapshots yet'); return; }
+    if (!snaps.length) { setSelect(snapSel, [], 'No snapshots yet'); updateButtons(); return; }
     setSelect(snapSel, snaps.map((s, i) => ({
       value: s.id,
       label: `${i + 1}. ${s.label} · ${formatTime(s.takenAtMs)} · ${formatBytes(s.sizeBytes)}${s.status !== 'OK' ? ' (' + s.status.toLowerCase() + ')' : ''}`,
     })), '');
     if (selectId) snapSel.value = selectId;
+    updateButtons();
+  }
+
+  // ------------------------------------------------------------ sessions: open, delete
+
+  /** Nothing to show any more (its snapshot or session was deleted): the views go back to the empty state. */
+  function cleared() {
+    shown = null;
+    onCleared();
+  }
+
+  /** Shows a session picked in the Sessions dialog: its snapshots, and its newest readable one. */
+  async function openSession(s) {
+    if (busy) return;
+    try { session = await api.session(s.id); } catch (e) { reportLoad(e); return; }
+    if ([...deviceSel.options].some((o) => o.value === session.serial && !o.disabled) && deviceSel.value !== session.serial) {
+      deviceSel.value = session.serial;
+      try { await loadApps(false); } catch (e) { reportLoad(e); }
+    }
+    if (apps.some((a) => a.packageName === session.packageName)) { appSel.value = session.packageName; renderProcesses(); }
+    const last = lastOk(session);
+    renderSnapshots(last?.id);
+    updateButtons();
+    if (last) await onSnapshot(session.id, last); else cleared();
+  }
+
+  /** A session was deleted in the dialog: forget it if it is the one on screen. */
+  function sessionDeleted(id) {
+    if (session && session.id === id) { session = null; renderSnapshots(); updateButtons(); }
+    if (shown && shown.sid === id) cleared();
+  }
+
+  async function deleteSelectedSnapshot() {
+    const meta = selectedSnapshotMeta();
+    if (!meta || busy) return;
+    const ok = await confirmDialog('Delete this snapshot?',
+      `${meta.label || meta.id} (${formatBytes(meta.sizeBytes)} heap dump, plus about 1.5\u00d7 that in analysis files) is deleted permanently.`,
+      'Delete snapshot');
+    if (!ok || !session) return;
+    const sid = session.id;
+    try {
+      await api.deleteSnapshot(sid, meta.id);
+    } catch (e) { reportLoad(e); return; }
+    try { session = await api.session(sid); } catch (e) { reportLoad(e); return; }
+    const wasShown = shown && shown.sid === sid && shown.id === meta.id;
+    const keep = !wasShown && shown && shown.sid === sid ? shown.id : null;
+    const next = keep ? null : lastOk(session);
+    renderSnapshots(keep || next?.id);
+    updateButtons();
+    if (!wasShown) return;
+    if (next) await onSnapshot(sid, next); else cleared();
   }
 
   function selectedSnapshotMeta() {
@@ -364,6 +427,8 @@ export function createCapture({ onSnapshot, onNoSnapshot, onEmptyState, onSessio
   $('app-refresh').addEventListener('click', () => loadApps(true).catch(reportLoad));
   dumpBtn.addEventListener('click', dumpNow);
   startupBtn.addEventListener('click', recordStartup);
+  snapDelBtn.addEventListener('click', deleteSelectedSnapshot);
+  sessionsBtn.addEventListener('click', () => openSessionsDialog({ currentId: session && session.id, onOpen: openSession, onDeleted: sessionDeleted }));
   snapSel.addEventListener('change', async () => {
     const meta = selectedSnapshotMeta();
     if (meta) await onSnapshot(session.id, meta);

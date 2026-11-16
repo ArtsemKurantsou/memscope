@@ -20,6 +20,11 @@ import java.util.concurrent.atomic.AtomicLong
 class JobRegistry(workers: Int = 3, private val keepFinished: Int = 50) : AutoCloseable {
     enum class Lane { DEVICE, ANALYSIS }
 
+    /** What a job works on: a whole session ([snapshotId] null: a dump or a recording) or one snapshot of it. */
+    data class Scope(val sessionId: String, val snapshotId: String?, val what: String)
+
+    private val scopes = HashMap<String, Scope>()
+
     private val jobs = LinkedHashMap<String, Job>()
     private val counter = AtomicLong()
     private val analysisPool = pool("memscope-worker", workers)
@@ -38,12 +43,25 @@ class JobRegistry(workers: Int = 3, private val keepFinished: Int = 50) : AutoCl
 
     private fun poolOf(lane: Lane) = if (lane == Lane.DEVICE) devicePool else analysisPool
 
-    fun create(title: String, steps: List<String>): Job = synchronized(jobs) {
+    fun create(title: String, steps: List<String>, scope: Scope? = null): Job = synchronized(jobs) {
         val job = Job("j${counter.incrementAndGet()}", title, steps)
         jobs[job.id] = job
+        if (scope != null) scopes[job.id] = scope
         val finished = jobs.values.filter { it.snapshot().state != Job.State.RUNNING }
-        finished.take((finished.size - keepFinished).coerceAtLeast(0)).forEach { jobs.remove(it.id) }
+        finished.take((finished.size - keepFinished).coerceAtLeast(0)).forEach { jobs.remove(it.id); scopes.remove(it.id) }
         job
+    }
+
+    /**
+     * Running (or queued) jobs that would be affected by removing session [sessionId] ([snapshotId] null) or its snapshot
+     * [snapshotId]: the session's dumps and recordings, and the analysis / findings jobs of that snapshot (of any, for null).
+     */
+    fun runningFor(sessionId: String, snapshotId: String? = null): List<Pair<Job, Scope>> = synchronized(jobs) {
+        scopes.entries.mapNotNull { (id, scope) ->
+            val job = jobs[id] ?: return@mapNotNull null
+            val hit = scope.sessionId == sessionId && (snapshotId == null || scope.snapshotId == null || scope.snapshotId == snapshotId)
+            if (hit && job.snapshot().state == Job.State.RUNNING) job to scope else null
+        }
     }
 
     fun get(id: String): Job? = synchronized(jobs) { jobs[id] }

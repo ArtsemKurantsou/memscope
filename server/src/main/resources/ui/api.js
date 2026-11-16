@@ -49,12 +49,17 @@ async function request(method, path, body) {
 
 const get = (p) => request('GET', p);
 const post = (p, b) => request('POST', p, b === undefined ? {} : b);
+const del = (p) => request('DELETE', p);
 const q = (params) => '?' + Object.entries(params).filter(([, v]) => v != null).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
 
 export const devices = () => get('/api/devices');
 export const apps = (serial, refresh) => get(`/api/devices/${encodeURIComponent(serial)}/apps${refresh ? '?refresh=1' : ''}`);
 export const sessions = () => get('/api/sessions');
 export const session = (id) => get(`/api/sessions/${id}`);
+/** Deletes a session and all its files; answers { deleted, freedBytes }. 409 BUSY while a job of it runs. */
+export const deleteSession = (id) => del(`/api/sessions/${id}`);
+/** Deletes one snapshot (hprof and analysis files); answers { deleted, freedBytes }. */
+export const deleteSnapshot = (sid, snap) => del(`/api/snapshots/${sid}/${snap}`);
 export const createSession = (serial, packageName) => post('/api/sessions', { serial, packageName, mode: 'ATTACH' });
 export const dump = (sessionId, body) => post(`/api/sessions/${sessionId}/dump`, body || {});
 /** Starts a startup recording; answers { session, jobId }. */

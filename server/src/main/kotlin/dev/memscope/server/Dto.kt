@@ -53,3 +53,7 @@ data class StartupStarted(val session: SessionMeta, val jobId: String)
 
 @Serializable
 data class DumpRequest(val processName: String? = null, val label: String? = null)
+
+/** What a DELETE removed: the session id or `<sid>/<snap>`, and the bytes freed on disk. */
+@Serializable
+data class DeletedDto(val deleted: String, val freedBytes: Long)

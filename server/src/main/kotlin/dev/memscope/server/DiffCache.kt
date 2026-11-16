@@ -16,6 +16,9 @@ class DiffCache(private val capacity: Int = 2) {
 
     fun cached(key: String): DiffResult? = synchronized(entries) { entries[key] }
 
+    /** Drops every cached diff whose key matches [predicate] (keys are `<sid>/<snap>|<base>`). */
+    fun removeIf(predicate: (String) -> Boolean) = synchronized(entries) { entries.keys.removeIf(predicate) }
+
     /** The cached result, or the result of [compute] (run at most once at a time, and not again for a key it just stored). */
     fun getOrCompute(key: String, compute: () -> DiffResult): DiffResult = cached(key) ?: synchronized(computeLock) {
         cached(key) ?: compute().also { synchronized(entries) { entries[key] = it } }

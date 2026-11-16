@@ -32,6 +32,48 @@ class SessionStoreTest {
     }
 
     @Test
+    fun `deleting a snapshot removes its hprof, every sidecar and its entry, nothing else`() {
+        val store = SessionStore(tmp)
+        val s = store.create("emulator-5554", "dev.app", SessionMeta.Mode.ATTACH)
+        store.addSnapshot(s.id, snap("s1"))
+        store.addSnapshot(s.id, snap("s10"))
+        val dir = store.dir(s.id)
+        val mine = listOf("s1.hprof", "s1.hprof.idx", "s1.hprof.summary.json", "s1.hprof.findings.json", "s1.hprof.idx.123.tmp", "s1.hprof.part")
+        val others = listOf("s10.hprof", "s10.hprof.idx", "timeline.jsonl")
+        (mine + others).forEach { Files.write(dir.resolve(it), ByteArray(100)) }
+        assertEquals(100L * 6, store.snapshotBytes(s.id, "s1"))
+        fun dataBytes() = store.diskBytes(s.id) - Files.size(dir.resolve("session.json"))
+        val before = dataBytes()
+        val after = store.deleteSnapshot(s.id, "s1")
+        assertEquals(listOf("s10"), after.snapshots.map { it.id })
+        assertEquals(listOf("s10"), SessionStore(tmp).get(s.id)!!.snapshots.map { it.id })
+        mine.forEach { assertTrue(Files.notExists(dir.resolve(it)), it) }
+        others.forEach { assertTrue(Files.exists(dir.resolve(it)), it) }
+        assertEquals(before - 600, dataBytes())
+        assertThrows<NoSuchElementException> { store.deleteSnapshot(s.id, "s1") }
+        assertThrows<IllegalArgumentException> { store.deleteSnapshot(s.id, "../x") }
+    }
+
+    @Test
+    fun `deleting a session removes its directory but never follows a link out of it`() {
+        val store = SessionStore(tmp)
+        val outside = Files.createDirectories(tmp.resolve("outside"))
+        val precious = Files.writeString(outside.resolve("precious.txt"), "keep")
+        val s = store.create("emulator-5554", "dev.app", SessionMeta.Mode.ATTACH)
+        val keep = store.create("emulator-5554", "dev.app", SessionMeta.Mode.ATTACH)
+        Files.write(store.dir(s.id).resolve("s1.hprof"), ByteArray(1000))
+        Files.createSymbolicLink(store.dir(s.id).resolve("link"), outside)
+        assertTrue(store.diskBytes(s.id) >= 1000)
+        assertTrue(store.deleteSession(s.id))
+        assertTrue(Files.notExists(store.dir(s.id)))
+        assertNull(store.get(s.id))
+        assertEquals("keep", Files.readString(precious), "the link target is untouched")
+        assertTrue(store.get(keep.id) != null)
+        assertEquals(false, store.deleteSession(s.id))
+        assertThrows<IllegalArgumentException> { store.deleteSession("..") }
+    }
+
+    @Test
     fun `session round-trips through disk`() {
         val store = SessionStore(tmp)
         val s = store.create("emulator-5554", "dev.app", SessionMeta.Mode.ATTACH)

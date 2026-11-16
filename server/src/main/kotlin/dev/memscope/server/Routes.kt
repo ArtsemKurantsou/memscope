@@ -41,6 +41,7 @@ import io.ktor.server.plugins.compression.Compression
 import io.ktor.server.plugins.compression.gzip
 import io.ktor.server.plugins.compression.minimumSize
 import io.ktor.server.routing.Route
+import io.ktor.server.routing.delete
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.route
@@ -114,6 +115,7 @@ fun Application.memscopeModule(deps: ServerDeps, allowedHosts: Set<String>) {
             jobRoutes(deps)
             snapshotRoutes(deps)
             findingsRoutes(deps)
+            deleteRoutes(deps)
         }
         staticResources("/", "ui")
     }
@@ -218,7 +220,10 @@ private fun Route.sessionRoutes(deps: ServerDeps) {
             synchronized(sessionLock) {
                 requireNoStartupRunning(deps)
                 val session = createExclusive(req)
-                val job = deps.jobs.create("Record startup of ${config.processName ?: req.packageName}", StartupSession.stepNames(config))
+                val job = deps.jobs.create(
+                    "Record startup of ${config.processName ?: req.packageName}", StartupSession.stepNames(config),
+                    JobRegistry.Scope(session.id, null, "startup recording"),
+                )
                 deps.setRunningStartup(ServerDeps.RunningStartup(session.id, job))
                 deps.jobs.submit(
                     job, JobRegistry.Lane.DEVICE,
@@ -251,7 +256,15 @@ private fun Route.sessionRoutes(deps: ServerDeps) {
         deps.startPolling(session.id)
         call.respond(session)
     }
-    get("/sessions") { call.respond(io { store.list() }) }
+    get("/sessions") {
+        // each row is the session plus `diskBytes`: its hprofs, analysis sidecars and timeline
+        call.respond(io {
+            kotlinx.serialization.json.JsonArray(store.list().map { m ->
+                val row = apiJson.encodeToJsonElement(SessionMeta.serializer(), m) as kotlinx.serialization.json.JsonObject
+                kotlinx.serialization.json.JsonObject(row + ("diskBytes" to kotlinx.serialization.json.JsonPrimitive(store.diskBytes(m.id))))
+            })
+        })
+    }
     get("/sessions/{id}") {
         call.respond(io { store.get(call.parameters["id"]!!) } ?: throw notFound("Session"))
     }
@@ -284,7 +297,7 @@ private fun Route.sessionRoutes(deps: ServerDeps) {
         val process = req.processName?.takeIf { it.isNotBlank() } ?: session.packageName
         DeviceArgs.requireProcessName(process)
         val label = req.label?.takeIf { it.isNotBlank() } ?: "Snapshot ${session.snapshots.size + 1}"
-        val job = deps.jobs.create("Dump $process", OnDemandDumper.STEP_NAMES)
+        val job = deps.jobs.create("Dump $process", OnDemandDumper.STEP_NAMES, JobRegistry.Scope(id, null, "heap dump"))
         deps.jobs.submit(job, JobRegistry.Lane.DEVICE) { deps.dumper.dump(id, process, label, job) }
         call.respond(JobRef(job.id))
     }
@@ -403,7 +416,7 @@ private fun Route.snapshotRoutes(deps: ServerDeps) {
                 }
                 synchronized(openLock) {
                     openJobs[key]?.takeIf { it.snapshot().state == Job.State.RUNNING }?.let { return@synchronized it }
-                    val created = deps.jobs.create("Analyse $key", ANALYSIS_STEPS)
+                    val created = deps.jobs.create("Analyse $key", ANALYSIS_STEPS, JobRegistry.Scope(sid, snap, "analysis"))
                     if (deps.snapshots.contains(key)) {
                         ANALYSIS_STEPS.forEach { created.step(it) { } }
                         markReadable(sid, snap)
@@ -498,5 +511,79 @@ private fun warmUp(deps: ServerDeps, key: String) {
     deps.snapshots.use(key) { view ->
         val first = view.children("root", 0, 1).rows.firstOrNull() ?: return@use
         view.details(first.ref)
+    }
+}
+
+/**
+ * `DELETE /api/sessions/{id}` and `DELETE /api/snapshots/{sid}/{snap}`: free the disk (and remove the data). 409 BUSY while
+ * a recording, dump, analysis or findings job that would touch it runs (or an abandoned analysis of it is still
+ * stopping). A session is ended first (its memory polling stops); its open snapshots are closed and cached diffs and
+ * findings dropped. Only files inside the session directory are deleted (ids are validated; links are not followed).
+ */
+private fun Route.deleteRoutes(deps: ServerDeps) {
+    val store = deps.store
+
+    fun requireIdle(sid: String, snap: String?) {
+        val (job, scope) = deps.jobs.runningFor(sid, snap).firstOrNull()
+            ?: synchronized(openLock) {
+                analysisThreads.keys.firstOrNull { it == "$sid/$snap" || (snap == null && it.startsWith("$sid/")) }
+            }?.let { key ->
+                throw ApiException(
+                    HttpStatusCode.Conflict, "An earlier analysis of $key is still stopping",
+                    "Wait a moment, then delete again.", "BUSY",
+                )
+            }
+            ?: return
+        throw ApiException(
+            HttpStatusCode.Conflict, "A ${scope.what} of ${if (snap == null) "this session" else "this snapshot"} is still running (job ${job.id})",
+            "Wait until it has finished, or cancel it, then delete again.", "BUSY",
+        )
+    }
+
+    /** Closes open snapshots and drops cached results of [sid] ([snap] null: all of its snapshots). */
+    fun forget(sid: String, snap: String?) {
+        val prefix = if (snap == null) "$sid/" else "$sid/$snap"
+        fun matches(key: String) = if (snap == null) key.startsWith(prefix) else key == prefix
+        deps.snapshots.keys().filter(::matches).forEach { deps.snapshots.remove(it) }
+        deps.findingsCache.keys.removeIf(::matches)
+        // diff keys are `<sid>/<snap>|<base>`; the base is a snapshot id of the same session
+        deps.diffs.removeIf { key ->
+            val (after, base) = key.substringBefore('|') to key.substringAfter('|')
+            if (snap == null) after.startsWith(prefix) else after == prefix || (after.startsWith("$sid/") && base == snap)
+        }
+    }
+
+    delete("/sessions/{id}") {
+        val id = call.parameters["id"]!!
+        val freed = io {
+            synchronized(sessionLock) {
+                val session = store.get(id) ?: throw notFound("Session")
+                requireIdle(id, null)
+                if (session.state == SessionMeta.State.ACTIVE) deps.stopPolling(id)
+                forget(id, null)
+                val bytes = store.diskBytes(id)
+                store.deleteSession(id)
+                bytes
+            }
+        }
+        call.respond(DeletedDto(id, freed))
+    }
+
+    delete("/snapshots/{sid}/{snap}") {
+        val sid = call.parameters["sid"]!!
+        val snap = call.parameters["snap"]!!
+        val freed = io {
+            synchronized(sessionLock) {
+                val session = store.get(sid) ?: throw notFound("Session")
+                store.snapshotFile(sid, snap) // validates the id
+                if (session.snapshots.none { it.id == snap }) throw notFound("Snapshot")
+                requireIdle(sid, snap)
+                forget(sid, snap)
+                val bytes = store.snapshotBytes(sid, snap)
+                store.deleteSnapshot(sid, snap)
+                bytes
+            }
+        }
+        call.respond(DeletedDto("$sid/$snap", freed))
     }
 }

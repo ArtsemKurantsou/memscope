@@ -19,7 +19,6 @@ import io.ktor.server.routing.get
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
-import java.util.concurrent.ConcurrentHashMap
 
 @Serializable
 data class FindingsResponse(val findings: List<Finding>, /** The leak pass was skipped or failed: ask again with `?rerun=1` to run it again. */ val incomplete: Boolean = false)
@@ -42,7 +41,7 @@ private fun findingsCancelled() = dev.memscope.device.DeviceException(
 
 internal fun Route.findingsRoutes(deps: ServerDeps) {
     val store = deps.store
-    val cache = ConcurrentHashMap<String, List<Finding>>()
+    val cache = deps.findingsCache
     val running = HashMap<String, Job>()
 
     fun session(sid: String): SessionMeta = store.get(sid) ?: throw notFound("Session")
@@ -69,7 +68,7 @@ internal fun Route.findingsRoutes(deps: ServerDeps) {
                 if (!rerun) FindingsSidecar.read(hprofFile, s.appPackagePrefixes, screen)?.let { cache[key] = it; return@withContext answer(it) }
                 running[key]?.takeIf { it.snapshot().state == Job.State.RUNNING }?.let { return@withContext JobRef(it.id) }
                 if (!deps.snapshots.contains(key)) throw ApiException(HttpStatusCode.Conflict, "not analysed", SnapshotRegistry.notAnalysed().hint, "NOT_ANALYSED")
-                val job = deps.jobs.create("Findings for $key", Findings.snapshotRuleIds)
+                val job = deps.jobs.create("Findings for $key", Findings.snapshotRuleIds, JobRegistry.Scope(sid, snap, "findings computation"))
                 running[key] = job
                 deps.jobs.submit(job) {
                     try {

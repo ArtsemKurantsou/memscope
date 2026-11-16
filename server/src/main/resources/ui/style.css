@@ -340,3 +340,16 @@ table.fields td:first-child { word-break: normal; overflow-wrap: anywhere; min-w
 .ferr { color: var(--err-ink); font-size: 12px; }
 .fpending { background: var(--info-bg); border: 1px solid var(--border); border-radius: 5px; padding: 8px 10px; margin: 0 0 10px; max-width: 980px; }
 @media (max-width: 1000px) { .findings { padding: 10px 8px 20px; } }
+
+/* Sessions dialog and delete actions */
+.btn.danger { color: var(--err-ink); border-color: var(--err-border); }
+.btn.danger:hover:not(:disabled) { background: var(--err-bg); }
+.dialog.sessions { width: min(760px, calc(100vw - 32px)); }
+.dialog.confirm { width: min(440px, calc(100vw - 32px)); }
+.sessions-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.sessions-table th { text-align: left; color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--border); padding: 4px 6px; }
+.sessions-table td { border-bottom: 1px solid var(--border); padding: 5px 6px; vertical-align: middle; }
+.sessions-table .num { text-align: right; }
+.sessions-table tr.current td { background: var(--row-sel); }
+.sessions-table .row-actions { white-space: nowrap; text-align: right; }
+.sessions-table .row-actions .btn + .btn { margin-left: 6px; }

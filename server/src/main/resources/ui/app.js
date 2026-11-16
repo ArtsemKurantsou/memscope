@@ -356,6 +356,32 @@ async function openSnapshot(sid, meta) {
   }
 }
 
+/** The open snapshot (or its session) was deleted: back to the empty state, no requests for it any more. */
+function closeSnapshot() {
+  state.loadToken++;
+  state.snap = null;
+  state.summary = null;
+  state.classes = null;
+  state.classesLoaded = false;
+  state.diff = null;
+  state.diffKey = null;
+  state.diffLoading = false;
+  state.diffError = null;
+  state.diffToken++;
+  state.query = null;
+  findingsView.setSnapshot(null);
+  if (state.tab === 'findings') findingsView.show();
+  if (state.tab === 'classes') loadClassesView();
+  $('search').value = '';
+  $('search').disabled = true;
+  $('search-banner').hidden = true;
+  details.clear();
+  renderSummary();
+  compare.setCurrent(null);
+  renderCompareLine();
+  onEmptyState('ready');
+}
+
 // ---------------------------------------------------------------- search
 
 async function runSearch(name) {
@@ -421,6 +447,7 @@ const capture = createCapture({
   onSession: (s) => { state.session = s; timeline.setSession(s); compare.setSession(s); },
   onNoSnapshot: () => {},
   onEmptyState,
+  onCleared: closeSnapshot,
 });
 
 startFn = async () => {

@@ -26,6 +26,7 @@
     </label>
     <button id="dump-btn" class="btn primary" type="button" disabled>Dump now</button>
     <button id="startup-btn" class="btn" type="button" disabled title="Restart the app under a debugger and dump its heap at startup milestones">Record startup</button>
+    <button id="sessions-btn" class="btn" type="button" title="Recorded sessions and their size on disk: open or delete them">Sessions</button>
   </header>
 
   <div id="job-panel" class="job-panel" hidden aria-live="polite"></div>
@@ -36,6 +37,7 @@
     <label class="field">Snapshot
       <select id="snapshot-select" disabled><option>No snapshots yet</option></select>
     </label>
+    <button id="snapshot-delete" class="btn small" type="button" disabled title="Delete the selected snapshot (its heap dump and analysis files)">Delete snapshot</button>
     <div class="compare">
       <label class="check" title="Show what changed since another snapshot of this session (in a startup recording: since the previous milestone)"><input id="compare-on" type="checkbox" disabled> Compare with</label>
       <select id="compare-select" aria-label="Snapshot to compare with" disabled><option value="">none</option></select>
