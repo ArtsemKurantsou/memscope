@@ -44,6 +44,9 @@ class RuleContext(
     internal val content: dev.memscope.analysis.findings.rules.ContentScan by lazy {
         dev.memscope.analysis.findings.rules.ContentScan.run(snapshot)
     }
+
+    /** The large-static findings, which `dominant-class` skips a class for when a static already explains its bytes. */
+    internal val largeStatics: List<Finding> by lazy { dev.memscope.analysis.findings.rules.LargeStaticRule().evaluate(this) }
 }
 
 interface Rule {
@@ -84,6 +87,10 @@ object Thresholds {
     const val LARGE_STATIC_HIGH_PERCENT = 15.0
     const val LARGE_STATIC_TOP = 10
     const val DOMINANT_CLASS_PERCENT = 30.0
+    /** Classes whose retained bytes are within this fraction of the largest in a cluster are one finding. */
+    const val DOMINANT_CLUSTER_TOLERANCE = 0.05
+    /** A class is "covered" when one large-static finding keeps at least this share of its bytes. */
+    const val DOMINANT_COVERED_SHARE = 0.9
     val DOMINANT_CLASS_EXCLUDED = setOf("byte[]", "java.lang.Object[]", "java.lang.String", "java.lang.Class")
     const val GROWTH_MIN_SNAPSHOTS = 3
     const val GROWTH_MIN_BYTES = 2 * MB

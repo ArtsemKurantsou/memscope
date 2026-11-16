@@ -73,10 +73,14 @@ class FindingsRulesTest {
         assertEquals(listOf(ref(FindingsHprof.BAG)), f.refs)
     }
 
-    @Test fun dominantClassFindsTheBag() {
-        val f = DominantClassRule().evaluate(ctx()).single()
-        assertTrue(f.title.startsWith("Bag instances retain"), f.title)
-        assertEquals(listOf(ref(FindingsHprof.BAG)), f.refs)
+    @Test fun dominantClassIsSilentWhenAStaticFieldAlreadyExplainsIt() {
+        assertTrue(DominantClassRule().evaluate(ctx()).isEmpty(), "Bag is the whole Caches.bag large-static")
+    }
+
+    @Test fun theHashMapCacheShapeIsOneClusterNotThree() {
+        fun stat(n: String, app: Boolean, b: Long) = dev.memscope.analysis.ClassStat(n, 1, b, b, app, 1, b, b)
+        val groups = DominantClassRule.cluster(listOf(stat("java.util.HashMap", false, 20_000_000), stat("java.util.HashMap\$Node[]", false, 19_900_000), stat("java.util.HashMap\$Node", false, 19_500_000), stat("app.Cache", true, 8_000_000)))
+        assertEquals(listOf(3, 1), groups.map { it.size })
     }
 
     @Test fun leakedComponentReportsTheDestroyedActivityWithItsChain() {
@@ -95,6 +99,6 @@ class FindingsRulesTest {
         val all = Findings.forSnapshot(snap, hprof, screen, progress = { ran += it })
         assertEquals(Findings.snapshotRuleIds, ran)
         assertEquals(all.sortedWith(compareBy<Finding> { it.severity.ordinal }.thenByDescending { it.bytes }), all)
-        assertTrue(all.map { it.ruleId }.containsAll(listOf("oversized-bitmap", "duplicate-bitmaps", "duplicate-strings", "duplicate-arrays", "sparse-collection", "large-static", "dominant-class")))
+        assertTrue(all.map { it.ruleId }.containsAll(listOf("oversized-bitmap", "duplicate-bitmaps", "duplicate-strings", "duplicate-arrays", "sparse-collection", "large-static")))
     }
 }

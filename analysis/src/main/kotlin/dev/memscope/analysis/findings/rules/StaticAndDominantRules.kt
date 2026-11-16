@@ -56,22 +56,43 @@ internal class LargeStaticRule : Rule {
 internal class DominantClassRule : Rule {
     override val id = "dominant-class"
 
+    companion object {
+        private val PRIMITIVE_ARRAYS = setOf("boolean[]", "char[]", "float[]", "double[]", "byte[]", "short[]", "int[]", "long[]")
+
+        /** Groups classes (largest first) whose app-retained bytes are within the tolerance of the group's largest: one cache seen through its HashMap, Node[] and Node. */
+        fun cluster(sortedDesc: List<dev.memscope.analysis.ClassStat>): List<List<dev.memscope.analysis.ClassStat>> {
+            val out = ArrayList<MutableList<dev.memscope.analysis.ClassStat>>()
+            for (c in sortedDesc) {
+                val head = out.lastOrNull()?.first()
+                if (head != null && c.appRetainedBytes >= head.appRetainedBytes * (1 - Thresholds.DOMINANT_CLUSTER_TOLERANCE)) out.last() += c else out += mutableListOf(c)
+            }
+            return out
+        }
+    }
+
     override fun evaluate(c: RuleContext): List<Finding> {
         val s = c.snapshot
         val appTotal = s.summary().appHeapBytes
-        return s.classes().filter { it.className !in Thresholds.DOMINANT_CLASS_EXCLUDED && pct(it.appRetainedBytes, appTotal) >= Thresholds.DOMINANT_CLASS_PERCENT }
-            .map { cls ->
-                val p = pct(cls.appRetainedBytes, appTotal)
-                val top = s.instances(cls.className, 0, 1).rows.firstOrNull()?.ref
-                Finding(
-                    ruleId = id, severity = Severity.MEDIUM,
-                    title = "${simpleName(cls.className)} instances retain ${String.format(Locale.US, "%.0f", p)}% of the app heap (${formatBytes(cls.appRetainedBytes)})",
-                    evidence = "${cls.className}: ${cls.appInstanceCount} instances retain ${formatBytes(cls.appRetainedBytes)} = ${String.format(Locale.US, "%.1f", p)}% of the ${formatBytes(appTotal)} app heap " +
-                        "(limit ${Thresholds.DOMINANT_CLASS_PERCENT.toInt()}%; byte[], Object[], String and Class are excluded).",
-                    suggestion = "Open the largest ${simpleName(cls.className)} in the tree and follow its path from the root to the owner; if that owner is a cache, bound it, " +
-                        "otherwise make it release ${simpleName(cls.className)} instances it no longer needs.",
-                    bytes = cls.appRetainedBytes, refs = listOfNotNull(top),
-                )
-            }
+        val dominant = s.classes().filter {
+            it.className !in Thresholds.DOMINANT_CLASS_EXCLUDED && it.className !in PRIMITIVE_ARRAYS && pct(it.appRetainedBytes, appTotal) >= Thresholds.DOMINANT_CLASS_PERCENT
+        }.sortedByDescending { it.appRetainedBytes }
+        // App classes, plus at most one framework class (the largest).
+        val picked = (dominant.filter { it.isAppCode } + dominant.filter { !it.isAppCode }.take(1)).sortedByDescending { it.appRetainedBytes }
+        return cluster(picked).mapNotNull { group ->
+            val cls = group.firstOrNull { it.isAppCode } ?: group.first()
+            if (c.largeStatics.any { it.bytes >= cls.appRetainedBytes * Thresholds.DOMINANT_COVERED_SHARE }) return@mapNotNull null
+            val p = pct(cls.appRetainedBytes, appTotal)
+            val top = s.instances(cls.className, 0, 1).rows.firstOrNull()?.ref
+            val also = group.filter { it !== cls }.joinToString { it.className }
+            Finding(
+                ruleId = id, severity = Severity.MEDIUM,
+                title = "${simpleName(cls.className)} instances retain ${String.format(Locale.US, "%.0f", p)}% of the app heap (${formatBytes(cls.appRetainedBytes)})",
+                evidence = "${cls.className}: ${cls.appInstanceCount} instances retain ${formatBytes(cls.appRetainedBytes)} = ${String.format(Locale.US, "%.1f", p)}% of the ${formatBytes(appTotal)} app heap " +
+                    "(limit ${Thresholds.DOMINANT_CLASS_PERCENT.toInt()}%; arrays, String and Class are excluded)." + if (also.isNotEmpty()) " Same bytes through: $also." else "",
+                suggestion = "Open the largest ${simpleName(cls.className)} in the tree and follow its path from the root to the owner; if that owner is a cache, bound it, " +
+                    "otherwise make it release ${simpleName(cls.className)} instances it no longer needs.",
+                bytes = cls.appRetainedBytes, refs = listOfNotNull(top),
+            )
+        }
     }
 }
