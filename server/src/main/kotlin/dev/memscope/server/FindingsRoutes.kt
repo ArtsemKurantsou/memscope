@@ -29,18 +29,20 @@ data class FindingsResponse(val findings: List<Finding>, /** The leak pass was s
 @Serializable
 data class SessionFindingsResponse(val findings: List<Finding>, val pending: List<String>)
 
+private fun findingsCancelled() = dev.memscope.device.DeviceException(
+    dev.memscope.device.DeviceException.Kind.CANCELLED, "Computing findings was cancelled.", "Open the Findings tab again to compute them.",
+)
+
 /**
  * `GET /api/snapshots/{sid}/{snap}/findings`: 200 `{findings}` once computed, otherwise 202 `{jobId}` of the job
  * computing them (started by the first request; the snapshot must be open, else 409 NOT_ANALYSED). The UI polls
  * the job and asks again. Results are cached in memory per snapshot (a snapshot file never changes).
- * `POST /api/snapshots/{sid}/{snap}/findings/rerun`: drops the cached and stored findings and computes them again (same answers).
+ * `POST /api/snapshots/{sid}/{snap}/findings/rerun`: drops the cached and stored findings and computes them again
+ * (same answers). Cancelling the job stops between rules and inside the leak pass; a cancelled run is not kept.
  *
  * `GET /api/sessions/{id}/findings`: `{findings, pending}` of the session rules (monotonic growth, startup
  * intervals) computed from the per-snapshot summaries, without opening any snapshot.
  */
-private fun findingsCancelled() = dev.memscope.device.DeviceException(
-    dev.memscope.device.DeviceException.Kind.CANCELLED, "Computing findings was cancelled.", "Open the Findings tab again to compute them.",
-)
 
 internal fun Route.findingsRoutes(deps: ServerDeps) {
     val store = deps.store
