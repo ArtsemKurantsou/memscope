@@ -45,6 +45,8 @@ bin="$root/server/build/install/server/bin/server"
 if [ "$rebuild" = 1 ] || [ ! -x "$bin" ]; then
   echo "Building MemScope (first run takes a minute or two)..." >&2
   (cd "$root" && ./gradlew --quiet :server:installDist) || { echo "Build failed; see the output above." >&2; exit 1; }
+else
+  echo "using the existing build; run ./memscope --rebuild after changing the source" >&2
 fi
 
 export JAVA_OPTS="-Xmx${MEMSCOPE_XMX:-6g} ${JAVA_OPTS:-}"
