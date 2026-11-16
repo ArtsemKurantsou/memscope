@@ -258,6 +258,31 @@ class StartupSessionTest {
     }
 
     @Test
+    fun `a slow but progressing multi-step debugger call is not declared wedged`() {
+        vm.defaultScript()
+        vm.entrySteps = 12 // 12 x 100 ms per milestone: far over the 400 ms bound in total, each sub-step well within it
+        vm.entryStepMs = 100
+        val job = newJob()
+        startup(fast.copy(jdwpReplyMs = 400)).run(session.id, StartupConfig(), job)
+        assertEquals(Job.State.DONE, job.snapshot().state, job.snapshot().errorMessage)
+        assertEquals(StartupConfig().milestones.count { it.enabled }, stored().snapshots.size)
+        assertCleanDevice()
+    }
+
+    @Test
+    fun `a multi-step debugger call that makes no progress is declared wedged`() {
+        vm.defaultScript()
+        vm.entrySteps = 12
+        vm.entryStepMs = 100
+        vm.entryReportsProgress = false
+        val job = newJob()
+        val e = runFailing(job = job, s = startup(fast.copy(jdwpReplyMs = 400))) as DeviceException
+        assertEquals(DeviceException.Kind.TIMEOUT, e.kind)
+        assertTrue("stopped answering the debugger" in e.message!! && "setting the breakpoints" in e.message!!, e.message)
+        assertCleanDevice()
+    }
+
+    @Test
     fun `a hung garbage collection after a dump does not fail the dump`() {
         vm.defaultScript()
         vm.hangOn = "gc"

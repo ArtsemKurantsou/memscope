@@ -31,6 +31,10 @@ class JdiDebuggerPort : DebuggerPort {
     /** Armed caller-return breakpoints: key -> (thread, the thread's frame count when the caller frame is on top). */
     private val pendingReturns = HashMap<String, Pair<ThreadReference, Int>>()
     private val disposed = AtomicBoolean(false)
+    /** Called after each JDWP round trip of a multi-step call (see [DebuggerPort.setProgressListener]). */
+    @Volatile private var progress: () -> Unit = {}
+
+    override fun setProgressListener(listener: () -> Unit) { progress = listener }
 
     override fun attach(localPort: Int, timeoutMs: Long) {
         JdiNoise.suppress()
@@ -52,7 +56,9 @@ class JdiDebuggerPort : DebuggerPort {
     override fun armWaitReturn(): String? {
         val vm = vm()
         val main = vm.allThreads().firstOrNull { it.name() == "main" } ?: return "the app has no thread named 'main'"
+        progress()
         val frames = main.frames()
+        progress()
         val i = frames.indexOfFirst { it.location().method().name() == "handleBindApplication" }
         if (i < 0) return "the main thread is not in ActivityThread.handleBindApplication (top frame: ${frames.firstOrNull()?.location()})"
         // the call in handleBindApplication must be the one waiting for us; otherwise the app already started (for example
@@ -77,6 +83,7 @@ class JdiDebuggerPort : DebuggerPort {
     override fun setEntryBreakpoints(key: String, hook: Hook): HookStatus {
         val vm = vm()
         val types = vm.classesByName(hook.className).filter { it.isPrepared }
+        progress()
         if (types.isEmpty()) {
             vm.eventRequestManager().createClassPrepareRequest().apply {
                 addClassFilter(hook.className)
@@ -94,8 +101,10 @@ class JdiDebuggerPort : DebuggerPort {
     override fun armCallerReturn(key: String, thread: DebugThread): String? {
         val t = threads[thread.id] ?: return "unknown thread ${thread.name}"
         val count = t.frameCount()
+        progress()
         if (count < 2) return "${thread.name} has no caller frame"
         val caller = t.frame(1).location()
+        progress()
         val ret = returnLocation(caller) ?: return "no code after ${caller.method().declaringType().name()}.${caller.method().name()} @${caller.codeIndex()}"
         vm().eventRequestManager().createBreakpointRequest(ret).apply {
             addThreadFilter(t)
@@ -212,13 +221,16 @@ class JdiDebuggerPort : DebuggerPort {
     override fun diagnose(): String = try {
         val vm = vm()
         val main = vm.allThreads().firstOrNull { it.name() == "main" }
+        progress()
         val suspendBefore = main?.suspendCount()
         vm.suspend()
+        progress()
         buildString {
             val erm = vm.eventRequestManager()
             append("armed breakpoints: ")
             append(erm.breakpointRequests().joinToString("; ") { r ->
                 val l = r.location()
+                progress()
                 "${r.getProperty(KEY)}/${r.getProperty(KIND)} ${l.declaringType().name()}.${l.method().name()}@${l.codeIndex()}${if (r.isEnabled) "" else " (disabled)"}"
             }.ifEmpty { "none" })
             append("\nclass-prepare requests: ")
@@ -228,6 +240,7 @@ class JdiDebuggerPort : DebuggerPort {
             if (main == null) { append("\nno main thread"); return@buildString }
             append("\nmain thread: status ${threadStatus(main.status())}, suspend count before diagnosis $suspendBefore, ")
             append("at breakpoint ${main.isAtBreakpoint}")
+            progress()
             main.frames().take(14).forEach { f ->
                 val l = f.location()
                 append("\n  at ${l.declaringType().name()}.${l.method().name()} @${l.codeIndex()}")
@@ -279,6 +292,7 @@ class JdiDebuggerPort : DebuggerPort {
     private fun breakpointsIn(type: ReferenceType, key: String, hook: Hook): Int {
         val methods = (if (hook.signature != null) type.methodsByName(hook.methodName, hook.signature) else type.methodsByName(hook.methodName))
             .filter { it.declaringType() == type && !it.isAbstract && !it.isNative }
+        progress()
         val erm = vm().eventRequestManager()
         var n = 0
         for (m in methods) {
@@ -289,6 +303,7 @@ class JdiDebuggerPort : DebuggerPort {
                 putProperty(KIND, if (hook.afterReturn) Kind.ENTRY_THEN_RETURN else Kind.ENTRY)
                 enable()
             }
+            progress()
             n++
         }
         return n
@@ -301,6 +316,7 @@ class JdiDebuggerPort : DebuggerPort {
     private fun returnLocation(call: Location): Location? {
         val method = call.method()
         val units = if (vm().canGetBytecodes()) runCatching { dexInvokeUnits(method.bytecodes(), call.codeIndex()) }.getOrNull() else null
+        progress()
         return method.locationOfCodeIndex(call.codeIndex() + (units ?: 3))
     }
 

@@ -86,6 +86,13 @@ interface DebuggerPort {
     /** A cheap round trip (JDWP AllThreads) to tell a quiet VM from a wedged one; blocks if the VM does not answer. */
     fun ping() {}
 
+    /**
+     * [listener] is called (on the calling thread) whenever one JDWP round trip of a multi-step call ([setEntryBreakpoints],
+     * [armWaitReturn], [armCallerReturn], [diagnose]) completed, so the caller can bound each round trip rather than
+     * the whole call.
+     */
+    fun setProgressListener(listener: () -> Unit) {}
+
     /** Deletes all requests, resumes and closes the connection. Idempotent; never throws. */
     fun dispose()
 }

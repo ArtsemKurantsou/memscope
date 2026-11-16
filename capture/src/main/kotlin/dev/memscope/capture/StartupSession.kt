@@ -149,6 +149,8 @@ class StartupSession(
         private var stopFailedHint: String? = null
         /** The debugger call that got no reply: the app's VM is wedged and must be stopped. */
         private var wedgedOp: String? = null
+        /** When the running [jdwp] call last started or reported progress (one JDWP round trip done). */
+        @Volatile private var lastProgressMs = 0L
         /** The app was past its debugger wait at attach time (see [APP_NOT_WAITING_REASON]). */
         private var notWaiting = false
         /** This attempt was aborted because the app was past its debugger wait (the only APP_NOT_WAITING failure). */
@@ -269,6 +271,7 @@ class StartupSession(
             guard.update(serial) { it.copy(forwardPort = port) }
             val dbg = debuggerFactory()
             debugger = dbg
+            dbg.setProgressListener { lastProgressMs = nowMs() }
             try {
                 bounded("Attaching the debugger", timeouts.attachMs, onAbort = dbg::dispose) { dbg.attach(port, timeouts.attachMs) }
             } catch (e: DeviceException) {
@@ -381,14 +384,16 @@ class StartupSession(
         }
 
         /**
-         * Runs one debugger call on [jdwpThread] and waits at most [StartupTimeouts.jdwpReplyMs], checking cancel every
-         * [POLL_MS]. No reply in time means the app's VM is wedged (seen on API 37 when a heap walk inside the app, e.g.
-         * from `dumpsys meminfo`, meets a SUSPEND_ALL breakpoint): the debugger is disposed, detach stops the app, and
-         * the failure says what was pending.
+         * Runs one debugger call on [jdwpThread] and waits at most [StartupTimeouts.jdwpReplyMs] for each of its JDWP round
+         * trips (a multi-step call such as setting breakpoints in a big app reports progress through
+         * [DebuggerPort.setProgressListener], and each report restarts the bound), checking cancel every [POLL_MS]. No
+         * reply in time means the app's VM is wedged (seen on API 37 when a heap walk inside the app, e.g. from
+         * `dumpsys meminfo`, meets a SUSPEND_ALL breakpoint): the debugger is disposed, detach stops the app, and the
+         * failure says what was pending.
          */
         private fun <T> jdwp(op: String, block: () -> T): T {
+            lastProgressMs = nowMs()
             val f = jdwpThread.submit(java.util.concurrent.Callable(block))
-            val deadline = nowMs() + timeouts.jdwpReplyMs
             while (true) {
                 try {
                     return f.get(POLL_MS, TimeUnit.MILLISECONDS)
@@ -398,7 +403,7 @@ class StartupSession(
                     throw e.cause ?: e
                 }
                 if (job.cancel.isCancelled) { debugger?.dispose(); throw cancelled() }
-                if (nowMs() >= deadline) {
+                if (nowMs() >= lastProgressMs + timeouts.jdwpReplyMs) {
                     wedgedOp = op
                     record("no reply while $op")
                     debugger?.dispose()
@@ -414,16 +419,21 @@ class StartupSession(
             }
         }
 
-        /** [DebuggerPort.diagnose], bounded; a VM that does not answer is reported as such. */
+        /** [DebuggerPort.diagnose], bounded per round trip like [jdwp]; a VM that does not answer is reported as such. */
         private fun diagnoseQuietly(): String {
+            lastProgressMs = nowMs()
             val f = jdwpThread.submit(java.util.concurrent.Callable { debugger?.diagnose() ?: "debugger already closed" })
-            return try {
-                f.get(DIAGNOSE_WAIT_MS, TimeUnit.MILLISECONDS)
-            } catch (_: TimeoutException) {
-                wedgedOp = "the diagnosis" // detach must stop the app
-                "the VM did not answer the diagnosis within ${DIAGNOSE_WAIT_MS / 1000} s (wedged)"
-            } catch (e: Exception) {
-                "diagnosis failed: ${e.cause ?: e}"
+            while (true) {
+                try {
+                    return f.get(POLL_MS, TimeUnit.MILLISECONDS)
+                } catch (_: TimeoutException) {
+                    if (nowMs() >= lastProgressMs + DIAGNOSE_WAIT_MS) {
+                        wedgedOp = "the diagnosis" // detach must stop the app
+                        return "the VM did not answer the diagnosis within ${DIAGNOSE_WAIT_MS / 1000} s (wedged)"
+                    }
+                } catch (e: Exception) {
+                    return "diagnosis failed: ${e.cause ?: e}"
+                }
             }
         }
 

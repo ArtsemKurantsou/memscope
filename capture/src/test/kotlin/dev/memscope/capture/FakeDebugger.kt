@@ -54,7 +54,22 @@ class FakeDebugger : DebuggerPort {
     override fun attach(localPort: Int, timeoutMs: Long) { calls += "attach:$localPort"; attachError?.let { throw it } }
     override fun suspendAll() { calls += "suspendAll" }
     override fun armWaitReturn(): String? { traffic("armWaitReturn"); return waitArmError }
-    override fun setEntryBreakpoints(key: String, hook: Hook): HookStatus { traffic("entry:$key"); return hookStatus(key, hook) }
+    /** A slow setEntryBreakpoints: this many sub-steps of [entryStepMs] each, reporting progress after each if [entryReportsProgress]. */
+    @Volatile var entrySteps = 0
+    @Volatile var entryStepMs = 0L
+    @Volatile var entryReportsProgress = true
+    @Volatile private var progress: () -> Unit = {}
+    override fun setProgressListener(listener: () -> Unit) { progress = listener }
+
+    override fun setEntryBreakpoints(key: String, hook: Hook): HookStatus {
+        traffic("entry:$key")
+        repeat(entrySteps) {
+            if (disposed) return HookStatus.Failed("disposed")
+            Thread.sleep(entryStepMs)
+            if (entryReportsProgress) progress()
+        }
+        return hookStatus(key, hook)
+    }
     override fun armCallerReturn(key: String, thread: DebugThread): String? { traffic("return:$key"); maybeHang("armCallerReturn:$key"); return returnArmError(key) }
     override fun clearHook(key: String) { traffic("clear:$key") }
 
