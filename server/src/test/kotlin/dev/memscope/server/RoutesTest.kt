@@ -779,6 +779,54 @@ class RoutesTest {
         assertEquals(HttpStatusCode.OK, client.get("/api/snapshots/${s.id}/$snap/summary").status)
     }
 
+    private fun aFinding() = dev.memscope.analysis.findings.Finding("large-static", dev.memscope.analysis.findings.Severity.LOW, "t", "e", "s", 1, emptyList())
+
+    @Test fun cancellingFindingsBetweenRulesEndsTheJobAndCachesNothing() = server {
+        val s = store.newAttachSession()
+        val snap = store.addFakeSnapshot(s.id)
+        client.openSnapshot(s.id, snap)
+        val inFirstRule = CountDownLatch(1)
+        val goOn = CountDownLatch(1)
+        val secondRuleRan = java.util.concurrent.atomic.AtomicBoolean(false)
+        opener.opened.single().findingsImpl = { onRule, _ ->
+            onRule("a"); inFirstRule.countDown(); goOn.await()
+            onRule("b"); secondRuleRan.set(true)
+            listOf(aFinding())
+        }
+        val r = client.get("/api/snapshots/${s.id}/$snap/findings")
+        assertEquals(HttpStatusCode.Accepted, r.status, r.bodyAsText())
+        val job = str(r.obj(), "jobId")
+        assertTrue(inFirstRule.await(5, TimeUnit.SECONDS))
+        client.postJson("/api/jobs/$job/cancel")
+        goOn.countDown()
+        assertEquals("CANCELLED", str(client.waitJob(job), "state"))
+        assertFalse(secondRuleRan.get(), "no rule runs after the cancel")
+        assertFalse(File(store.snapshotFile(s.id, snap).toString() + ".findings.json").exists(), "not persisted")
+        opener.opened.single().findingsImpl = { _, _ -> listOf(aFinding()) }
+        val again = client.get("/api/snapshots/${s.id}/$snap/findings")
+        assertEquals(HttpStatusCode.Accepted, again.status, "not cached: a new job starts")
+        assertEquals("DONE", str(client.waitJob(str(again.obj(), "jobId")), "state"))
+    }
+
+    @Test fun cancellingFindingsReachesTheLongRunningLeakPass() = server {
+        val s = store.newAttachSession()
+        val snap = store.addFakeSnapshot(s.id)
+        client.openSnapshot(s.id, snap)
+        val sawCancel = CountDownLatch(1)
+        opener.opened.single().findingsImpl = { onRule, isCancelled ->
+            onRule("leaked-component")
+            val deadline = System.currentTimeMillis() + 10_000
+            while (!isCancelled() && System.currentTimeMillis() < deadline) Thread.sleep(10)
+            if (isCancelled()) { sawCancel.countDown(); throw dev.memscope.analysis.findings.FindingsCancelledException() }
+            listOf(aFinding())
+        }
+        val job = str(client.get("/api/snapshots/${s.id}/$snap/findings").obj(), "jobId")
+        Thread.sleep(100)
+        client.postJson("/api/jobs/$job/cancel")
+        assertTrue(sawCancel.await(5, TimeUnit.SECONDS), "the rule saw the cancel")
+        assertEquals("CANCELLED", str(client.waitJob(job), "state"))
+    }
+
     @Test fun badRefIs400WithHint() = server {
         val s = store.newAttachSession()
         val snap = store.addFakeSnapshot(s.id)

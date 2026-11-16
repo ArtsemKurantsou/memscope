@@ -26,18 +26,23 @@ object Findings {
 
     /**
      * Findings of one opened snapshot. [progress] is called with each rule id before it runs. A rule that
-     * fails produces a LOW finding naming it, except an unreadable hprof, which is rethrown.
+     * fails produces a LOW finding naming it, except an unreadable hprof, which is rethrown. [isCancelled] is checked
+     * between rules (and by the leak pass); a cancel throws [FindingsCancelledException].
      */
     fun forSnapshot(
         s: Snapshot, hprof: File = s.hprofFile, screen: ScreenSize = ScreenSize.FALLBACK,
         leakTimeoutMs: Long = Thresholds.LEAK_ANALYSIS_TIMEOUT_MS, progress: (String) -> Unit = {},
+        isCancelled: () -> Boolean = { false },
     ): List<Finding> {
-        val ctx = RuleContext(s, hprof, screen, leakTimeoutMs)
+        val ctx = RuleContext(s, hprof, screen, leakTimeoutMs, isCancelled)
         return sorted(snapshotRules.flatMap { rule ->
+            if (isCancelled()) throw FindingsCancelledException()
             progress(rule.id)
             try {
                 rule.evaluate(ctx)
             } catch (e: HprofUnreadableException) {
+                throw e
+            } catch (e: FindingsCancelledException) {
                 throw e
             } catch (e: OutOfMemoryError) {
                 listOf(

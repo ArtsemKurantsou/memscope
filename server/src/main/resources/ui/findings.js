@@ -149,10 +149,22 @@ export function createFindings({ container, getSession, onShow, onBadge, onAnaly
     try {
       let r = await mine.findings(rerun);
       if (r.jobId) {
-        const j = await api.pollJob(r.jobId, (job) => {
+        const jobId = r.jobId;
+        const step = document.getElementById('findings-step');
+        if (step && my === token) {
+          step.after(' ', el('button', {
+            class: 'btn small', type: 'button', id: 'findings-cancel',
+            onclick: (e) => { e.currentTarget.disabled = true; api.cancelJob(jobId).catch(() => { /* the poll reports the outcome */ }); },
+          }, 'Cancel'));
+        }
+        const j = await api.pollJob(jobId, (job) => {
           const t = document.getElementById('findings-step');
           if (t && my === token) t.textContent = runningStepText(job);
         });
+        if (j.state === 'CANCELLED') {
+          if (my === token) message('Computing findings was cancelled. ', el('button', { class: 'btn small', type: 'button', onclick: () => load() }, 'Compute findings'));
+          return;
+        }
         if (j.state !== 'DONE') throw new api.ApiError(500, { error: j.errorMessage || 'Computing findings failed', hint: j.errorHint || '', kind: 'JOB_FAILED' });
         r = await mine.findings();
       }

@@ -109,6 +109,10 @@ class FakeView(val name: String = "fake") : SnapshotView {
     }
     override fun revealPath(ref: String): List<String> { revealFails?.let { throw it }; return revealPath }
     override fun indexInParent(parentRef: String, childRef: String) = 4
+    /** Replaces the (empty) findings computation: gets the rule callback and the cancel check. */
+    @Volatile var findingsImpl: ((onRule: (String) -> Unit, isCancelled: () -> Boolean) -> List<dev.memscope.analysis.findings.Finding>)? = null
+    override fun findings(screen: dev.memscope.analysis.findings.ScreenSize, onRule: (String) -> Unit, isCancelled: () -> Boolean) =
+        findingsImpl?.invoke(onRule, isCancelled) ?: emptyList()
     override fun close() { closed = true }
 }
 

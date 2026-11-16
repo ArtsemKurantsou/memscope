@@ -2,6 +2,7 @@ package dev.memscope.analysis.findings.rules
 
 import dev.memscope.analysis.Dominators
 import dev.memscope.analysis.findings.Finding
+import dev.memscope.analysis.findings.FindingsCancelledException
 import dev.memscope.analysis.findings.LeakChildLauncher
 import dev.memscope.analysis.findings.LeakPass
 import dev.memscope.analysis.findings.LeakPassResult
@@ -18,7 +19,9 @@ internal class LeakedComponentRule(private val launcher: LeakChildLauncher = Lea
     override fun evaluate(c: RuleContext): List<Finding> {
         val s = c.snapshot
         val idx = s.index
-        return when (val r = LeakPass.run(c.hprof, c.leakTimeoutMs, launcher)) {
+        return when (val r = LeakPass.run(c.hprof, c.leakTimeoutMs, launcher, c.isCancelled)) {
+            LeakPassResult.Cancelled -> throw FindingsCancelledException()
+            LeakPassResult.Busy -> listOf(skipped("leak analysis skipped: another leak analysis was still running"))
             LeakPassResult.TimedOut -> listOf(skipped("leak analysis skipped: took longer than ${c.leakTimeoutMs / 1000} s"))
             LeakPassResult.OutOfMemory -> listOf(skipped("leak analysis failed: out of memory — raise MEMSCOPE_LEAK_XMX (now ${LeakPass.xmx()})"))
             is LeakPassResult.Failed -> listOf(skipped("leak analysis failed: ${r.message}"))

@@ -25,6 +25,60 @@ class LeakPassTest {
         assertFalse(child!!.isAlive, "the process was really destroyed")
     }
 
+    @Test fun cancellingDuringTheChildDestroysIt() {
+        var child: Process? = null
+        val cancelled = java.util.concurrent.atomic.AtomicBoolean(false)
+        val t0 = System.nanoTime()
+        Thread { Thread.sleep(300); cancelled.set(true) }.start()
+        val r = LeakPass.run(hprof, 60_000, launcher("sleep", "30") { child = it }, isCancelled = { cancelled.get() })
+        assertTrue(r is LeakPassResult.Cancelled, r.toString())
+        assertTrue((System.nanoTime() - t0) / 1_000_000 < 10_000, "returned soon after the cancel")
+        assertFalse(child!!.isAlive, "the child was destroyed")
+    }
+
+    @Test fun aPassQueuedBehindAnotherSaysSoAndCancellingTheFirstFreesTheGate() {
+        var first: Process? = null
+        val cancelFirst = java.util.concurrent.atomic.AtomicBoolean(false)
+        val firstResult = java.util.concurrent.atomic.AtomicReference<LeakPassResult>()
+        val t = Thread { firstResult.set(LeakPass.run(hprof, 60_000, launcher("sleep", "30") { first = it }, isCancelled = { cancelFirst.get() })) }
+        t.start()
+        val deadline = System.currentTimeMillis() + 5000
+        while (first == null && System.currentTimeMillis() < deadline) Thread.sleep(10)
+        val second = LeakPass.run(hprof, 300, launcher("true"))
+        assertTrue(second is LeakPassResult.Busy, second.toString())
+        cancelFirst.set(true)
+        t.join(10_000)
+        assertTrue(firstResult.get() is LeakPassResult.Cancelled)
+        assertTrue(LeakPass.run(hprof, 5000, launcher("sh", "-c", "exit 1")) is LeakPassResult.Failed, "the gate is free again")
+    }
+
+    @Test fun anUnwritableTempDirDoesNotLeakTheGate() {
+        val missing = File(dir, "no/such/dir")
+        val r = LeakPass.run(hprof, 5000, launcher("true"), tmpDir = missing)
+        assertTrue(r is LeakPassResult.Failed, r.toString())
+        val next = LeakPass.run(hprof, 300, launcher("sh", "-c", "exit 1"))
+        assertTrue(next is LeakPassResult.Failed && "exit code 1" in next.message, "the permit was released: $next")
+    }
+
+    @Test fun theRuleSaysWhenAnotherPassWasStillRunningAndThrowsWhenCancelled() {
+        val h = File(dir, "busy.hprof").also { FindingsHprof.write(it, withLeak = true) }
+        Snapshot.open(h, listOf("test.")).use { s ->
+            val cancelFirst = java.util.concurrent.atomic.AtomicBoolean(false)
+            var first: Process? = null
+            val t = Thread { LeakPass.run(h, 60_000, launcher("sleep", "30") { first = it }, isCancelled = { cancelFirst.get() }) }
+            t.start()
+            val deadline = System.currentTimeMillis() + 5000
+            while (first == null && System.currentTimeMillis() < deadline) Thread.sleep(10)
+            val busy = LeakedComponentRule(launcher("true")).evaluate(RuleContext(s, h, ScreenSize.FALLBACK, leakTimeoutMs = 300)).single()
+            assertTrue(busy.title == "leak analysis skipped: another leak analysis was still running", busy.title)
+            cancelFirst.set(true)
+            t.join(10_000)
+            val ctx = RuleContext(s, h, ScreenSize.FALLBACK, leakTimeoutMs = 60_000, isCancelled = { true })
+            org.junit.jupiter.api.assertThrows<FindingsCancelledException> { LeakedComponentRule(launcher("sleep", "30")).evaluate(ctx) }
+            org.junit.jupiter.api.assertThrows<FindingsCancelledException> { Findings.forSnapshot(s, isCancelled = { true }) }
+        }
+    }
+
     @Test fun anOutOfMemoryExitAndAFailureExitAreTold() {
         assertTrue(LeakPass.run(hprof, 5000, launcher("sh", "-c", "exit 3")) is LeakPassResult.OutOfMemory)
         val failed = LeakPass.run(hprof, 5000, launcher("sh", "-c", "exit 1"))

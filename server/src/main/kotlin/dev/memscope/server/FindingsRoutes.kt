@@ -3,6 +3,7 @@ package dev.memscope.server
 import dev.memscope.analysis.HprofUnreadableException
 import dev.memscope.analysis.findings.Finding
 import dev.memscope.analysis.findings.Findings
+import dev.memscope.analysis.findings.FindingsCancelledException
 import dev.memscope.analysis.findings.FindingsSidecar
 import dev.memscope.analysis.findings.ScreenSize
 import dev.memscope.analysis.findings.SnapshotSummaries
@@ -35,6 +36,10 @@ data class SessionFindingsResponse(val findings: List<Finding>, val pending: Lis
  * `GET /api/sessions/{id}/findings`: `{findings, pending}` of the session rules (monotonic growth, startup
  * intervals) computed from the per-snapshot summaries, without opening any snapshot.
  */
+private fun findingsCancelled() = dev.memscope.device.DeviceException(
+    dev.memscope.device.DeviceException.Kind.CANCELLED, "Computing findings was cancelled.", "Open the Findings tab again to compute them.",
+)
+
 internal fun Route.findingsRoutes(deps: ServerDeps) {
     val store = deps.store
     val cache = ConcurrentHashMap<String, List<Finding>>()
@@ -70,16 +75,20 @@ internal fun Route.findingsRoutes(deps: ServerDeps) {
                     try {
                         var previous: String? = null
                         val list = deps.snapshots.use(key) { view ->
-                            view.findings(screenOf(s)) { ruleId ->
+                            view.findings(screenOf(s), { ruleId ->
+                                if (job.cancel.isCancelled) throw findingsCancelled() // between rules
                                 previous?.let { p -> job.step(p) { } }
                                 previous = ruleId
                                 job.note(ruleId, "running")
-                            }
+                            }, isCancelled = { job.cancel.isCancelled })
                         }
+                        if (job.cancel.isCancelled) throw findingsCancelled() // never cache or persist a cancelled run
                         previous?.let { p -> job.step(p) { } }
                         cache[key] = list
                         runCatching { FindingsSidecar.write(hprofFile, s.appPackagePrefixes, screen, list) }
                         job.complete(key)
+                    } catch (e: FindingsCancelledException) {
+                        throw findingsCancelled()
                     } catch (e: HprofUnreadableException) {
                         throw unreadable(e.message ?: "unreadable")
                     } finally {

@@ -26,6 +26,9 @@ internal sealed interface LeakPassResult {
     class Done(val traces: List<LeakTraceDto>) : LeakPassResult
     object TimedOut : LeakPassResult
     object OutOfMemory : LeakPassResult
+    /** Still waiting for another pass (one at a time) when the time was up. */
+    object Busy : LeakPassResult
+    object Cancelled : LeakPassResult
     class Failed(val message: String) : LeakPassResult
 }
 
@@ -53,18 +56,42 @@ internal object LeakPass {
         ).redirectErrorStream(false).redirectError(stderr).redirectOutput(ProcessBuilder.Redirect.DISCARD).start()
     }
 
-    fun run(hprof: File, timeoutMs: Long, launcher: LeakChildLauncher = realLauncher): LeakPassResult {
+    /**
+     * Runs the child for [hprof] within [timeoutMs] (waiting for the gate included). [isCancelled] is polled while
+     * waiting; when it turns true the child is destroyed and [LeakPassResult.Cancelled] returned. [tmpDir] holds
+     * the child's output files (default: the system temp dir).
+     */
+    fun run(
+        hprof: File, timeoutMs: Long, launcher: LeakChildLauncher = realLauncher,
+        isCancelled: () -> Boolean = { false }, tmpDir: File? = null,
+    ): LeakPassResult {
         val deadline = System.nanoTime() + timeoutMs * 1_000_000
-        if (!gate.tryAcquire(timeoutMs, TimeUnit.MILLISECONDS)) return LeakPassResult.TimedOut
-        val out = File.createTempFile("memscope-leaks", ".json")
-        val err = File.createTempFile("memscope-leaks", ".err")
+        fun leftMs() = (deadline - System.nanoTime()) / 1_000_000
+        var acquired = false
+        var out: File? = null
+        var err: File? = null
         var process: Process? = null
         try {
+            while (!acquired) {
+                if (isCancelled()) return LeakPassResult.Cancelled
+                val left = leftMs()
+                if (left <= 0) return LeakPassResult.Busy
+                acquired = gate.tryAcquire(minOf(left, POLL_MS), TimeUnit.MILLISECONDS)
+            }
+            out = File.createTempFile("memscope-leaks", ".json", tmpDir)
+            err = File.createTempFile("memscope-leaks", ".err", tmpDir)
             process = launcher.start(hprof, out, err)
-            val left = (deadline - System.nanoTime()) / 1_000_000
-            if (left <= 0 || !process.waitFor(left, TimeUnit.MILLISECONDS)) {
-                process.destroyForcibly().waitFor(10, TimeUnit.SECONDS)
-                return LeakPassResult.TimedOut
+            while (true) {
+                if (isCancelled()) {
+                    process.destroyForcibly().waitFor(10, TimeUnit.SECONDS)
+                    return LeakPassResult.Cancelled
+                }
+                val left = leftMs()
+                if (left <= 0) {
+                    process.destroyForcibly().waitFor(10, TimeUnit.SECONDS)
+                    return LeakPassResult.TimedOut
+                }
+                if (process.waitFor(minOf(left, POLL_MS), TimeUnit.MILLISECONDS)) break
             }
             val code = process.exitValue()
             if (code == CHILD_OOM_EXIT || err.readText().contains("OutOfMemoryError")) return LeakPassResult.OutOfMemory
@@ -74,8 +101,10 @@ internal object LeakPass {
             return LeakPassResult.Failed(e.message ?: e.javaClass.simpleName)
         } finally {
             process?.takeIf { it.isAlive }?.destroyForcibly()
-            out.delete(); err.delete()
-            gate.release()
+            out?.delete(); err?.delete()
+            if (acquired) gate.release()
         }
     }
+
+    private const val POLL_MS = 100L
 }

@@ -22,8 +22,13 @@ interface SnapshotView : AutoCloseable {
     fun indexInParent(parentRef: String, childRef: String): Int
     /** What grew between [base] (before) and this snapshot (after); [base] comes from the same registry. */
     fun diff(base: SnapshotView): DiffResult
-    /** Rule-based findings of this snapshot; [onRule] is called with each rule id before it runs. Can take minutes on a big dump. */
-    fun findings(screen: dev.memscope.analysis.findings.ScreenSize, onRule: (String) -> Unit): List<dev.memscope.analysis.findings.Finding> = emptyList()
+    /**
+     * Rule-based findings of this snapshot; [onRule] is called with each rule id before it runs. Can take minutes on a
+     * big dump; the leak pass polls [isCancelled] and stops (destroying its child JVM) when it turns true.
+     */
+    fun findings(
+        screen: dev.memscope.analysis.findings.ScreenSize, onRule: (String) -> Unit, isCancelled: () -> Boolean = { false },
+    ): List<dev.memscope.analysis.findings.Finding> = emptyList()
     /** The compact summary the session rules use (read from, or written to, the sidecar next to the hprof). */
     fun snapshotSummary(): dev.memscope.analysis.findings.SnapshotSummary? = null
 }
@@ -61,8 +66,8 @@ fun Snapshot.asView(): SnapshotView = object : SnapshotView, SnapshotBacked {
         val before = (base as? SnapshotBacked)?.snapshot ?: throw IllegalArgumentException("the base snapshot cannot be compared: it is not backed by a real analysis")
         return SnapshotDiff.diff(before, this@asView)
     }
-    override fun findings(screen: dev.memscope.analysis.findings.ScreenSize, onRule: (String) -> Unit) =
-        dev.memscope.analysis.findings.Findings.forSnapshot(this@asView, screen = screen, progress = onRule)
+    override fun findings(screen: dev.memscope.analysis.findings.ScreenSize, onRule: (String) -> Unit, isCancelled: () -> Boolean) =
+        dev.memscope.analysis.findings.Findings.forSnapshot(this@asView, screen = screen, progress = onRule, isCancelled = isCancelled)
     override fun snapshotSummary() = dev.memscope.analysis.findings.SnapshotSummaries.readOrCompute(this@asView)
     override fun close() = this@asView.close()
 }

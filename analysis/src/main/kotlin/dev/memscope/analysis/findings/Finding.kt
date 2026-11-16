@@ -33,12 +33,16 @@ data class ScreenSize(val width: Int, val height: Int) {
     }
 }
 
-/** What a snapshot rule may use. [leakTimeoutMs] bounds the Shark leak pass. */
+/** The findings job was cancelled; never turned into a finding. */
+class FindingsCancelledException : RuntimeException("Computing findings was cancelled.")
+
+/** What a snapshot rule may use. [leakTimeoutMs] bounds the Shark leak pass; long rules poll [isCancelled]. */
 class RuleContext(
     val snapshot: Snapshot,
     val hprof: File = snapshot.hprofFile,
     val screen: ScreenSize = ScreenSize.FALLBACK,
     val leakTimeoutMs: Long = Thresholds.LEAK_ANALYSIS_TIMEOUT_MS,
+    val isCancelled: () -> Boolean = { false },
 ) {
     /** One streaming pass over the hprof, shared by the duplicate-strings and duplicate-arrays rules. */
     internal val content: dev.memscope.analysis.findings.rules.ContentScan by lazy {
