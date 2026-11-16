@@ -70,7 +70,7 @@ internal class ContentScan private constructor(
                         r.skip(size - take)
                         val h = hash(bytes, take, size, type)
                         if (wantString) { stringHashes.add(h); stringIdx.add(d) }
-                        if (wantArray) { arrayHashes.add(h); arrayIdx.add(d) }
+                        if (wantArray && !wantString) { arrayHashes.add(h); arrayIdx.add(d) }
                     }
                 }
             }

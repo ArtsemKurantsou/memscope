@@ -37,8 +37,8 @@ class FindingsRulesTest {
 
     @Test fun duplicateBitmapsCountsSixSameSized() {
         val f = DuplicateBitmapsRule().evaluate(ctx()).single()
-        assertTrue(f.title.startsWith("Possible duplicate bitmaps: 6 x 100x100"), f.title)
-        assertEquals(5L * 100 * 100 * 4, f.bytes)
+        assertTrue(f.title.startsWith("Possible duplicate bitmaps: 6 x 300x300"), f.title)
+        assertEquals(5L * 300 * 300 * 4, f.bytes)
         assertTrue(f.refs.size == 3 && f.refs.all { it.startsWith("obj:") })
     }
 

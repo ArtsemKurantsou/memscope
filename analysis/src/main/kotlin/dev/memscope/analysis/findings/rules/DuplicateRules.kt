@@ -77,21 +77,35 @@ internal class DuplicateArraysRule : Rule {
 internal class DuplicateStringsRule : Rule {
     override val id = "duplicate-strings"
 
-    private class Dup(val owner: Int, val copies: Int, val wasted: Long, val text: String, val length: Int)
+    internal class Dup(val owner: Int, val copies: Int, val wasted: Long, val text: String, val length: Int)
+
+    companion object {
+        /**
+         * Ranks the hash groups by wasted bytes (estimated from the group alone) and reads text only for the best
+         * [Thresholds.STRING_VERIFY_MAX]: every sampled owner must read back equal, else it was a hash collision.
+         */
+        internal fun verify(groups: List<ContentGroup>, ownerOf: (Int) -> Int, eachOf: (Int, Int) -> Long, read: (Int) -> String?): List<Dup> {
+            class Cand(val owners: IntArray, val wasted: Long)
+            val cands = ArrayList<Cand>()
+            for (g in groups) {
+                val owners = g.members.map(ownerOf).filter { it >= 0 }.toIntArray()
+                if (owners.size >= 2) cands += Cand(owners, (owners.size - 1) * eachOf(owners[0], g.members[0]))
+            }
+            cands.sortByDescending { it.wasted }
+            val out = ArrayList<Dup>()
+            for (cand in cands.take(Thresholds.STRING_VERIFY_MAX)) {
+                val texts = cand.owners.take(Thresholds.STRING_VERIFY_SAMPLES).map(read)
+                if (texts.any { it == null || it != texts[0] }) continue
+                out += Dup(cand.owners[0], cand.owners.size, cand.wasted, texts[0]!!, texts[0]!!.length)
+            }
+            return out
+        }
+    }
 
     override fun evaluate(c: RuleContext): List<Finding> {
         val s = c.snapshot
         val idx = s.index
-        val dups = ArrayList<Dup>()
-        for (g in c.content.strings) {
-            val owners = g.members.map { c.content.stringOf(it) }.filter { it >= 0 }
-            if (owners.size < 2) continue
-            val each = idx.shallow[owners[0]].toLong() + idx.shallow[g.members[0]].toLong()
-            // Hash match -> read the actual text of a few members; differing texts are a collision.
-            val texts = owners.take(3).map { readString(s, it) }
-            if (texts.any { it == null || it != texts[0] }) continue
-            dups += Dup(owners[0], owners.size, (owners.size - 1) * each, texts[0]!!, texts[0]!!.length)
-        }
+        val dups = verify(c.content.strings, c.content::stringOf, { owner, value -> idx.shallow[owner].toLong() + idx.shallow[value].toLong() }, { readString(s, it) })
         val top = dups.sortedByDescending { it.wasted }.take(Thresholds.DUPLICATE_STRING_TOP)
         val total = top.sumOf { it.wasted }
         if (top.isEmpty() || total < Thresholds.DUPLICATE_STRING_MIN_WASTED) return emptyList()

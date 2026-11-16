@@ -73,8 +73,13 @@ object Thresholds {
     /** oversized-bitmap: pixels above this multiple of the screen's pixels. */
     const val OVERSIZED_BITMAP_SCREEN_FACTOR = 2L
     const val DUPLICATE_BITMAP_MIN_COUNT = 5
+    /** A group of duplicate bitmaps is reported when it holds at least this much pixel memory. */
+    const val DUPLICATE_BITMAP_MIN_BYTES = 1 * MB
     const val DUPLICATE_STRING_MIN_WASTED = 256 * KB
     const val DUPLICATE_STRING_TOP = 10
+    /** Hash groups whose text is read back to confirm (best by wasted bytes first), and members sampled per group. */
+    const val STRING_VERIFY_MAX = 50
+    const val STRING_VERIFY_SAMPLES = 3
     const val DUPLICATE_ARRAY_MIN_BYTES = 16 * KB
     const val DUPLICATE_ARRAY_MIN_COPIES = 2
     const val DUPLICATE_ARRAY_MIN_WASTED = 1 * MB

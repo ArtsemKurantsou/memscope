@@ -70,7 +70,7 @@ internal class DuplicateBitmapsRule : Rule {
 
     override fun evaluate(c: RuleContext): List<Finding> =
         readBitmaps(c.snapshot).groupBy { Triple(it.width, it.height, it.bytesPerPixel) }
-            .filter { (_, g) -> g.size >= Thresholds.DUPLICATE_BITMAP_MIN_COUNT }
+            .filter { (_, g) -> g.size >= Thresholds.DUPLICATE_BITMAP_MIN_COUNT && g.sumOf { it.bytes } >= Thresholds.DUPLICATE_BITMAP_MIN_BYTES }
             .map { (_, g) ->
                 val first = g.first()
                 val total = g.sumOf { it.bytes }

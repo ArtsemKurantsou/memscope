@@ -21,7 +21,7 @@ import java.nio.ByteBuffer
 /**
  * A synthetic Android-style hprof shaped for the findings rules. Static `test.Caches.bag` -> `test.Bag`
  * whose `items` Object[] holds: 3 byte[1,150,000] (two equal, the third differing only in its last byte),
- * 100 equal 2000-char Strings, 6 Bitmaps 100x100, one Bitmap 3000x2000, and an ArrayList with a 20,000-slot
+ * 100 equal 2000-char Strings, 6 Bitmaps 300x300, one Bitmap 3000x2000, and an ArrayList with a 20,000-slot
  * backing array holding 3 items. `test.Caches.leaked` -> a destroyed `test.LeakyActivity`
  * (android.app.Activity.mDestroyed = true) when [withLeak]. Classes are in heap "image", instances in "app".
  */
@@ -97,7 +97,7 @@ object FindingsHprof {
                 w.write(CharArrayDump(chars(i), 0, CharArray(STRING_CHARS) { ('a' + it % 26) }))
                 items += string(i)
             }
-            for (i in 0 until 6) { inst(bitmap(i), C_BITMAP, { putInt(100); putInt(100) }, 8); items += bitmap(i) }
+            for (i in 0 until 6) { inst(bitmap(i), C_BITMAP, { putInt(300); putInt(300) }, 8); items += bitmap(i) }
             inst(BIG_BITMAP, C_BITMAP, { putInt(3000); putInt(2000) }, 8); items += BIG_BITMAP
             inst(LIST, C_LIST, { putInt(LIST_DATA.toInt()); putInt(3) }, 8); items += LIST
             w.write(ObjectArrayDumpRecord(LIST_DATA, 0, C_OBJARR, LongArray(SPARSE_SLOTS)))
