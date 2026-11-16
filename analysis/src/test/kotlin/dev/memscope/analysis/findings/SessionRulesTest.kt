@@ -92,3 +92,19 @@ private object MonotonicGrowthTest {
 private object StartupIntervalTest {
     fun run(s: List<SummarizedSnapshot>) = Findings.forSession(s, startup = true).filter { it.ruleId == "startup-interval" }
 }
+
+class GrowthNoiseTest {
+    private val mb = 1024L * 1024L
+    private fun snap(i: Int, staticBytes: Long, classBytes: Long) = SummarizedSnapshot(
+        "s$i", "n$i", null, i * 1000L,
+        SnapshotSummary(null, 0, 10 * mb, listOf(ClassSummary("app.Item", true, 1, 1, classBytes, "obj:1")), listOf(StaticSummary("app.Holder", staticBytes, staticBytes, "obj:2", true))),
+    )
+
+    @org.junit.jupiter.api.Test fun oneFindingPerCauseAndNoneForStartupSessions() {
+        val snaps = (1..3).map { snap(it, it * mb, it * mb) } // the class grows exactly as much as the static holding it
+        val f = Findings.forSession(snaps, startup = false).filter { it.ruleId == "monotonic-growth" }
+        assertEquals(listOf("Holder grew by 2.0 MB across 3 snapshots"), f.map { it.title })
+        assertTrue("one run of the app" in f.single().evidence)
+        assertTrue(Findings.forSession(snaps, startup = true).none { it.ruleId == "monotonic-growth" })
+    }
+}

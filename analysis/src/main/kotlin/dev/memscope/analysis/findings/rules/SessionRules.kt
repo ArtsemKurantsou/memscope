@@ -33,8 +33,9 @@ internal class MonotonicGrowthRule : SessionRule {
     override val id = "monotonic-growth"
 
     override fun evaluate(snapshots: List<SummarizedSnapshot>, startup: Boolean): List<Finding> {
-        if (snapshots.size < Thresholds.GROWTH_MIN_SNAPSHOTS) return emptyList()
-        val found = ArrayList<Pair<Finding, Long>>()
+        // Milestones of a startup recording grow by nature; the startup-interval rule describes them.
+        if (startup || snapshots.size < Thresholds.GROWTH_MIN_SNAPSHOTS) return emptyList()
+        val found = ArrayList<Triple<Finding, Long, Boolean>>()
         for (s in seriesOf(snapshots, appOnlyClasses = true)) {
             // Longest run of strictly increasing values.
             var start = 0
@@ -57,16 +58,20 @@ internal class MonotonicGrowthRule : SessionRule {
                 ruleId = id, severity = Severity.MEDIUM,
                 title = "$name grew by ${formatBytes(growth)} across ${run.count()} snapshots",
                 evidence = "$what retain: " + run.joinToString(" -> ") { "${formatBytes(s.values[it])} (${snapshots[it].label})" } +
-                    ". Strictly increasing over at least ${Thresholds.GROWTH_MIN_SNAPSHOTS} snapshots, growth at least ${formatBytes(Thresholds.GROWTH_MIN_BYTES)}.",
+                    ". Strictly increasing over at least ${Thresholds.GROWTH_MIN_SNAPSHOTS} snapshots, growth at least ${formatBytes(Thresholds.GROWTH_MIN_BYTES)}. " +
+                    "Assumes the snapshots come from one run of the app: a restart in between resets the numbers.",
                 suggestion = if (s.isStatic) {
                     "`$name` keeps retaining more (${formatBytes(perStep)} per snapshot on average). Find what adds to it each time and cap it: evict old entries, use a bounded LruCache or ring buffer, or release it when its screen closes."
                 } else {
                     "$name instances accumulate (${formatBytes(perStep)} per snapshot on average). Find which owner keeps adding them (open the largest instance in the tree) and release them when no longer needed."
                 },
                 bytes = growth, refs = listOfNotNull(s.refs[run.last]), snapshotId = last.id,
-            ) to growth
+            ).let { Triple(it, growth, s.isStatic) }
         }
-        return found.sortedByDescending { it.second }.take(Thresholds.GROWTH_TOP).map { it.first }
+        // One finding per cause: a class series that a static holder explains (about the same bytes) is dropped.
+        val statics = found.filter { it.third }
+        return found.filter { f -> f.third || statics.none { it.second >= f.second * 0.8 } }
+            .sortedByDescending { it.second }.take(Thresholds.GROWTH_TOP).map { it.first }
     }
 }
 
