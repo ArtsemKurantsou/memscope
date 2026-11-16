@@ -48,6 +48,8 @@ data class StartupTimeouts(
     val pullMs: Long = 300_000,
     /** Longest wait for any other JDWP reply (JDI has none of its own): a VM that does not answer is wedged. */
     val jdwpReplyMs: Long = 20_000,
+    /** Longest wait for the garbage collection after a dump; a hung one must not fail a dump that succeeded. */
+    val gcMs: Long = 20_000,
     /** After this long without a debugger event (app past the wait), ping the VM to tell a slow app from a wedged one. */
     val pingAfterMs: Long = 10_000,
 )
@@ -434,6 +436,17 @@ class StartupSession(
             DebugEvent.Disconnected -> "disconnected"
         }
 
+        /** Keeps a collection from being pending when the app resumes. A hang ends the debugger connection but not the dump. */
+        private fun collectGarbageAfterDump(thread: DebugThread) {
+            try {
+                bounded("The garbage collection after the dump", timeouts.gcMs, onAbort = { debugger?.dispose() }) { debugger!!.collectGarbage(thread) }
+            } catch (e: DeviceException) {
+                if (e.kind == DeviceException.Kind.CANCELLED) throw e
+                wedgedOp = "the garbage collection after the dump" // detach must stop the app
+                record("no reply while collecting garbage after the dump")
+            }
+        }
+
         /** Dumps and pulls milestone [m]; true if the debugger connection closed meanwhile. */
         private fun reach(m: Milestone, thread: DebugThread): Boolean {
             pending.remove(m.id)
@@ -470,6 +483,7 @@ class StartupSession(
                     throw VmGone()
                 }
                 if (error != null) throw MilestoneFailed("Debug.dumpHprofData failed in the app: $error")
+                collectGarbageAfterDump(thread)
                 facts += "dump %.1f s".format((nowMs() - t0) / 1000.0)
                 d((facts + "pulling").joinToString(" · "))
                 val t1 = nowMs()

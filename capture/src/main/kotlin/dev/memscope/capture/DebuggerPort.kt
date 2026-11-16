@@ -77,6 +77,12 @@ interface DebuggerPort {
      */
     fun diagnose(): String = "no diagnosis available"
 
+    /**
+     * `Runtime.getRuntime().gc()` on [thread] (stopped at an event) so no collection is pending when the app resumes.
+     * Best effort: failures are ignored; a call that hangs is bounded by the caller.
+     */
+    fun collectGarbage(thread: DebugThread) {}
+
     /** A cheap round trip (JDWP AllThreads) to tell a quiet VM from a wedged one; blocks if the VM does not answer. */
     fun ping() {}
 

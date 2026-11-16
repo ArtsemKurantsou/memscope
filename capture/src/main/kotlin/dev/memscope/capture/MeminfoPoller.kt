@@ -119,7 +119,13 @@ class MeminfoPoller(
      */
     fun setRecording(on: Boolean) {
         val r = run ?: return
-        synchronized(monitor) { r.recording = on }
+        synchronized(monitor) {
+            r.recording = on
+            if (on) {
+                r.epoch++ // the cancelled poll's late result is discarded, without backoff
+                r.inFlight?.cancel() // a `dumpsys` already running must not meet the first breakpoint
+            }
+        }
     }
 
     /** Stops the loop and abandons a poll in flight; waits briefly for the thread. Idempotent. */

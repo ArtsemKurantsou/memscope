@@ -232,6 +232,8 @@ export function createTimeline({ container, onSelectSnapshot, pollMs = POLL_MS }
     if (sig === chipSig) return;
     chipSig = sig;
     chips.hidden = !markers.length;
+    // the rebuild would drop keyboard focus from the activated chip
+    const focusedAt = [...chips.children].findIndex((c) => c === document.activeElement);
     chips.replaceChildren(...markers.map((m, i) => {
       const isMilestone = m.kind === 'milestone';
       const label = `${i + 1}. ${m.label} (${isMilestone ? 'milestone' : 'dump'}) at ${fmtSec(m.tMs)}`;
@@ -246,6 +248,7 @@ export function createTimeline({ container, onSelectSnapshot, pollMs = POLL_MS }
       b.addEventListener('blur', () => setHighlight(null));
       return b;
     }));
+    if (focusedAt >= 0) chips.children[focusedAt]?.focus({ preventScroll: true });
   }
 
   function setHighlight(id) {

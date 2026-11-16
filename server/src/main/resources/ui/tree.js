@@ -272,7 +272,6 @@ export function createTree({ container, getOptions, getSummary, onSelect, onStat
 
   async function showMore(node) {
     if (node.loading) return; // a click while the previous page is still loading
-    const seq = node.seq;
     const before = node.kids.length;
     const { hideSystem } = getOptions();
     const st = statusRow(node, 'Loading more…');
@@ -283,7 +282,9 @@ export function createTree({ container, getOptions, getSummary, onSelect, onStat
       if (e.name === 'AbortError') return;
       onStatus(`Could not load more rows: ${e.message}`);
     }
-    if (node !== root && (seq !== node.seq || !node.expanded || !node.el.isConnected)) return; // collapsed meanwhile
+    // Collapsed meanwhile: a later expand renders every loaded row. Collapsed and re-expanded meanwhile: that expand
+    // rendered before these rows arrived and removed `st`, so the else branch below redraws the whole block.
+    if (node !== root && (!node.expanded || !node.el.isConnected)) return;
     if (!hideSystem && st.isConnected) {
       // Server order is the display order: append only the new rows.
       const frag = document.createDocumentFragment();

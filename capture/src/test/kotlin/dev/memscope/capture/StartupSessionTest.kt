@@ -258,6 +258,20 @@ class StartupSessionTest {
     }
 
     @Test
+    fun `a hung garbage collection after a dump does not fail the dump`() {
+        vm.defaultScript()
+        vm.hangOn = "gc"
+        val job = newJob()
+        val t0 = System.nanoTime()
+        runCatching { startup(fast.copy(gcMs = 300, jdwpReplyMs = 700)).run(session.id, StartupConfig(), job) } // the fake VM goes on after a dispose; a real one would fail later
+        assertTrue((System.nanoTime() - t0) / 1_000_000 < 5_000, "bounded")
+        assertEquals(Job.StepState.DONE, step(job, "Dump: Process start").state, "the dump itself succeeded")
+        assertEquals(SnapshotMeta.Status.OK, stored().snapshots.first().status)
+        assertEquals(2, device.count("shell am force-stop dev.app"), "the app that no longer answers is stopped")
+        assertCleanDevice()
+    }
+
+    @Test
     fun `a wedged VM that sends no event is found by the liveness ping, not after the full milestone timeout`() {
         vm.defaultScript()
         vm.script.removeIf { set -> set.any { it is DebugEvent.EntryHit && it.key == "first_activity_resumed" || it is DebugEvent.Reached && it.key == "first_activity_resumed" } }

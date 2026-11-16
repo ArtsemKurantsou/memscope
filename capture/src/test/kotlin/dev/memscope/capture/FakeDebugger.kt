@@ -87,6 +87,8 @@ class FakeDebugger : DebuggerPort {
         return dumpResult(remotePath)
     }
 
+    override fun collectGarbage(thread: DebugThread) { traffic("gc"); maybeHang("gc") }
+
     override fun diagnose(): String { calls += "diagnose"; maybeHang("ping"); return "diagnosis of the fake VM" }
 
     override fun ping() { calls += "ping"; maybeHang("ping") }

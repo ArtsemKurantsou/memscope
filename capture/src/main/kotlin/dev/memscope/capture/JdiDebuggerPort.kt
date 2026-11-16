@@ -183,7 +183,6 @@ class JdiDebuggerPort : DebuggerPort {
             path.disableCollection()
             try {
                 debug.invokeMethod(t, method, listOf(path), ClassType.INVOKE_SINGLE_THREADED)
-                collectGarbage(t)
                 return null
             } catch (e: com.sun.jdi.InvocationException) {
                 return describe(e.exception())
@@ -197,8 +196,8 @@ class JdiDebuggerPort : DebuggerPort {
         }
     }
 
-    /** `Runtime.getRuntime().gc()` on the stopped thread, so no collection is pending when the app resumes. Best effort. */
-    private fun collectGarbage(t: ThreadReference) {
+    override fun collectGarbage(thread: DebugThread) {
+        val t = threads[thread.id] ?: return
         runCatching {
             val runtime = vm().classesByName("java.lang.Runtime").firstOrNull() as? ClassType ?: return
             val get = runtime.methodsByName("getRuntime", "()Ljava/lang/Runtime;").firstOrNull() ?: return

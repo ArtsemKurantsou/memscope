@@ -175,7 +175,7 @@ export function createCapture({ onSnapshot, onNoSnapshot, onEmptyState, onSessio
         el('strong', null, failure.message),
         failure.hint ? el('p', null, failure.hint) : null,
         el('div', { class: 'jactions' },
-          el('button', { class: 'btn primary small', onclick: failure.retry }, 'Retry'),
+          failure.retry ? el('button', { class: 'btn primary small', onclick: failure.retry }, 'Retry') : null,
           el('button', { class: 'btn small', onclick: hidePanel }, 'Dismiss'))));
     }
     jobPanel.replaceChildren(...parts);
@@ -390,8 +390,8 @@ export function createCapture({ onSnapshot, onNoSnapshot, onEmptyState, onSessio
       // unreadable or failed: say why instead of trying to open it
       showFailure({
         message: `Snapshot ${meta.label || meta.id} cannot be opened (${meta.status.toLowerCase()})`,
-        hint: (meta.error ? meta.error + ' ' : '') + 'Capture a new snapshot to replace it.',
-      }, () => retryOpen(meta.id));
+        hint: (meta.error ? meta.error + ' ' : '') + 'Take a new dump to replace it.',
+      }); // no Retry: opening it again would fail the same way
       return;
     }
     if (meta) await onSnapshot(session.id, meta);

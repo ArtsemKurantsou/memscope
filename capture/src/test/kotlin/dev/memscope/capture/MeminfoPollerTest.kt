@@ -187,6 +187,24 @@ class MeminfoPollerTest {
     }
 
     @Test
+    fun `setRecording during a dumpsys in flight cancels it and discards its late result`() {
+        val inCall = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        phone.meminfo = { inCall.countDown(); release.await(5, java.util.concurrent.TimeUnit.SECONDS); ProcessResult(0, SUMMARY, "") }
+        val result = java.util.concurrent.atomic.AtomicReference<Boolean>()
+        val t = Thread { result.set(poller.pollOnce()) }.also { it.start() }
+        assertTrue(inCall.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        now += 300
+        poller.setRecording(true)
+        assertTrue(phone.tokens.single().isCancelled, "the in-flight dumpsys must be cancelled")
+        release.countDown()
+        t.join(5000)
+        assertFalse(result.get())
+        assertTrue(samples().isEmpty())
+        assertEquals(1000, poller.currentIntervalMs)
+    }
+
+    @Test
     fun `a 300 ms hold still yields a held interval and an open hold has no end`() {
         now += 1000
         poller.setPaused(true)
