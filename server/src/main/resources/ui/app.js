@@ -12,9 +12,12 @@ import { createFindings } from './findings.js';
 import { el, formatBytes, formatInt, formatDeltaBytes, indexDiff, prefs } from './util.js';
 
 const $ = (id) => document.getElementById(id);
+const HIDE_SYSTEM_KEY = 'hideSystem.v2';
 
 const state = {
-  hideSystem: prefs.get('hideSystem', true),
+  // v2: earlier builds also stored the automatic switch-off of "Show in tree" (forceShowSystem), so a stored OFF may
+  // not have been the user's choice; the versioned key starts everyone at the default ON.
+  hideSystem: prefs.get(HIDE_SYSTEM_KEY, true),
   myCode: prefs.get('myCode', false),
   snap: null,      // snapshotApi of the open snapshot
   summary: null,
@@ -119,7 +122,7 @@ const tree = createTree({
     hideSystem: state.hideSystem,
     myCode: state.myCode,
     get diff() { return state.diff; },
-    forceShowSystem: () => { setHideSystem(false); },
+    forceShowSystem: () => { setHideSystem(false, false); },
   }),
   getSummary: () => state.summary,
   onSelect: (row) => details.showRow(row),
@@ -196,10 +199,11 @@ const findingsView = createFindings({
   onAnalyseAll: analyseAll,
 });
 
-function setHideSystem(on) {
+/** [persist] false: a temporary switch (revealing a system object) that must not become the stored preference. */
+function setHideSystem(on, persist = true) {
   state.hideSystem = on;
   hideBox.checked = on;
-  prefs.set('hideSystem', on);
+  if (persist) prefs.set(HIDE_SYSTEM_KEY, on);
   renderSummary();
   renderCompareLine();
   tree.refresh();

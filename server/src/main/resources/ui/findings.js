@@ -66,7 +66,7 @@ export function createFindings({ container, getSession, onShow, onBadge, onAnaly
       onclick: (e) => show(e.currentTarget, ref, f.snapshotId),
     }, f.refs.length > 1 ? `Show in tree (${i + 1})` : 'Show in tree'));
     if (f.ruleId === 'leaked-component' && f.severity === 'LOW') {
-      buttons.push(el('button', { class: 'btn small primary', type: 'button', title: 'Run only the slow leak analysis again', onclick: () => load(true) }, 'Run leak analysis again'));
+      buttons.push(el('button', { class: 'btn small primary', type: 'button', title: 'Compute all findings of this snapshot again (the leak analysis included; can take a while)', onclick: () => load(true) }, 'Run leak analysis again'));
     }
     return el('article', { class: 'fcard sev-' + f.severity.toLowerCase() },
       el('header', { class: 'fhead' }, chip(f.severity), el('h3', { class: 'ftitle' }, f.title),

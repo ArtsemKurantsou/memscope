@@ -23,6 +23,7 @@ import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import io.ktor.server.testing.ApplicationTestBuilder
 import io.ktor.server.testing.testApplication
+import kotlinx.coroutines.async
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -269,6 +270,36 @@ class RoutesTest {
         val o = client.postJson("/api/sessions", startupBody).obj()
         client.postJson("/api/sessions/${str(o["session"]!!.jsonObject, "id")}/end")
         assertEquals("CANCELLED", str(client.waitJob(str(o, "jobId")), "state"))
+    }
+
+    @Test fun endingTheSessionCancelsItsRunningDump() = server {
+        val s = store.newAttachSession()
+        runner.pullGate = CountDownLatch(1)
+        val job = str(client.postJson("/api/sessions/${s.id}/dump").obj(), "jobId")
+        waitUntil { runner.calls.any { "pull" in it } }
+        assertEquals(HttpStatusCode.OK, client.postJson("/api/sessions/${s.id}/end").status)
+        assertEquals("CANCELLED", str(client.waitJob(job), "state"))
+        val after = store.get(s.id)!!
+        assertEquals(SessionMeta.State.ENDED, after.state)
+        assertTrue(after.snapshots.isEmpty(), "no snapshot is appended to an ended session")
+        assertFalse(store.snapshotFile(s.id, "s1").toFile().exists())
+    }
+
+    @Test fun aSlowScreenSizeQueryDoesNotHoldTheSessionLock() = server {
+        val other = store.newAttachSession()
+        store.update(other.id) { it.copy(state = SessionMeta.State.ENDED) }
+        val gate = CountDownLatch(1)
+        runner.wmGate = gate
+        kotlinx.coroutines.coroutineScope {
+            val creating = async { client.postJson("/api/sessions", """{"serial":"emulator-5554","packageName":"dev.app","mode":"ATTACH"}""") }
+            kotlinx.coroutines.withTimeout(5_000) { while (runner.calls.none { "wm" in it }) kotlinx.coroutines.delay(10) }
+            val deleted = kotlinx.coroutines.withTimeout(3_000) { client.delete("/api/sessions/${other.id}") }
+            assertEquals(HttpStatusCode.OK, deleted.status, "a request needing the session lock is not blocked by `wm size`")
+            gate.countDown()
+            val created = creating.await()
+            assertEquals(HttpStatusCode.OK, created.status, created.bodyAsText())
+            assertEquals(1080, created.obj()["screenWidthPx"]!!.jsonPrimitive.int)
+        }
     }
 
     @Test fun launcherComponentForTheDialogPlaceholder() = server {

@@ -36,6 +36,17 @@ class FakeAdbRunner : ProcessRunner {
     var hprofSize = 4096
     var meminfo = ""
     @Volatile var disconnected = false
+    /** While set, `pull` waits for it (honouring cancel, like the real runner). */
+    @Volatile var pullGate: java.util.concurrent.CountDownLatch? = null
+    /** While set, `wm size` waits for it. */
+    @Volatile var wmGate: java.util.concurrent.CountDownLatch? = null
+
+    private fun await(gate: java.util.concurrent.CountDownLatch?, cancel: CancelToken) {
+        gate ?: return
+        while (!gate.await(10, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+            if (cancel.isCancelled) throw dev.memscope.device.DeviceException(dev.memscope.device.DeviceException.Kind.CANCELLED, "cancelled", "cancelled")
+        }
+    }
 
     fun count(vararg prefix: String) = calls.count { c -> c.drop(1).let { a -> a.windowed(prefix.size).any { it == prefix.toList() } } }
 
@@ -60,9 +71,11 @@ class FakeAdbRunner : ProcessRunner {
                 ProcessResult(0, "PID NAME\n" + processes.filter { it.endsWith(name) || it.contains("$name:") }.joinToString("\n"), "")
             }
             c[0] == "shell" && c[1] == "dumpsys" -> ProcessResult(0, meminfo, "")
+            c[0] == "shell" && c[1] == "wm" -> { await(wmGate, cancel); ProcessResult(0, "Physical size: 1080x2400\n", "") }
             c[0] == "shell" && c[1] == "stat" -> ProcessResult(0, "$hprofSize\n", "")
             c[0] == "shell" && c[1] == "cmd" && c.last() == "dev.app" -> ProcessResult(0, "priority=0\ndev.app/.Main\n", "")
             c[0] == "pull" -> {
+                await(pullGate, cancel)
                 val head = "JAVA PROFILE 1.0.3\u0000".toByteArray()
                 Files.write(Path.of(c[2]), head + ByteArray(hprofSize - head.size))
                 ProcessResult(0, "", "")

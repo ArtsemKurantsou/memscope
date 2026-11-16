@@ -1,6 +1,4 @@
-    const changed = !session || !s || session.id !== s.id;
-    session = s;
-    if (changed || (base && !s.snapshots.some((x) => x.id === base))) { base = null; auto = false; } // a deleted base is dropped// The "compare with" selector: which snapshot of the session the current one is diffed against.
+// The "compare with" selector: which snapshot of the session the current one is diffed against.
 import { el, formatTime } from './util.js';
 
 export function createCompare({ box, select, onChange }) {
@@ -41,7 +39,7 @@ export function createCompare({ box, select, onChange }) {
   function setSession(s) {
     const changed = !session || !s || session.id !== s.id;
     session = s;
-    if (changed) { base = null; auto = false; }
+    if (changed || (base && !s.snapshots.some((x) => x.id === base))) { base = null; auto = false; } // a deleted base is dropped
     render();
     emit();
   }

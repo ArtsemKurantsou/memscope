@@ -46,7 +46,9 @@ class AdbTest {
     @Test
     fun `shell maps failures`() {
         val (a1, _) = adb { err("error: device 'x' not found") }
-        assertEquals(DeviceException.Kind.DISCONNECTED, assertThrows<DeviceException> { a1.shell("x", listOf("ls")) }.kind)
+        val gone = assertThrows<DeviceException> { a1.shell("x", listOf("ls")) }
+        assertEquals(DeviceException.Kind.DISCONNECTED, gone.kind)
+        assertFalse("Partial files" in gone.hint, "a shell command leaves no files: ${gone.hint}")
 
         val (a2, _) = adb { throw DeviceException(DeviceException.Kind.TIMEOUT, "slow", "retry") }
         assertEquals(DeviceException.Kind.TIMEOUT, assertThrows<DeviceException> { a2.shell("x", listOf("ls")) }.kind)
@@ -142,6 +144,12 @@ class AdbTest {
         val dest = tmp.resolve("p.hprof")
         val (adb, _) = adb { Files.writeString(dest, "partial"); err("adb: error: remote object '/x' does not exist") }
         assertEquals(DeviceException.Kind.COMMAND_FAILED, assertThrows<DeviceException> { adb.pull("s", "/x", dest, 5.seconds) }.kind)
+        assertFalse(Files.exists(dest))
+
+        val (cut, _) = adb { Files.writeString(dest, "partial"); err("adb: error: closed") }
+        val e = assertThrows<DeviceException> { cut.pull("s", "/x", dest, 5.seconds) }
+        assertEquals(DeviceException.Kind.DISCONNECTED, e.kind)
+        assertTrue("Partial files were removed" in e.hint, e.hint)
         assertFalse(Files.exists(dest))
     }
 

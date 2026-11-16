@@ -133,11 +133,11 @@ async function diff(sid, snap, baseId, isCurrent = () => true) {
 /** Snapshot-scoped calls; a 409 "not analysed" triggers one transparent re-open and a retry. */
 export function snapshotApi(sid, snap) {
   const base = `/api/snapshots/${sid}/${snap}`;
-  const call = async (path) => {
-    try { return await get(base + path); } catch (e) {
+  const call = async (path, send = get) => {
+    try { return await send(base + path); } catch (e) {
       if (!e.notAnalysed) throw e;
       await reopen(sid, snap);
-      return get(base + path);
+      return send(base + path);
     }
   };
   return {
@@ -148,8 +148,8 @@ export function snapshotApi(sid, snap) {
     reveal: (ref) => call('/reveal' + q({ ref })),
     indexInParent: (parent, child) => call('/indexInParent' + q({ parent, child })),
     classes: () => call('/classes'),
-    /** { findings } once computed, else { jobId } of the job computing them (poll it, then ask again). */
-    findings: (rerun = false) => call('/findings' + (rerun ? '?rerun=1' : '')),
+    /** { findings } once computed, else { jobId } of the job computing them (poll it, then ask again); rerun recomputes all of them. */
+    findings: (rerun = false) => (rerun ? call('/findings/rerun', post) : call('/findings')),
     instances: (cls, offset = 0, limit = 25) => call('/instances' + q({ class: cls, offset, limit })),
     diff: (baseId, isCurrent) => diff(sid, snap, baseId, isCurrent),
   };

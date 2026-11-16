@@ -189,15 +189,16 @@ private fun Route.milestoneRoutes() {
 private fun Route.sessionRoutes(deps: ServerDeps) {
     val store = deps.store
 
+    /** The screen size the oversized-bitmap rule compares against; best effort (the rule falls back to 1080x2400). Never under [sessionLock]: `wm size` can be slow. */
+    fun screenOf(req: CreateSessionRequest) = try { deps.adb.screenSize(req.serial) } catch (e: Exception) { null }
+
     /** Ends the other ACTIVE sessions and creates this one; caller holds [sessionLock]. */
-    fun createExclusive(req: CreateSessionRequest): SessionMeta {
+    fun createExclusive(req: CreateSessionRequest, screen: dev.memscope.device.ScreenPx?): SessionMeta {
         store.list().filter { it.state == SessionMeta.State.ACTIVE }.forEach { other ->
             store.update(other.id) { it.copy(state = SessionMeta.State.ENDED) }
             deps.stopPolling(other.id)
         }
         var created = store.create(req.serial, req.packageName, req.mode)
-        // The screen size is what the oversized-bitmap rule compares against; best effort, the rule falls back to 1080x2400.
-        val screen = try { deps.adb.screenSize(req.serial) } catch (e: Exception) { null }
         if (screen != null) created = store.update(created.id) { it.copy(screenWidthPx = screen.width, screenHeightPx = screen.height) }
         return req.appPackagePrefixes?.takeIf { it.isNotEmpty() }
             ?.let { prefixes -> store.update(created.id) { it.copy(appPackagePrefixes = prefixes) } }
@@ -217,9 +218,10 @@ private fun Route.sessionRoutes(deps: ServerDeps) {
         val started = io {
             synchronized(sessionLock) { requireNoStartupRunning(deps) }
             deps.adb.requireDebuggable(req.serial, req.packageName) // before anything changes
+            val screen = screenOf(req)
             synchronized(sessionLock) {
                 requireNoStartupRunning(deps)
-                val session = createExclusive(req)
+                val session = createExclusive(req, screen)
                 val job = deps.jobs.create(
                     "Record startup of ${config.processName ?: req.packageName}", StartupSession.stepNames(config),
                     JobRegistry.Scope(session.id, null, "startup recording"),
@@ -248,9 +250,10 @@ private fun Route.sessionRoutes(deps: ServerDeps) {
         }
         val session = io {
             deps.adb.requireDebuggable(req.serial, req.packageName) // before anything changes
+            val screen = screenOf(req)
             synchronized(sessionLock) {
                 requireNoStartupRunning(deps)
-                createExclusive(req)
+                createExclusive(req, screen)
             }
         }
         deps.startPolling(session.id)
@@ -276,6 +279,8 @@ private fun Route.sessionRoutes(deps: ServerDeps) {
     post("/sessions/{id}/end") {
         val id = call.parameters["id"]!!
         deps.runningStartup()?.takeIf { it.sessionId == id }?.job?.cancel?.cancel() // the recording detaches and cleans up
+        // a dump of an ended session must not append its snapshot: cancel it (queued or running)
+        deps.jobs.runningFor(id).filter { (_, scope) -> scope.snapshotId == null }.forEach { (job, _) -> job.cancel.cancel() }
         deps.stopPolling(id)
         call.respond(io { store.update(id) { it.copy(state = SessionMeta.State.ENDED) } })
     }

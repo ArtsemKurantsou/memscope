@@ -234,7 +234,7 @@ class Adb(val adbPath: Path, val runner: ProcessRunner = RealProcessRunner()) {
             ("device '" in text && "not found" in text) || "error: closed" in text || "connection reset" in text ||
                 "protocol fault" in text -> DeviceException(
                 DeviceException.Kind.DISCONNECTED, "$who disconnected.",
-                "Device disconnected: reconnect it (check the cable or emulator), then retry. Partial files were removed.",
+                "Device disconnected: reconnect it (check the cable or emulator), then retry.",
             )
             "more than one device" in text -> DeviceException(
                 DeviceException.Kind.COMMAND_FAILED, "More than one device is connected and no serial was given.",
@@ -253,7 +253,11 @@ class Adb(val adbPath: Path, val runner: ProcessRunner = RealProcessRunner()) {
         try {
             return block()
         } catch (t: Throwable) {
-            try { Files.deleteIfExists(dest) } catch (_: Exception) { /* best effort */ }
+            val removed = try { Files.deleteIfExists(dest); true } catch (_: Exception) { false }
+            // only a transfer leaves a partial file to remove: say so where it is true
+            if (removed && t is DeviceException && t.kind == DeviceException.Kind.DISCONNECTED) {
+                throw DeviceException(t.kind, t.message ?: "disconnected", t.hint + " Partial files were removed.", t.cause)
+            }
             throw t
         }
     }

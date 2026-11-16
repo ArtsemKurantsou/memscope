@@ -1,11 +1,4 @@
-      // unreadable or failed: say why instead of trying to open it
-      const unreadable = meta.status === 'UNREADABLE';
-      showFailure({
-        message: `Snapshot ${meta.label || meta.id} cannot be opened (${meta.status.toLowerCase()})`,
-        hint: (meta.error ? meta.error + ' ' : '') + (unreadable
-          ? 'Retry checks the file again and re-analyses it if it is intact; otherwise take a new dump to replace it.'
-          : 'Take a new dump to replace it.'),
-      }, unreadable ? () => retryOpen(id) : undefined); // the server re-validates an unreadable file on open// Capture bar: device / app pickers, "Dump now", job stepper, snapshot selector.
+// Capture bar: device / app pickers, "Dump now", job stepper, snapshot selector.
 import * as api from './api.js';
 import { el, formatBytes, formatTime } from './util.js';
 import { askStartupConfig } from './startup.js';
@@ -91,18 +84,36 @@ export function createCapture({ onSnapshot: showSnapshot, onNoSnapshot, onEmptyS
     }
     if (my !== appsToken || deviceSel.value !== serial) return; // a newer scan or another device took over
     apps = list;
-    apps = [...apps].sort((a, b) => (b.running - a.running) || a.packageName.localeCompare(b.packageName));
+    apps = sortApps(apps);
     if (!apps.length) {
       setSelect(appSel, [], 'No debuggable apps');
       onEmptyState('no-apps');
       updateButtons();
       return;
     }
-    setSelect(appSel, apps.map((a) => ({ value: a.packageName, label: `${a.packageName}${a.running ? '  ● running' : '  (not running)'}` })), '');
+    setSelect(appSel, apps.map((a) => ({ value: a.packageName, label: appLabel(a) })), '');
     if (apps.some((a) => a.packageName === prev)) appSel.value = prev;
     onEmptyState('ready');
     renderProcesses();
     updateButtons();
+  }
+
+  const sortApps = (list) => [...list].sort((a, b) => (b.running - a.running) || a.packageName.localeCompare(b.packageName));
+  const appLabel = (a) => `${a.packageName}${a.running ? '  \u25cf running' : '  (not running)'}`;
+
+  /** After a dump or a recording the app's running state changed: relabel the app list in place (selection kept). */
+  async function refreshAppLabels() {
+    const serial = deviceSel.value;
+    if (!serial || appSel.disabled) return;
+    let list;
+    try { list = await api.apps(serial, true); } catch { return; } // best effort: the refresh button still works
+    if (deviceSel.value !== serial) return;
+    apps = sortApps(list);
+    for (const o of appSel.options) {
+      const a = apps.find((x) => x.packageName === o.value);
+      if (a) o.textContent = appLabel(a);
+    }
+    renderProcesses();
   }
 
   function updateButtons() {
@@ -300,7 +311,7 @@ export function createCapture({ onSnapshot: showSnapshot, onNoSnapshot, onEmptyS
     busy = true;
     updateButtons();
     const ctl = { retry: initialRetry };
-    try { await run(ctl); } catch (e) { showFailure(e, ctl.retry); } finally { busy = false; updateButtons(); }
+    try { await run(ctl); } catch (e) { showFailure(e, ctl.retry); } finally { busy = false; updateButtons(); refreshAppLabels(); }
   }
 
   const dumpNow = () => guarded(async (ctl) => {

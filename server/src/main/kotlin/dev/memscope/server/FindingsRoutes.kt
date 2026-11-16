@@ -16,12 +16,14 @@ import io.ktor.server.application.call
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
 import io.ktor.server.routing.get
+import io.ktor.server.routing.post
+import io.ktor.server.application.ApplicationCall
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 
 @Serializable
-data class FindingsResponse(val findings: List<Finding>, /** The leak pass was skipped or failed: ask again with `?rerun=1` to run it again. */ val incomplete: Boolean = false)
+data class FindingsResponse(val findings: List<Finding>, /** The leak pass was skipped or failed: POST …/findings/rerun to run it again. */ val incomplete: Boolean = false)
 
 /** [pending] are the OK snapshots without a summary yet (not analysed): open them to include them. */
 @Serializable
@@ -31,6 +33,7 @@ data class SessionFindingsResponse(val findings: List<Finding>, val pending: Lis
  * `GET /api/snapshots/{sid}/{snap}/findings`: 200 `{findings}` once computed, otherwise 202 `{jobId}` of the job
  * computing them (started by the first request; the snapshot must be open, else 409 NOT_ANALYSED). The UI polls
  * the job and asks again. Results are cached in memory per snapshot (a snapshot file never changes).
+ * `POST /api/snapshots/{sid}/{snap}/findings/rerun`: drops the cached and stored findings and computes them again (same answers).
  *
  * `GET /api/sessions/{id}/findings`: `{findings, pending}` of the session rules (monotonic growth, startup
  * intervals) computed from the per-snapshot summaries, without opening any snapshot.
@@ -49,59 +52,64 @@ internal fun Route.findingsRoutes(deps: ServerDeps) {
     fun screenOf(s: SessionMeta): ScreenSize =
         if (s.screenWidthPx != null && s.screenHeightPx != null) ScreenSize(s.screenWidthPx!!, s.screenHeightPx!!) else ScreenSize.FALLBACK
 
-    get("/snapshots/{sid}/{snap}/findings") {
-        val sid = call.parameters["sid"]!!
-        val snap = call.parameters["snap"]!!
+    /** The cached findings, or the [JobRef] of the job computing them; [rerun] drops the cache and the sidecar first. Blocking. */
+    fun findingsOf(sid: String, snap: String, rerun: Boolean): Any {
         val key = "$sid/$snap"
-        val rerun = call.request.queryParameters["rerun"] == "1"
-        val reply: Any = withContext(Dispatchers.IO) {
-            val s = session(sid)
-            val meta = s.snapshots.firstOrNull { it.id == snap } ?: throw notFound("Snapshot")
-            if (meta.status == SnapshotMeta.Status.UNREADABLE) throw unreadable(meta.error ?: "Snapshot $snap is unreadable")
-            val hprofFile = store.snapshotFile(sid, snap).toFile()
-            val screen = screenOf(s)
-            if (rerun) { cache.remove(key); FindingsSidecar.delete(hprofFile) }
-            fun answer(list: List<Finding>) = FindingsResponse(list, incomplete = !FindingsSidecar.isComplete(list))
-            cache[key]?.let { return@withContext answer(it) }
-            synchronized(running) {
-                cache[key]?.let { return@withContext answer(it) }
-                if (!rerun) FindingsSidecar.read(hprofFile, s.appPackagePrefixes, screen)?.let { cache[key] = it; return@withContext answer(it) }
-                running[key]?.takeIf { it.snapshot().state == Job.State.RUNNING }?.let { return@withContext JobRef(it.id) }
-                if (!deps.snapshots.contains(key)) throw ApiException(HttpStatusCode.Conflict, "not analysed", SnapshotRegistry.notAnalysed().hint, "NOT_ANALYSED")
-                val job = deps.jobs.create("Findings for $key", Findings.snapshotRuleIds, JobRegistry.Scope(sid, snap, "findings computation"))
-                running[key] = job
-                deps.jobs.submit(job) {
-                    try {
-                        var previous: String? = null
-                        val list = deps.snapshots.use(key) { view ->
-                            view.findings(screenOf(s), { ruleId ->
-                                if (job.cancel.isCancelled) throw findingsCancelled() // between rules
-                                previous?.let { p -> job.step(p) { } }
-                                previous = ruleId
-                                job.note(ruleId, "running")
-                            }, isCancelled = { job.cancel.isCancelled })
-                        }
-                        if (job.cancel.isCancelled) throw findingsCancelled() // never cache or persist a cancelled run
-                        previous?.let { p -> job.step(p) { } }
-                        cache[key] = list
-                        runCatching { FindingsSidecar.write(hprofFile, s.appPackagePrefixes, screen, list) }
-                        job.complete(key)
-                    } catch (e: FindingsCancelledException) {
-                        throw findingsCancelled()
-                    } catch (e: HprofUnreadableException) {
-                        throw unreadable(e.message ?: "unreadable")
-                    } finally {
-                        synchronized(running) { running.remove(key, job) }
+        val s = session(sid)
+        val meta = s.snapshots.firstOrNull { it.id == snap } ?: throw notFound("Snapshot")
+        if (meta.status == SnapshotMeta.Status.UNREADABLE) throw unreadable(meta.error ?: "Snapshot $snap is unreadable")
+        val hprofFile = store.snapshotFile(sid, snap).toFile()
+        val screen = screenOf(s)
+        if (rerun) { cache.remove(key); FindingsSidecar.delete(hprofFile) }
+        fun answer(list: List<Finding>) = FindingsResponse(list, incomplete = !FindingsSidecar.isComplete(list))
+        cache[key]?.let { return answer(it) }
+        return synchronized(running) {
+            cache[key]?.let { return answer(it) }
+            if (!rerun) FindingsSidecar.read(hprofFile, s.appPackagePrefixes, screen)?.let { cache[key] = it; return answer(it) }
+            running[key]?.takeIf { it.snapshot().state == Job.State.RUNNING }?.let { return JobRef(it.id) }
+            if (!deps.snapshots.contains(key)) throw ApiException(HttpStatusCode.Conflict, "not analysed", SnapshotRegistry.notAnalysed().hint, "NOT_ANALYSED")
+            val job = deps.jobs.create("Findings for $key", Findings.snapshotRuleIds, JobRegistry.Scope(sid, snap, "findings computation"))
+            running[key] = job
+            deps.jobs.submit(job) {
+                try {
+                    var previous: String? = null
+                    val list = deps.snapshots.use(key) { view ->
+                        view.findings(screenOf(s), { ruleId ->
+                            if (job.cancel.isCancelled) throw findingsCancelled() // between rules
+                            previous?.let { p -> job.step(p) { } }
+                            previous = ruleId
+                            job.note(ruleId, "running")
+                        }, isCancelled = { job.cancel.isCancelled })
                     }
+                    if (job.cancel.isCancelled) throw findingsCancelled() // never cache or persist a cancelled run
+                    previous?.let { p -> job.step(p) { } }
+                    cache[key] = list
+                    runCatching { FindingsSidecar.write(hprofFile, s.appPackagePrefixes, screen, list) }
+                    job.complete(key)
+                } catch (e: FindingsCancelledException) {
+                    throw findingsCancelled()
+                } catch (e: HprofUnreadableException) {
+                    throw unreadable(e.message ?: "unreadable")
+                } finally {
+                    synchronized(running) { running.remove(key, job) }
                 }
-                JobRef(job.id)
             }
-        }
-        when (reply) {
-            is FindingsResponse -> call.respond(reply)
-            else -> call.respond(HttpStatusCode.Accepted, reply as JobRef)
+            JobRef(job.id)
         }
     }
+
+    suspend fun ApplicationCall.respondFindings(rerun: Boolean) {
+        val sid = parameters["sid"]!!
+        val snap = parameters["snap"]!!
+        when (val reply = withContext(Dispatchers.IO) { findingsOf(sid, snap, rerun) }) {
+            is FindingsResponse -> respond(reply)
+            else -> respond(HttpStatusCode.Accepted, reply as JobRef)
+        }
+    }
+
+    get("/snapshots/{sid}/{snap}/findings") { call.respondFindings(rerun = false) }
+    // recomputing deletes the stored findings: a state change, so POST (behind the Origin check), never a GET side effect
+    post("/snapshots/{sid}/{snap}/findings/rerun") { call.respondFindings(rerun = true) }
 
     get("/sessions/{id}/findings") {
         val id = call.parameters["id"]!!

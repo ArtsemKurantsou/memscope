@@ -57,6 +57,8 @@ class OnDemandDumper(private val adb: Adb, private val store: SessionStore) {
         }
         val recorded = meta!!
         try {
+            // cancelled after the pull (e.g. the session was ended meanwhile): the snapshot is not recorded
+            if (job.cancel.isCancelled) throw DeviceException(DeviceException.Kind.CANCELLED, "The dump was cancelled.", "Dump again when you need a snapshot.")
             store.addSnapshot(sessionId, recorded)
         } catch (t: Throwable) {
             deleteQuietly(localFinal)

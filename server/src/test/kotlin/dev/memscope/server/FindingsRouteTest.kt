@@ -4,6 +4,7 @@ import dev.memscope.analysis.findings.FindingsHprof
 import dev.memscope.capture.SessionStore
 import io.ktor.client.HttpClient
 import io.ktor.client.request.get
+import io.ktor.client.request.header
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
@@ -81,20 +82,27 @@ class FindingsRouteTest {
     @Test fun findingsArePersistedAndRerunComputesThemAgain() = server { store, sid ->
         val s = store.snapshot(sid)
         client.open(sid, s)
-        suspend fun compute(query: String) {
-            val r = client.get("/api/snapshots/$sid/$s/findings$query")
+        suspend fun compute(rerun: Boolean) {
+            val r = if (rerun) client.post("/api/snapshots/$sid/$s/findings/rerun") else client.get("/api/snapshots/$sid/$s/findings")
             assertEquals(HttpStatusCode.Accepted, r.status, r.bodyAsText())
             assertEquals("DONE", client.waitJob(Json.parseToJsonElement(r.bodyAsText()).jsonObject["jobId"]!!.jsonPrimitive.content))
         }
-        compute("")
+        compute(false)
         val sidecar = File(store.snapshotFile(sid, s).toString() + ".findings.json")
         assertTrue(sidecar.isFile, "complete findings are stored next to the hprof")
         val cached = client.get("/api/snapshots/$sid/$s/findings")
         assertEquals(HttpStatusCode.OK, cached.status)
         assertTrue("\"incomplete\":false" in cached.bodyAsText())
+        val stamp = sidecar.lastModified()
+        val viaGet = client.get("/api/snapshots/$sid/$s/findings?rerun=1")
+        assertEquals(HttpStatusCode.OK, viaGet.status, "a GET never recomputes: ${viaGet.bodyAsText()}")
+        assertEquals(stamp, sidecar.lastModified())
         sidecar.delete()
-        compute("?rerun=1")
+        compute(true)
         assertTrue(sidecar.isFile)
+        val crossSite = client.post("/api/snapshots/$sid/$s/findings/rerun") { header(io.ktor.http.HttpHeaders.Origin, "http://evil.example") }
+        assertEquals(HttpStatusCode.Forbidden, crossSite.status)
+        assertEquals(HttpStatusCode.NotFound, client.post("/api/snapshots/$sid/s99/findings/rerun").status)
     }
 
     @Test fun openingWritesTheSummarySidecarAndSessionFindingsReportPendingSnapshots() = server { store, sid ->
