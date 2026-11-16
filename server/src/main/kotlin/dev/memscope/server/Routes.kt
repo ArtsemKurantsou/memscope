@@ -46,7 +46,7 @@ import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.route
 import io.ktor.server.routing.routing
-import io.ktor.util.pipeline.PipelineContext
+import io.ktor.server.routing.RoutingContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -328,7 +328,7 @@ private val analysisThreads = HashMap<String, java.util.concurrent.CompletableFu
 private fun Route.snapshotRoutes(deps: ServerDeps) {
     val store = deps.store
 
-    fun PipelineContext<Unit, ApplicationCall>.ids() = call.parameters["sid"]!! to call.parameters["snap"]!!
+    fun RoutingContext.ids() = call.parameters["sid"]!! to call.parameters["snap"]!!
 
     fun lookup(sid: String, snap: String): Pair<SessionMeta, SnapshotMeta> {
         val session = store.get(sid) ?: throw notFound("Session")

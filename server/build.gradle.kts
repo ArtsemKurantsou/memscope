@@ -20,7 +20,7 @@ dependencies {
     implementation(libs.ktor.server.compression)
     implementation(libs.ktor.serialization.json)
     // Ktor logs through SLF4J; without a binding it prints a warning on every start.
-    runtimeOnly("org.slf4j:slf4j-nop:2.0.13")
+    runtimeOnly("org.slf4j:slf4j-nop:2.0.20")
     testImplementation(libs.ktor.server.tests)
 }
 
@@ -31,3 +31,8 @@ dependencies {
     testImplementation(analysisTestOutput)
     testImplementation(libs.shark.graph)
 }
+
+// Netty loads a native library; JDK 24+ warns (and later JDKs will refuse) unless native access is enabled.
+val nativeAccess = "--enable-native-access=ALL-UNNAMED"
+application { applicationDefaultJvmArgs = listOf(nativeAccess) }
+tasks.withType<Test>().configureEach { jvmArgs(nativeAccess) }

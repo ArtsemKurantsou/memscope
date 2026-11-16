@@ -12,7 +12,7 @@ It is built for the case where Android Studio's profiler fails to connect, hangs
 
 ## Requirements
 
-- macOS (other systems are untested), JDK 17 or newer. The first run builds with the bundled Gradle wrapper and needs internet access for dependencies.
+- macOS (other systems are untested), JDK 17 or newer (tested on 17 and 25). The first run builds with the bundled Gradle wrapper and needs internet access for dependencies.
 - `adb`: found in `~/Library/Android/sdk/platform-tools`, then `ANDROID_HOME` / `ANDROID_SDK_ROOT`, then your `PATH`.
 - A device or emulator (Android 10+ is the design target) with USB debugging, and a debuggable build of your app installed.
 

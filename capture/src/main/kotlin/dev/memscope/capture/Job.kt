@@ -72,18 +72,18 @@ class Job(
     fun note(name: String, detail: String) = synchronized(lock) { replace(name) { it.copy(detail = detail) } }
 
     /** Removes the detail of step [name] if it is still exactly [detail] and the step has not started. */
-    fun clearNote(name: String, detail: String) = synchronized(lock) {
+    fun clearNote(name: String, detail: String): Unit = synchronized(lock) {
         replace(name) { if (it.state == StepState.PENDING && it.detail == detail) it.copy(detail = null) else it }
     }
 
     /** Sets every step back to PENDING (a retry of the whole operation inside the same job). */
-    fun resetSteps() = synchronized(lock) {
+    fun resetSteps(): Unit = synchronized(lock) {
         if (state != State.RUNNING) return
         steps.indices.forEach { steps[it] = Step(steps[it].name, StepState.PENDING) }
     }
 
     /** Marks the job as finished successfully. */
-    fun complete(resultRef: String?) = synchronized(lock) {
+    fun complete(resultRef: String?): Unit = synchronized(lock) {
         if (state != State.RUNNING) return
         this.resultRef = resultRef
         state = State.DONE
@@ -91,7 +91,7 @@ class Job(
     }
 
     /** Marks the job as failed (or CANCELLED for [DeviceException.Kind.CANCELLED]); a running step becomes FAILED. */
-    fun fail(e: Throwable) = synchronized(lock) {
+    fun fail(e: Throwable): Unit = synchronized(lock) {
         if (state != State.RUNNING) return
         val device = e as? DeviceException
         state = if (device?.kind == DeviceException.Kind.CANCELLED) State.CANCELLED else State.FAILED

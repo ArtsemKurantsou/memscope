@@ -5,6 +5,7 @@ import dev.memscope.device.Adb
 import dev.memscope.device.AdbLocator
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.netty.Netty
+import io.ktor.server.engine.EmbeddedServer
 import io.ktor.server.netty.NettyApplicationEngine
 import java.net.InetAddress
 import java.net.ServerSocket
@@ -14,7 +15,7 @@ const val LOOPBACK = "127.0.0.1"
 private const val FIRST_PORT = 7070
 
 /** Starts the server on [LOOPBACK] only; requests must carry `Host: localhost:<port>` or `127.0.0.1:<port>`. */
-fun startServer(deps: ServerDeps, port: Int, wait: Boolean = true): NettyApplicationEngine =
+fun startServer(deps: ServerDeps, port: Int, wait: Boolean = true): EmbeddedServer<NettyApplicationEngine, NettyApplicationEngine.Configuration> =
     embeddedServer(Netty, port = port, host = LOOPBACK) {
         memscopeModule(deps, setOf("localhost:$port", "$LOOPBACK:$port"))
     }.start(wait)

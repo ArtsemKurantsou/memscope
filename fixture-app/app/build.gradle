@@ -1,8 +1,8 @@
 plugins { id 'com.android.application' }
 android {
-  namespace 'dev.memscope.fixture'
-  compileSdk 35
-  defaultConfig { applicationId 'dev.memscope.fixture'; minSdk 29; targetSdk 35; versionCode 1; versionName '1' }
-  buildTypes { debug { debuggable true } }
-  compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+  namespace = 'dev.memscope.fixture'
+  compileSdk = 35
+  defaultConfig { applicationId = 'dev.memscope.fixture'; minSdk = 29; targetSdk = 35; versionCode = 1; versionName = '1' }
+  buildTypes { debug { debuggable = true } }
+  compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
 }

@@ -22,7 +22,6 @@ tasks.register<JavaExec>("perfIndex") {
     classpath = sourceSets["test"].runtimeClasspath
     mainClass.set("dev.memscope.analysis.PerfMainKt")
     maxHeapSize = providers.gradleProperty("perfXmx").getOrElse("6g")
-    javaLauncher.set(javaToolchains.launcherFor { languageVersion.set(JavaLanguageVersion.of(17)) })
     val hprof = providers.gradleProperty("hprof")
     doFirst { args(hprof.orNull ?: throw GradleException("pass -Phprof=<heap dump>")) }
 }
@@ -35,7 +34,6 @@ tasks.register<JavaExec>("perfSnapshot") {
     classpath = sourceSets["test"].runtimeClasspath
     mainClass.set("dev.memscope.analysis.SnapshotPerfMainKt")
     maxHeapSize = providers.gradleProperty("perfXmx").getOrElse("6g")
-    javaLauncher.set(javaToolchains.launcherFor { languageVersion.set(JavaLanguageVersion.of(17)) })
     val hprof = providers.gradleProperty("hprof")
     doFirst { args(hprof.orNull ?: throw GradleException("pass -Phprof=<heap dump>")) }
 }
@@ -57,7 +55,6 @@ tasks.register<JavaExec>("perfFindings") {
     classpath = sourceSets["test"].runtimeClasspath
     mainClass.set("dev.memscope.analysis.findings.FindingsPerfMainKt")
     maxHeapSize = providers.gradleProperty("perfXmx").getOrElse("6g")
-    javaLauncher.set(javaToolchains.launcherFor { languageVersion.set(JavaLanguageVersion.of(17)) })
     val hprof = providers.gradleProperty("hprof")
     doFirst { args(hprof.orNull ?: throw GradleException("pass -Phprof=<heap dump>")) }
 }

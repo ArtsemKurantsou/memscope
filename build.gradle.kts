@@ -16,11 +16,13 @@ allprojects {
 subprojects {
     apply(plugin = "org.jetbrains.kotlin.jvm")
 
-    extensions.configure<org.jetbrains.kotlin.gradle.dsl.KotlinJvmProjectExtension> {
-        jvmToolchain(17)
-    }
+    // No toolchain pin: the build uses the JDK that runs Gradle (17 or newer, including 25+)
+    // and always produces Java 17 bytecode.
     tasks.withType<KotlinCompile>().configureEach {
         compilerOptions.jvmTarget.set(JvmTarget.JVM_17)
+    }
+    tasks.withType<JavaCompile>().configureEach {
+        options.release.set(17)
     }
 
     dependencies {

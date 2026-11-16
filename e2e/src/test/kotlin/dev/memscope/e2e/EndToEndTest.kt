@@ -5,6 +5,7 @@ import dev.memscope.device.Adb
 import dev.memscope.device.AdbLocator
 import dev.memscope.server.ServerDeps
 import dev.memscope.server.startServer
+import io.ktor.server.engine.EmbeddedServer
 import io.ktor.server.netty.NettyApplicationEngine
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -45,7 +46,7 @@ class EndToEndTest {
     private val adb = Adb(AdbLocator.find())
     private val http = HttpClient.newHttpClient()
     private lateinit var deps: ServerDeps
-    private lateinit var engine: NettyApplicationEngine
+    private lateinit var engine: EmbeddedServer<NettyApplicationEngine, NettyApplicationEngine.Configuration>
     private var port = 0
 
     @BeforeEach
