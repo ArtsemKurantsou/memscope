@@ -32,6 +32,32 @@ class SnapshotRegistry(private val capacity: Int = 2) : AutoCloseable {
         dropped.forEach(::retire)
     }
 
+    /**
+     * Closes least-recently-used snapshots until one more fits, so a build about to start never runs while the
+     * registry still holds [capacity] indexes (three large indexes do not fit in the heap at once).
+     */
+    fun makeRoomForOne() {
+        val dropped = synchronized(entries) {
+            val out = ArrayList<Entry>()
+            while (entries.isNotEmpty() && entries.size >= capacity) {
+                val eldest = entries.entries.first()
+                entries.remove(eldest.key)
+                out += eldest.value
+            }
+            out
+        }
+        dropped.forEach(::retire)
+    }
+
+    /** Closes and forgets the snapshot under [key], if open (waits for queries running on it). */
+    fun remove(key: String) {
+        val entry = synchronized(entries) { entries.remove(key) } ?: return
+        retire(entry)
+    }
+
+    /** Keys of the open snapshots, least recently used first. */
+    fun keys(): List<String> = synchronized(entries) { entries.keys.toList() }
+
     /** Runs [block] on the snapshot under [key]; throws [notAnalysed] if it is not (or no longer) open. */
     fun <T> use(key: String, block: (SnapshotView) -> T): T {
         val entry = synchronized(entries) { entries[key] } ?: throw notAnalysed()

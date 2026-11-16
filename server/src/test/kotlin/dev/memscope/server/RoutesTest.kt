@@ -604,6 +604,37 @@ class RoutesTest {
         assertEquals(HttpStatusCode.Conflict, client.get("/api/snapshots/${s.id}/${ids[2]}/summary").status)
     }
 
+    @Test fun aFullRegistryEvictsBeforeTheNextBuildSoNeverThreeIndexesAreLive() = server {
+        val s = store.newAttachSession()
+        val ids = (1..3).map { store.addFakeSnapshot(s.id) }
+        ids.take(2).forEach { assertEquals("DONE", str(client.openSnapshot(s.id, it), "state")) }
+        val gate = CountDownLatch(1)
+        opener.gate = gate
+        val job = str(client.postJson("/api/snapshots/${s.id}/${ids[2]}/open").obj(), "jobId")
+        waitUntil { opener.calls.get() == 3 }
+        assertTrue(opener.opened[0].closed, "the least recently used snapshot is closed before the third build starts")
+        assertFalse(opener.opened[1].closed)
+        gate.countDown()
+        assertEquals("DONE", str(client.waitJob(job), "state"))
+        assertFalse(opener.opened[1].closed)
+        assertEquals(HttpStatusCode.OK, client.get("/api/snapshots/${s.id}/${ids[1]}/summary").status)
+        assertEquals(HttpStatusCode.Conflict, client.get("/api/snapshots/${s.id}/${ids[0]}/summary").status)
+    }
+
+    @Test fun runningOutOfMemoryFailsTheJobWithAHeapHint() = server {
+        val s = store.newAttachSession()
+        val snap = store.addFakeSnapshot(s.id)
+        opener.failWith = OutOfMemoryError("Java heap space")
+        val job = client.openSnapshot(s.id, snap)
+        assertEquals("FAILED", str(job, "state"))
+        assertEquals("ran out of memory analysing this snapshot", str(job, "errorMessage"))
+        assertEquals("OUT_OF_MEMORY", str(job, "errorKind"))
+        assertTrue(str(job, "errorHint").contains("MEMSCOPE_XMX=10g ./memscope"), str(job, "errorHint"))
+        assertEquals(SnapshotMeta.Status.OK, store.get(s.id)!!.snapshots.single().status)
+        opener.failWith = null
+        assertEquals("DONE", str(client.openSnapshot(s.id, snap), "state"))
+    }
+
     @Test fun diffComparesTwoOpenSnapshotsAndCachesTheResult() = server {
         val s = store.newAttachSession()
         val (a, b) = (1..2).map { store.addFakeSnapshot(s.id) }

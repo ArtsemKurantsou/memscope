@@ -16,6 +16,8 @@ data class JobView(
     val errorMessage: String?,
     val errorHint: String?,
     val resultRef: String?,
+    /** The [DeviceException.Kind] name of the failure (e.g. OUT_OF_MEMORY), when it had one. */
+    val errorKind: String? = null,
 )
 
 /**
@@ -43,6 +45,7 @@ class Job(
     private val steps = stepNames.mapTo(ArrayList()) { Step(it, StepState.PENDING) }
     private var errorMessage: String? = null
     private var errorHint: String? = null
+    private var errorKind: String? = null
     private var resultRef: String? = null
 
     /**
@@ -89,6 +92,7 @@ class Job(
         state = if (device?.kind == DeviceException.Kind.CANCELLED) State.CANCELLED else State.FAILED
         errorMessage = e.message ?: e.javaClass.simpleName
         errorHint = device?.hint
+        errorKind = device?.kind?.name
         steps.indices.filter { steps[it].state == StepState.RUNNING }.forEach { steps[it] = steps[it].copy(state = StepState.FAILED) }
         finishedAtMs = clock()
     }
@@ -96,7 +100,7 @@ class Job(
     fun snapshot(): JobView = synchronized(lock) {
         JobView(
             id, title, state, steps.toList(), startedAtMs, (finishedAtMs ?: clock()) - startedAtMs,
-            errorMessage, errorHint, resultRef,
+            errorMessage, errorHint, resultRef, errorKind,
         )
     }
 

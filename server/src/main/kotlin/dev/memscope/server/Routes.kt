@@ -414,6 +414,7 @@ private fun Route.snapshotRoutes(deps: ServerDeps) {
                         var started = false
                         try {
                             if (prior != null) awaitPreviousAnalysis(created, prior, deps.previousAnalysisTimeoutMs)
+                            deps.snapshots.makeRoomForOne() // never a third index in memory while two are open
                             started = true // runAnalysis starts its thread at once; that thread completes `mine`
                             val view = runAnalysis(created, mine) { progress -> deps.opener.open(file.toFile(), session.appPackagePrefixes, progress) }
                             deps.snapshots.put(key, view)
@@ -425,6 +426,12 @@ private fun Route.snapshotRoutes(deps: ServerDeps) {
                         } catch (e: HprofUnreadableException) {
                             markUnreadable(sid, snap, e.message ?: "unreadable")
                             throw DeviceException(DeviceException.Kind.COMMAND_FAILED, e.message ?: "unreadable", unreadable("").hint)
+                        } catch (e: OutOfMemoryError) {
+                            ServerLog.error("analysis of $key ran out of memory: $e")
+                            throw DeviceException(
+                                DeviceException.Kind.OUT_OF_MEMORY, "ran out of memory analysing this snapshot",
+                                "start MemScope with a larger heap: MEMSCOPE_XMX=10g ./memscope — or analyse one snapshot at a time", e,
+                            )
                         } catch (e: DeviceException) {
                             throw e // cancelled, or timed out waiting for an abandoned analysis
                         } catch (e: Exception) {
