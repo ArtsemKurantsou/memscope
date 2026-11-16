@@ -33,7 +33,7 @@ import java.util.BitSet
  * from the hprof on demand through a Shark heap graph that is opened on the first such request
  * (not in [open]: indexing it costs time and memory on a large dump) and closed by [close].
  */
-class Snapshot private constructor(private val hprof: File, val index: HeapIndex, appPackagePrefixes: List<String>) : AutoCloseable {
+class Snapshot private constructor(private val hprof: File, val index: HeapIndex, val appPackagePrefixes: List<String>) : AutoCloseable {
     companion object {
         /** Siblings of one class under one parent numbering at least this many collapse into a GROUP row. */
         const val GROUP_MIN = TreeModel.GROUP_MIN

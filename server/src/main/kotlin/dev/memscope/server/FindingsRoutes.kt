@@ -95,7 +95,7 @@ internal fun Route.findingsRoutes(deps: ServerDeps) {
             val summarized = ArrayList<SummarizedSnapshot>()
             for (m in s.snapshots.filter { it.status == SnapshotMeta.Status.OK }.sortedBy { it.takenAtMs }) {
                 val file = store.snapshotFile(id, m.id).toFile()
-                val summary = SnapshotSummaries.read(file) ?: try {
+                val summary = SnapshotSummaries.read(file, s.appPackagePrefixes) ?: try {
                     // Open but its sidecar is missing (opened before summaries existed): compute it now.
                     if (deps.snapshots.contains("$id/${m.id}")) deps.snapshots.use("$id/${m.id}") { it.snapshotSummary() } else null
                 } catch (e: ApiException) {

@@ -76,7 +76,7 @@ class SessionRulesTest {
                 val bag = summary.classes.single { it.name == "test.Bag" }
                 assertTrue(bag.isApp && bag.appRetained > 3_000_000 && bag.topRef!!.startsWith("obj:"))
                 assertTrue(summary.statics.any { it.className == "test.Caches" && it.isApp })
-                assertEquals(summary, SnapshotSummaries.read(hprof), "sidecar written and read back")
+                assertEquals(summary, SnapshotSummaries.read(hprof, listOf("test.")), "sidecar written and read back")
                 assertTrue(SnapshotSummaries.file(hprof).name == "s.hprof.summary.json")
             }
         } finally {

@@ -91,6 +91,8 @@ object Thresholds {
     const val STARTUP_TOP = 5
     /** Classes smaller than this (app-retained) are left out of snapshot summaries. */
     const val SUMMARY_CLASS_FLOOR = 64 * KB
+    /** Class entries kept per snapshot summary (largest app-retained first). */
+    const val SUMMARY_MAX_CLASSES = 2000
 }
 
 /** "19.5 MB" style sizes (binary units, one decimal). */
