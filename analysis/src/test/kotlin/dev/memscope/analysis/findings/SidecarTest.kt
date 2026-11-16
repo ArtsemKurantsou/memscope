@@ -42,6 +42,18 @@ class SidecarTest {
         assertEquals(listOf("s.hprof", "s.hprof.summary.json"), dir.list()!!.filter { !it.endsWith(".idx") }.sorted(), "no temp files left")
     }
 
+    @Test fun findingsAreStoredOnlyWhenCompleteAndKeyedByScreenAndPrefixes() {
+        val ok = Finding("large-static", Severity.HIGH, "t", "e", "s", 1, listOf("obj:1"))
+        val skipped = Finding("leaked-component", Severity.LOW, "leak analysis skipped: took longer than 1 s", "e", "s", 0, emptyList())
+        val screen = ScreenSize(1080, 2400)
+        FindingsSidecar.write(hprof, prefixes, screen, listOf(ok, skipped))
+        assertNull(FindingsSidecar.read(hprof, prefixes, screen), "an incomplete result is not stored")
+        FindingsSidecar.write(hprof, prefixes, screen, listOf(ok))
+        assertEquals(listOf(ok), FindingsSidecar.read(hprof, prefixes, screen))
+        assertNull(FindingsSidecar.read(hprof, prefixes, ScreenSize(720, 1600)), "another screen size")
+        assertNull(FindingsSidecar.read(hprof, listOf("x."), screen), "other app packages")
+    }
+
     @Test fun classEntriesAreCapped() {
         assertTrue(summary.classes.size <= Thresholds.SUMMARY_MAX_CLASSES)
     }

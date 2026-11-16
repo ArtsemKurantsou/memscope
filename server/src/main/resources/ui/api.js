@@ -144,7 +144,7 @@ export function snapshotApi(sid, snap) {
     indexInParent: (parent, child) => call('/indexInParent' + q({ parent, child })),
     classes: () => call('/classes'),
     /** { findings } once computed, else { jobId } of the job computing them (poll it, then ask again). */
-    findings: () => call('/findings'),
+    findings: (rerun = false) => call('/findings' + (rerun ? '?rerun=1' : '')),
     instances: (cls, offset = 0, limit = 25) => call('/instances' + q({ class: cls, offset, limit })),
     diff: (baseId, isCurrent) => diff(sid, snap, baseId, isCurrent),
   };

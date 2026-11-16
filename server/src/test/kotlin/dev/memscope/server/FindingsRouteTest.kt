@@ -78,6 +78,25 @@ class FindingsRouteTest {
         assertTrue(list.all { it["suggestion"]!!.jsonPrimitive.content.isNotBlank() && it["evidence"]!!.jsonPrimitive.content.isNotBlank() })
     }
 
+    @Test fun findingsArePersistedAndRerunComputesThemAgain() = server { store, sid ->
+        val s = store.snapshot(sid)
+        client.open(sid, s)
+        suspend fun compute(query: String) {
+            val r = client.get("/api/snapshots/$sid/$s/findings$query")
+            assertEquals(HttpStatusCode.Accepted, r.status, r.bodyAsText())
+            assertEquals("DONE", client.waitJob(Json.parseToJsonElement(r.bodyAsText()).jsonObject["jobId"]!!.jsonPrimitive.content))
+        }
+        compute("")
+        val sidecar = File(store.snapshotFile(sid, s).toString() + ".findings.json")
+        assertTrue(sidecar.isFile, "complete findings are stored next to the hprof")
+        val cached = client.get("/api/snapshots/$sid/$s/findings")
+        assertEquals(HttpStatusCode.OK, cached.status)
+        assertTrue("\"incomplete\":false" in cached.bodyAsText())
+        sidecar.delete()
+        compute("?rerun=1")
+        assertTrue(sidecar.isFile)
+    }
+
     @Test fun openingWritesTheSummarySidecarAndSessionFindingsReportPendingSnapshots() = server { store, sid ->
         val a = store.snapshot(sid)
         val b = store.snapshot(sid)

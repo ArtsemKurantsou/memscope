@@ -3,6 +3,7 @@ package dev.memscope.server
 import dev.memscope.analysis.HprofUnreadableException
 import dev.memscope.analysis.findings.Finding
 import dev.memscope.analysis.findings.Findings
+import dev.memscope.analysis.findings.FindingsSidecar
 import dev.memscope.analysis.findings.ScreenSize
 import dev.memscope.analysis.findings.SnapshotSummaries
 import dev.memscope.analysis.findings.SummarizedSnapshot
@@ -20,7 +21,7 @@ import kotlinx.serialization.Serializable
 import java.util.concurrent.ConcurrentHashMap
 
 @Serializable
-data class FindingsResponse(val findings: List<Finding>)
+data class FindingsResponse(val findings: List<Finding>, /** The leak pass was skipped or failed: ask again with `?rerun=1` to run it again. */ val incomplete: Boolean = false)
 
 /** [pending] are the OK snapshots without a summary yet (not analysed): open them to include them. */
 @Serializable
@@ -48,13 +49,19 @@ internal fun Route.findingsRoutes(deps: ServerDeps) {
         val sid = call.parameters["sid"]!!
         val snap = call.parameters["snap"]!!
         val key = "$sid/$snap"
+        val rerun = call.request.queryParameters["rerun"] == "1"
         val reply: Any = withContext(Dispatchers.IO) {
             val s = session(sid)
             val meta = s.snapshots.firstOrNull { it.id == snap } ?: throw notFound("Snapshot")
             if (meta.status == SnapshotMeta.Status.UNREADABLE) throw unreadable(meta.error ?: "Snapshot $snap is unreadable")
-            cache[key]?.let { return@withContext FindingsResponse(it) }
+            val hprofFile = store.snapshotFile(sid, snap).toFile()
+            val screen = screenOf(s)
+            if (rerun) { cache.remove(key); FindingsSidecar.delete(hprofFile) }
+            fun answer(list: List<Finding>) = FindingsResponse(list, incomplete = !FindingsSidecar.isComplete(list))
+            cache[key]?.let { return@withContext answer(it) }
             synchronized(running) {
-                cache[key]?.let { return@withContext FindingsResponse(it) }
+                cache[key]?.let { return@withContext answer(it) }
+                if (!rerun) FindingsSidecar.read(hprofFile, s.appPackagePrefixes, screen)?.let { cache[key] = it; return@withContext answer(it) }
                 running[key]?.takeIf { it.snapshot().state == Job.State.RUNNING }?.let { return@withContext JobRef(it.id) }
                 if (!deps.snapshots.contains(key)) throw ApiException(HttpStatusCode.Conflict, "not analysed", SnapshotRegistry.notAnalysed().hint, "NOT_ANALYSED")
                 val job = deps.jobs.create("Findings for $key", Findings.snapshotRuleIds)
@@ -71,6 +78,7 @@ internal fun Route.findingsRoutes(deps: ServerDeps) {
                         }
                         previous?.let { p -> job.step(p) { } }
                         cache[key] = list
+                        runCatching { FindingsSidecar.write(hprofFile, s.appPackagePrefixes, screen, list) }
                         job.complete(key)
                     } catch (e: HprofUnreadableException) {
                         throw unreadable(e.message ?: "unreadable")
