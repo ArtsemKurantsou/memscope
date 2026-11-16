@@ -1,7 +1,9 @@
 package dev.memscope.server
 
+import dev.memscope.analysis.AnalysisBugException
 import dev.memscope.analysis.DiffJson
 import dev.memscope.analysis.DiffResult
+import dev.memscope.analysis.HprofFiles
 import dev.memscope.analysis.HprofUnreadableException
 import dev.memscope.capture.DeviceArgs
 import dev.memscope.capture.Job
@@ -124,6 +126,10 @@ private suspend fun ApplicationCall.respondError(t: Throwable) {
         is ApiException -> body(t.status, msg, t.hint, t.kind)
         is DeviceException -> body(HttpStatusCode.BadGateway, msg, t.hint, t.kind.name)
         is HprofUnreadableException -> body(HttpStatusCode.UnprocessableEntity, msg, unreadable(msg).hint, "UNREADABLE")
+        is AnalysisBugException -> {
+            ServerLog.error("analysis bug on ${request.local.method.value} ${request.local.uri}: ${t.cause}", t)
+            body(HttpStatusCode.InternalServerError, AnalysisBugException.MESSAGE, AnalysisBugException.HINT, "ANALYSIS_BUG")
+        }
         is TooDeepToReveal -> body(HttpStatusCode.UnprocessableEntity, "too deep to reveal", "use the path shown in the details panel", "TOO_DEEP")
         is NoSuchElementException -> body(HttpStatusCode.NotFound, msg, notFound("Item").hint, "NOT_FOUND")
         is IllegalArgumentException, is SerializationException, is ContentTransformationException,
@@ -318,6 +324,18 @@ private fun Route.snapshotRoutes(deps: ServerDeps) {
         }
     }
 
+    /** Clears an UNREADABLE mark after a successful analysis. Never throws. */
+    fun markReadable(sid: String, snap: String) {
+        try {
+            if (store.get(sid)?.snapshots?.any { it.id == snap && it.status == SnapshotMeta.Status.UNREADABLE } != true) return
+            store.update(sid) { s ->
+                s.copy(snapshots = s.snapshots.map { if (it.id == snap) it.copy(status = SnapshotMeta.Status.OK, error = null) else it })
+            }
+        } catch (t: Exception) {
+            ServerLog.error("could not record snapshot $sid/$snap as readable again: ${t.message}")
+        }
+    }
+
     /** Runs a query on the opened snapshot: 404 unknown, 422 unreadable, 409 not (or no longer) open. */
     fun <T> query(sid: String, snap: String, f: (SnapshotView) -> T): T {
         val (_, meta) = lookup(sid, snap)
@@ -366,8 +384,14 @@ private fun Route.snapshotRoutes(deps: ServerDeps) {
             val job = io {
                 val (session, meta) = lookup(sid, snap)
                 val key = "$sid/$snap"
-                if (meta.status == SnapshotMeta.Status.UNREADABLE) throw unreadable(meta.error ?: "Snapshot $snap is unreadable")
                 val file = store.snapshotFile(sid, snap)
+                if (meta.status == SnapshotMeta.Status.UNREADABLE) {
+                    // An earlier failure may not have been the file's fault: re-validate it and retry if it looks intact.
+                    HprofFiles.headerProblem(file.toFile())?.let { problem ->
+                        markUnreadable(sid, snap, problem)
+                        throw unreadable(problem)
+                    }
+                }
                 if (!Files.isRegularFile(file) || Files.size(file) == 0L) {
                     val message = "Heap dump ${file.fileName} is missing or empty"
                     markUnreadable(sid, snap, message)
@@ -378,6 +402,7 @@ private fun Route.snapshotRoutes(deps: ServerDeps) {
                     val created = deps.jobs.create("Analyse $key", ANALYSIS_STEPS)
                     if (deps.snapshots.contains(key)) {
                         ANALYSIS_STEPS.forEach { created.step(it) { } }
+                        markReadable(sid, snap)
                         created.complete(key)
                         return@synchronized created
                     }
@@ -392,6 +417,7 @@ private fun Route.snapshotRoutes(deps: ServerDeps) {
                             started = true // runAnalysis starts its thread at once; that thread completes `mine`
                             val view = runAnalysis(created, mine) { progress -> deps.opener.open(file.toFile(), session.appPackagePrefixes, progress) }
                             deps.snapshots.put(key, view)
+                            markReadable(sid, snap)
                             // The session rules read this summary instead of opening the snapshot.
                             try { deps.snapshots.use(key) { it.snapshotSummary() } } catch (e: Exception) { ServerLog.error("could not summarise $key: ${e.message}") }
                             created.complete(key)
@@ -399,6 +425,12 @@ private fun Route.snapshotRoutes(deps: ServerDeps) {
                         } catch (e: HprofUnreadableException) {
                             markUnreadable(sid, snap, e.message ?: "unreadable")
                             throw DeviceException(DeviceException.Kind.COMMAND_FAILED, e.message ?: "unreadable", unreadable("").hint)
+                        } catch (e: DeviceException) {
+                            throw e // cancelled, or timed out waiting for an abandoned analysis
+                        } catch (e: Exception) {
+                            // Not the file's fault (that is HprofUnreadableException): the snapshot stays OK and can be re-opened.
+                            ServerLog.error("analysis of $key hit a bug: $e", e)
+                            throw DeviceException(DeviceException.Kind.COMMAND_FAILED, AnalysisBugException.MESSAGE, AnalysisBugException.HINT, e)
                         } finally {
                             synchronized(openLock) { openJobs.remove(key, created) }
                             if (!started) {

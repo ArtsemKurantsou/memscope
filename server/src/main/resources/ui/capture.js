@@ -1,4 +1,11 @@
-// Capture bar: device / app pickers, "Dump now", job stepper, snapshot selector.
+      // unreadable or failed: say why instead of trying to open it
+      const unreadable = meta.status === 'UNREADABLE';
+      showFailure({
+        message: `Snapshot ${meta.label || meta.id} cannot be opened (${meta.status.toLowerCase()})`,
+        hint: (meta.error ? meta.error + ' ' : '') + (unreadable
+          ? 'Retry checks the file again and re-analyses it if it is intact; otherwise take a new dump to replace it.'
+          : 'Take a new dump to replace it.'),
+      }, unreadable ? () => retryOpen(id) : undefined); // the server re-validates an unreadable file on open// Capture bar: device / app pickers, "Dump now", job stepper, snapshot selector.
 import * as api from './api.js';
 import { el, formatBytes, formatTime } from './util.js';
 import { askStartupConfig } from './startup.js';
@@ -388,10 +395,13 @@ export function createCapture({ onSnapshot, onNoSnapshot, onEmptyState, onSessio
     const meta = selectedSnapshotMeta();
     if (meta && meta.status !== 'OK') {
       // unreadable or failed: say why instead of trying to open it
+      const unreadable = meta.status === 'UNREADABLE';
       showFailure({
         message: `Snapshot ${meta.label || meta.id} cannot be opened (${meta.status.toLowerCase()})`,
-        hint: (meta.error ? meta.error + ' ' : '') + 'Take a new dump to replace it.',
-      }); // no Retry: opening it again would fail the same way
+        hint: (meta.error ? meta.error + ' ' : '') + (unreadable
+          ? 'Retry checks the file again and re-analyses it if it is intact; otherwise take a new dump to replace it.'
+          : 'Take a new dump to replace it.'),
+      }, unreadable ? () => retryOpen(id) : undefined); // the server re-validates an unreadable file on open
       return;
     }
     if (meta) await onSnapshot(session.id, meta);

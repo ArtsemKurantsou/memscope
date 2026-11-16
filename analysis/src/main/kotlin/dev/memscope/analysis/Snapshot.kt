@@ -186,7 +186,8 @@ class Snapshot private constructor(private val hprof: File, val index: HeapIndex
 
     /**
      * Runs [block] on the lazily opened Shark graph, serialised with every other query. Keep blocks short:
-     * the snapshot is locked meanwhile. Failures reading the hprof become [HprofUnreadableException].
+     * the snapshot is locked meanwhile. Failures reading a damaged hprof become [HprofUnreadableException],
+     * other runtime errors [AnalysisBugException].
      */
     @Synchronized
     fun <T> withGraph(block: (shark.HeapGraph) -> T): T = whileOpen { readingHprof { block(graph()) } }
@@ -204,7 +205,7 @@ class Snapshot private constructor(private val hprof: File, val index: HeapIndex
         } catch (e: IOException) {
             throw HprofUnreadableException(hprof, "Heap dump ${hprof.path} could not be opened for details: ${e.message}", e)
         } catch (e: RuntimeException) {
-            throw HprofUnreadableException(hprof, "Heap dump ${hprof.path} could not be opened for details: ${e.message}", e)
+            throw HprofFiles.classify(hprof, e, "opening it for details")
         }
         graphOpenMillis = (System.nanoTime() - start) / 1_000_000
         graph = opened
@@ -214,8 +215,9 @@ class Snapshot private constructor(private val hprof: File, val index: HeapIndex
     private fun heapObject(d: Int): HeapObject? = readingHprof { graph().findObjectByIdOrNull(index.objectIds[d]) }
 
     /**
-     * Runs Shark reads of object records; their failures (file changed, truncated or corrupt since the
-     * index was built) become [HprofUnreadableException], like a failed graph open.
+     * Runs Shark reads of object records. I/O errors and runtime errors on a file that fails [HprofFiles.problem]
+     * (changed, truncated or corrupt since the index was built) become [HprofUnreadableException]; other runtime
+     * errors are bugs ([AnalysisBugException]) and say nothing about the file.
      */
     private inline fun <T> readingHprof(block: () -> T): T = try {
         block()
@@ -224,7 +226,7 @@ class Snapshot private constructor(private val hprof: File, val index: HeapIndex
     } catch (e: IOException) {
         throw HprofUnreadableException(hprof, "Heap dump ${hprof.path} could not be read: ${e.message}", e)
     } catch (e: RuntimeException) {
-        throw HprofUnreadableException(hprof, "Heap dump ${hprof.path} could not be read: ${e.javaClass.simpleName}: ${e.message}", e)
+        throw HprofFiles.classify(hprof, e, "reading it")
     }
 
     private val labels = object : HeapLabels {

@@ -164,6 +164,40 @@ class HeapIndexerTest {
     }
 
     @Test
+    fun aRuntimeErrorWhileIndexingAnIntactFileIsABugNotAnUnreadableDump() {
+        val f = synthetic()
+        val e = assertThrows<AnalysisBugException> {
+            HeapIndexer.build(f) { step, _ -> if (step == "parse") throw IndexOutOfBoundsException("indexer bug") }
+        }
+        assertTrue(e.cause is IndexOutOfBoundsException)
+        assertEquals(AnalysisBugException.MESSAGE, e.message)
+    }
+
+    @Test
+    fun aRuntimeErrorOnAFileWithoutItsEndRecordIsStillTruncation() {
+        val f = synthetic()
+        RandomAccessFile(f, "rw").use { it.setLength(it.length() - 9) }
+        assertThrows<HprofUnreadableException> {
+            HeapIndexer.build(f) { step, _ -> if (step == "parse") throw IllegalStateException("bad record") }
+        }
+    }
+
+    @Test
+    fun fileProblemChecksHeaderSizeAndEndRecord() {
+        val f = synthetic()
+        assertEquals(null, HprofFiles.problem(f))
+        assertEquals(null, HprofFiles.headerProblem(f))
+        RandomAccessFile(f, "rw").use { it.setLength(it.length() - 9) }
+        assertTrue(HprofFiles.problem(f)!!.contains("HEAP_DUMP_END"))
+        assertEquals(null, HprofFiles.headerProblem(f))
+        val zeros = File(dir, "zeros.hprof").also { it.writeBytes(ByteArray(64)) }
+        assertTrue(HprofFiles.headerProblem(zeros)!!.contains("not an hprof"), HprofFiles.headerProblem(zeros))
+        val empty = File(dir, "empty.hprof").also { it.createNewFile() }
+        assertTrue(HprofFiles.headerProblem(empty)!!.contains("empty"))
+        assertTrue(HprofFiles.headerProblem(File(dir, "missing.hprof"))!!.contains("missing"))
+    }
+
+    @Test
     fun cacheIsReusedAndInvalidatedByTouch() {
         val f = synthetic()
         val steps = mutableListOf<String>()

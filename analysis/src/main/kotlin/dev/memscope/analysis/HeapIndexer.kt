@@ -35,8 +35,9 @@ object HeapIndexer {
         } catch (e: IOException) {
             throw unreadable(hprof, e)
         } catch (e: RuntimeException) {
-            // Shark reports malformed records with IllegalStateException / IllegalArgumentException etc.
-            throw unreadable(hprof, e)
+            // Shark reports malformed records with IllegalStateException / IllegalArgumentException etc., but so
+            // does a bug of ours: only a file that fails the cheap checks (header, final HEAP_DUMP_END) is unreadable.
+            throw HprofFiles.classify(hprof, e, "while indexing")
         }
         return finish(parsed, progress)
     }

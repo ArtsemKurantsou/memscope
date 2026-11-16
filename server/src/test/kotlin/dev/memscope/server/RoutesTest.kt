@@ -698,6 +698,56 @@ class RoutesTest {
         assertEquals(SnapshotMeta.Status.UNREADABLE, store.get(s.id)!!.snapshots.single().status)
     }
 
+    /** An hprof that passes the header check (the fake opener does not parse it). */
+    private fun SessionStore.addHprofLikeSnapshot(sid: String): String {
+        val snap = addFakeSnapshot(sid)
+        val head = "JAVA PROFILE 1.0.3\u0000".toByteArray()
+        java.nio.file.Files.write(snapshotFile(sid, snap), head + ByteArray(2048 - head.size))
+        return snap
+    }
+
+    @Test fun anAnalysisBugInAQueryIs500AndLeavesTheSnapshotReadable() = server {
+        val s = store.newAttachSession()
+        val snap = store.addFakeSnapshot(s.id)
+        client.openSnapshot(s.id, snap)
+        opener.opened.single().onChildren = { throw dev.memscope.analysis.AnalysisBugException(IndexOutOfBoundsException("42")) }
+        val r = client.get("/api/snapshots/${s.id}/$snap/tree?ref=root")
+        assertEquals(HttpStatusCode.InternalServerError, r.status)
+        val body = r.obj()
+        assertEquals("MemScope hit a bug while analysing this snapshot", str(body, "error"))
+        assertEquals("the snapshot file is intact; please report this with the server's terminal output", str(body, "hint"))
+        assertEquals("ANALYSIS_BUG", str(body, "kind"))
+        assertEquals(SnapshotMeta.Status.OK, store.get(s.id)!!.snapshots.single().status)
+        assertTrue(logs.any { it.contains("IndexOutOfBoundsException") && it.contains("at ") }, "logged with stack trace: $logs")
+        opener.opened.single().onChildren = {}
+        assertEquals(HttpStatusCode.OK, client.get("/api/snapshots/${s.id}/$snap/tree?ref=root").status)
+    }
+
+    @Test fun anAnalysisBugWhileOpeningFailsTheJobWithoutMarkingTheSnapshot() = server {
+        val s = store.newAttachSession()
+        val snap = store.addFakeSnapshot(s.id)
+        opener.failWith = IndexOutOfBoundsException("indexer bug")
+        val job = client.openSnapshot(s.id, snap)
+        assertEquals("FAILED", str(job, "state"))
+        assertEquals("MemScope hit a bug while analysing this snapshot", str(job, "errorMessage"))
+        assertTrue(str(job, "errorHint").contains("intact"))
+        assertEquals(SnapshotMeta.Status.OK, store.get(s.id)!!.snapshots.single().status)
+        assertTrue(logs.any { it.contains("indexer bug") && it.contains("at ") }, "logged with stack trace: $logs")
+        opener.failWith = null
+        assertEquals("DONE", str(client.openSnapshot(s.id, snap), "state"), "a later open retries")
+    }
+
+    @Test fun reopeningAnUnreadableSnapshotWhoseFileIsIntactRetriesAndClearsTheMark() = server {
+        val s = store.newAttachSession()
+        val snap = store.addHprofLikeSnapshot(s.id)
+        store.update(s.id) { m -> m.copy(snapshots = m.snapshots.map { it.copy(status = SnapshotMeta.Status.UNREADABLE, error = "old bug") }) }
+        assertEquals("DONE", str(client.openSnapshot(s.id, snap), "state"))
+        val meta = store.get(s.id)!!.snapshots.single()
+        assertEquals(SnapshotMeta.Status.OK, meta.status)
+        assertNull(meta.error)
+        assertEquals(HttpStatusCode.OK, client.get("/api/snapshots/${s.id}/$snap/summary").status)
+    }
+
     @Test fun badRefIs400WithHint() = server {
         val s = store.newAttachSession()
         val snap = store.addFakeSnapshot(s.id)

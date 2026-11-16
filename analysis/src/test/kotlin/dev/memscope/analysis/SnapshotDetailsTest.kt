@@ -149,6 +149,13 @@ class SnapshotDetailsTest {
     }
 
     @Test
+    fun aRuntimeErrorReadingAnIntactDumpIsABugNotUnreadable() {
+        val e = assertThrows<AnalysisBugException> { snapshot.withGraph { throw IllegalStateException("query bug") } }
+        assertTrue(e.cause is IllegalStateException)
+        snapshot.details(obj(Tree.C)) // still usable
+    }
+
+    @Test
     fun unreachableObjectHasDetailsButNoPath() {
         val d = snapshot.details(obj(Tree.GARBAGE))
         assertEquals("test.Other", d.className)
