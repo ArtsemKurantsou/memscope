@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# MemScope launcher: builds the server on first use, then runs it.
+#   ./memscope [--port <n>] [--no-open] [--rebuild]
+# Env: MEMSCOPE_XMX (default 6g), MEMSCOPE_HOME (where sessions are stored, default ~/.memscope), JAVA_HOME.
+set -euo pipefail
+
+# Resolve this script's directory even when it is called through a symlink or from another directory.
+src="${BASH_SOURCE[0]}"
+while [ -L "$src" ]; do
+  dir="$(cd -P "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  [[ "$src" != /* ]] && src="$dir/$src"
+done
+root="$(cd -P "$(dirname "$src")" && pwd)"
+
+# Java 17 or newer: JAVA_HOME, then macOS' java_home, then the java on PATH.
+java_major() { "$1" -version 2>&1 | sed -n 's/.*version "\([0-9]*\).*/\1/p' | head -n1; }
+find_java() {
+  local c
+  if [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/java" ]; then echo "$JAVA_HOME"; return; fi
+  if [ -x /usr/libexec/java_home ] && c="$(/usr/libexec/java_home -v 17+ 2>/dev/null)" && [ -n "$c" ]; then echo "$c"; return; fi
+  if c="$(command -v java 2>/dev/null)"; then
+    c="$(cd -P "$(dirname "$c")/.." && pwd)"; [ -x "$c/bin/java" ] && echo "$c"
+  fi
+}
+java_home="$(find_java || true)"
+if [ -z "$java_home" ]; then
+  echo "MemScope needs Java 17 or newer, but none was found. Install a JDK 17+ and/or set JAVA_HOME." >&2
+  exit 1
+fi
+major="$(java_major "$java_home/bin/java" || true)"
+if [ -z "$major" ] || [ "$major" -lt 17 ]; then
+  echo "MemScope needs Java 17 or newer; $java_home/bin/java is version '${major:-unknown}'. Set JAVA_HOME to a JDK 17+." >&2
+  exit 1
+fi
+export JAVA_HOME="$java_home"
+
+rebuild=0
+args=()
+for a in "$@"; do
+  if [ "$a" = "--rebuild" ]; then rebuild=1; else args+=("$a"); fi
+done
+
+bin="$root/server/build/install/server/bin/server"
+if [ "$rebuild" = 1 ] || [ ! -x "$bin" ]; then
+  echo "Building MemScope (first run takes a minute or two)..." >&2
+  (cd "$root" && ./gradlew --quiet :server:installDist) || { echo "Build failed; see the output above." >&2; exit 1; }
+fi
+
+export JAVA_OPTS="-Xmx${MEMSCOPE_XMX:-6g} ${JAVA_OPTS:-}"
+exec "$bin" ${args[@]+"${args[@]}"}
