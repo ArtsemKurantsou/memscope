@@ -8,3 +8,8 @@ dependencies {
     testImplementation(project(":analysis"))
     testImplementation(project(":server"))
 }
+
+dependencies {
+    testImplementation(libs.kotlinx.serialization.json)
+    testImplementation(libs.ktor.server.netty)
+}
