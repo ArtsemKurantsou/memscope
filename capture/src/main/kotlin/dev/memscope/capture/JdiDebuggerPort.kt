@@ -58,7 +58,7 @@ class JdiDebuggerPort : DebuggerPort {
         // the call in handleBindApplication must be the one waiting for us; otherwise the app already started (for example
         // the one-shot debug-app flag was used up) and "process start" would silently be a later point
         if (frames.take(i).none { it.location().method().name() == "waitForDebugger" }) {
-            return "the app was not waiting for the debugger when it attached (it was already at " +
+            return "$APP_NOT_WAITING_REASON (it was already at " +
                 "${frames[i].location().method().name()} @${frames[i].location().codeIndex()}); the process start was missed"
         }
         val call = frames[i].location()

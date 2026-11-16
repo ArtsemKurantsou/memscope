@@ -8,6 +8,7 @@ import dev.memscope.capture.SessionStore
 import dev.memscope.capture.SessionMeta
 import dev.memscope.capture.StartupConfig
 import dev.memscope.capture.StartupListener
+import dev.memscope.capture.StartupRetry
 import dev.memscope.capture.StartupSession
 import dev.memscope.device.Adb
 
@@ -17,7 +18,12 @@ fun interface StartupRunner {
 
     companion object {
         val real = StartupRunner { deps, sessionId, config, job ->
-            StartupSession(deps.adb, deps.store, deps.guard, listener = deps.pollerListener(sessionId, config.processName)).run(sessionId, config, job)
+            StartupRetry(deps.store) { abortIfNotWaiting, note ->
+                StartupSession(
+                    deps.adb, deps.store, deps.guard, listener = deps.pollerListener(sessionId, config.processName),
+                    abortIfNotWaiting = abortIfNotWaiting, startNote = note,
+                )
+            }.run(sessionId, config, job)
         }
     }
 }

@@ -31,6 +31,14 @@ data class StartupConfig(
     val customGraceSec: Int = 10,
 )
 
+/** Why a failed recording is worth one more try: the app is stopped and nothing was dumped, so the device is clean. */
+enum class RetryableFailure {
+    /** The app's VM stopped answering the debugger. */
+    VM_WEDGED,
+    /** The app was already past its debugger wait when the debugger stopped it. */
+    APP_NOT_WAITING,
+}
+
 /** Every blocking wait of a startup session, in milliseconds. */
 data class StartupTimeouts(
     val baselineMs: Long = 5_000,
@@ -72,8 +80,16 @@ class StartupSession(
     private val debuggerFactory: () -> DebuggerPort = { JdiDebuggerPort() },
     private val timeouts: StartupTimeouts = StartupTimeouts(),
     private val listener: StartupListener = StartupListener.NONE,
+    /** Fail the attempt (retryable, nothing dumped yet) when the app is past its debugger wait, instead of skipping only the process-start milestone. */
+    private val abortIfNotWaiting: Boolean = false,
+    /** Shown in the Prepare step: why this is a second attempt. */
+    private val startNote: String? = null,
     private val onMilestoneDone: (Milestone) -> Unit = {},
 ) {
+    /** Set by [run] when it failed in a way that a fresh attempt may avoid, before any snapshot was taken. */
+    @Volatile var retryable: RetryableFailure? = null
+        private set
+
     /**
      * Steps: "Prepare", "Launch app", "Attach debugger", one "Dump: <label>" per enabled milestone, "Detach". Returns
      * when all enabled milestones were reached (job DONE, result = session id, session stays ACTIVE). Otherwise the job
@@ -84,14 +100,14 @@ class StartupSession(
      * step. Always detaches, removes its forward, clears the debug app it set, and stops an app it launched that never
      * got past waitForDebugger; snapshots already pulled are kept.
      */
-    fun run(sessionId: String, config: StartupConfig, job: Job) {
+    fun run(sessionId: String, config: StartupConfig, job: Job, failJobOnError: Boolean = true) {
         try {
             val session = store.get(sessionId) ?: throw NoSuchElementException("no such session: $sessionId")
             DeviceArgs.requireSerial(session.serial)
             validate(config, session.packageName)
             Run(session, config, job).execute()
         } catch (t: Throwable) {
-            job.fail(t)
+            if (failJobOnError) job.fail(t)
             throw t
         }
     }
@@ -131,6 +147,8 @@ class StartupSession(
         private var stopFailedHint: String? = null
         /** The debugger call that got no reply: the app's VM is wedged and must be stopped. */
         private var wedgedOp: String? = null
+        /** The app was past its debugger wait at attach time (see [APP_NOT_WAITING_REASON]). */
+        private var notWaiting = false
         /**
          * The one thread that talks JDWP (and owns the JDI event queue): JDI waits for replies without a timeout, so
          * every call runs here and the session thread waits for it with [jdwp]'s bound.
@@ -148,7 +166,7 @@ class StartupSession(
             var failure: Throwable? = null
             var outcome: Outcome? = null
             try {
-                val launchArgs = job.step(PREPARE) { d -> timed(d) { prepare() } }
+                val launchArgs = job.step(PREPARE) { d -> timed(d, startNote) { prepare() } }
                 job.step(LAUNCH) { d -> timed(d) { launch(launchArgs); "pid $pid" } }
                 job.step(ATTACH) { d -> timed(d) { attach(); "port $localPort" } }
                 outcome = awaitMilestones()
@@ -188,7 +206,12 @@ class StartupSession(
                     listOfNotNull(d?.hint, extra).joinToString(" "), f,
                 )
             }
-            failure?.let { throw it }
+            retryable = if (failure == null || appExited || stopFailedHint != null || (failure as? DeviceException)?.kind == DeviceException.Kind.CANCELLED || store.get(session.id)?.snapshots?.isNotEmpty() == true) null else when {
+                notWaiting && abortIfNotWaiting -> RetryableFailure.APP_NOT_WAITING
+                wedgedOp != null -> RetryableFailure.VM_WEDGED
+                else -> null
+            }
+                        failure?.let { throw it }
             job.complete(session.id)
         }
 
@@ -255,6 +278,13 @@ class StartupSession(
             jdwp("suspending the VM") { dbg.suspendAll() }
             observe { listener.onHeld(true) }
             val waitError = jdwp("arming the waitForDebugger return") { dbg.armWaitReturn() }
+            if (waitError != null && waitError.startsWith(APP_NOT_WAITING_REASON)) {
+                notWaiting = true
+                if (abortIfNotWaiting && Milestones.PROCESS_START in pending) throw DeviceException(
+                    DeviceException.Kind.COMMAND_FAILED, "The app was already past its debugger wait when MemScope attached, so the process start was missed.",
+                    "MemScope stopped the app; press Record again.",
+                )
+            }
             for (m in pending.values.toList()) {
                 if (m.id == Milestones.PROCESS_START) {
                     if (waitError != null) failMilestone(m, "Could not find where the app waits for the debugger: $waitError")
@@ -497,7 +527,11 @@ class StartupSession(
                     false // the disarm below reports a lost device
                 }
                 if (stopped) {
-                    notes += if (wedged) "stopped the app: it no longer answered the debugger" else "stopped the app, which was still waiting for the debugger"
+                    notes += when {
+                        wedged -> "stopped the app: it no longer answered the debugger"
+                        notWaiting -> "stopped the app, which had already passed its debugger wait"
+                        else -> "stopped the app, which was still waiting for the debugger"
+                    }
                 } else {
                     stopFailedHint = "$pkg may still be frozen and could not be stopped: run " +
                         "'adb shell am force-stop $pkg', or MemScope stops it at its next start."
@@ -661,10 +695,10 @@ class StartupSession(
             }
         }
 
-        private fun <T> timed(d: (String) -> Unit, block: () -> T): T {
+        private fun <T> timed(d: (String) -> Unit, lead: String? = null, block: () -> T): T {
             val t0 = nowMs()
             val r = block()
-            d(listOfNotNull((r as? String), "%.1f s".format((nowMs() - t0) / 1000.0)).joinToString(" · "))
+            d(listOfNotNull(lead, (r as? String), "%.1f s".format((nowMs() - t0) / 1000.0)).joinToString(" · "))
             return r
         }
     }

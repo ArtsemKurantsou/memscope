@@ -83,3 +83,6 @@ interface DebuggerPort {
     /** Deletes all requests, resumes and closes the connection. Idempotent; never throws. */
     fun dispose()
 }
+
+/** Start of the reason [DebuggerPort.armWaitReturn] returns when the app had already passed its debugger wait. */
+const val APP_NOT_WAITING_REASON = "the app was not waiting for the debugger when it attached"
